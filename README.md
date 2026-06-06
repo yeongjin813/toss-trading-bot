@@ -1,161 +1,202 @@
-# Live Signal Generator Pipeline
+# Multi-Asset Live Signal Generator Pipeline
 
-## Documentation Update
-
-- Rewrote documentation to accurately reflect the dynamic live trading signal architecture.
-- Added detailed sections including the end-to-end data pipeline flow, optimized parameters (SMA 10, RSI 14), and exact live breakout evaluation criteria.
-- Integrated the updated project directory tree and standardized terminal output logging blueprints.
-- Purged all legacy static backtesting context and localized Korean placeholders to align with production standards.
-
----
-
-## 1. Project Overview
-
-This system is a production-oriented **Live Signal Generator Pipeline** for US equities. On each execution, it dynamically ingests the latest market data, computes technical indicators, evaluates live breakout conditions, and emits a standardized BUY / SELL / HOLD signal banner. A historical backtest run is executed in parallel to report portfolio performance metrics.
+A production-oriented quantitative trading infrastructure for US equities. The system dynamically ingests market data, computes multi-indicator analytics per asset, enforces liquidity and volatility risk controls, and emits standardized live trading signal banners across a configurable watchlist.
 
 | Field | Value |
 |---|---|
-| Target Ticker | AAPL (Apple Inc.) |
+| Current Phase | **Phase 4** — Dynamic ATR Risk Engine & Multi-Ticker Ingestion |
+| Watchlist | `AAPL`, `RDW`, `JOBY` |
 | Lookback Window | 3 years of daily OHLCV bars |
-| Initial Capital (Backtest) | $10,000 |
-| Data Source | yfinance API (no static CSV dependency at startup) |
+| Initial Capital (Backtest) | $10,000 per asset |
+| Data Source | yfinance API (dynamic ingestion; local CSV cache on each run) |
 
 ---
 
-## 2. System Architecture
+## Project Evolution & Development Milestones (Phase 1 – 4)
+
+### Phase 1: Static Backtesting Infrastructure (Baseline)
+
+- **Architecture**: Single-ticker backtest on AAPL using a fixed 20-day SMA crossover over 3 years of historical daily data loaded from flat CSV files.
+- **Performance**: Net return **+0.99%** — Final Portfolio Value **$10,099.42**.
+- **Insight**: High vulnerability to whipsaws and capital erosion in sideways markets. A fixed lookback period without momentum or risk controls produced unreliable entry timing.
+
+### Phase 2: Parameter Optimization & Multi-Indicator Filtering
+
+- **Architecture**: Grid-search optimization (SMA 10–50, step 5) converged on a **10-day SMA** paired with a **14-day RSI** momentum filter (BUY when RSI >= 50; SELL when RSI > 70 or SMA death cross).
+- **Performance**: Net return **+0.52%** — Final Portfolio Value **$10,052.18**.
+- **Insight**: Observed **False Negative dilemma** — stacking uncorrelated indicators choked profitable entries. Reduced whipsaw frequency came at the cost of missed momentum breakouts.
+
+### Phase 3: Production-Ready Live Signal Pipeline
+
+- **Architecture**: Replaced static CSV dependency with automated **yfinance API ingestion** on every execution. Introduced live terminal signal banners (BUY / SELL / HOLD) driven by real-time crossover and RSI evaluation against the latest two trading sessions.
+- **Capability**: Dynamic data persistence, standardized English console telemetry, and integrated Backtrader performance analyzers (Final Portfolio Value, Sharpe Ratio, Max Drawdown).
+
+### Phase 4: Dynamic ATR Risk Engine & Multi-Ticker Ingestion *(Current)*
+
+- **Architecture**: Expanded from single-asset to a parallel **multi-ticker watchlist** (`AAPL`, `RDW`, `JOBY`) with sequential yfinance ingestion and per-asset data persistence (`data/{ticker}_daily.csv`).
+- **Liquidity Control**: Implemented a **20-day Volume SMA** filter — long entry signals are invalidated when the latest session volume falls below its 20-day average, mitigating slippage risk in mid-cap growth names such as RDW.
+- **Volatility Control**: Upgraded from a static percentage trailing stop to an adaptive **Dynamic ATR Trailing Stop** — trigger floor calibrated at **`ATR(14) × 2.0`**, widening automatically during macro volatility spikes (geopolitical events, rate decisions) and tightening as volatility subsides to lock in accumulated profits.
+- **Signal Priority**: `[DYNAMIC_ATR_SELL]` → `[STANDARD_SELL]` → `[BUY]` → `[HOLD]` enforced independently per ticker.
+
+---
+
+## System Architecture & Priority Order
+
+### Multi-Asset Tracking Matrix
+
+Each watchlist ticker is processed through an independent, parallel analytics pipeline. All assets share the same strategy parameters and risk rules but maintain isolated indicator states, position tracking, and signal output.
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│  yfinance API   │────▶│  main.py         │────▶│  data/aapl_daily.csv│
-│  (3Y daily bars)│     │  fetch + persist │     │  (auto-saved cache) │
-└─────────────────┘     └────────┬─────────┘     └─────────────────────┘
-                                   │
-                    ┌──────────────┼──────────────┐
-                    ▼              ▼              ▼
-             analytics.py    Live Signal     Backtrader
-             SMA / RSI        Evaluation      Backtest Engine
-                              (BUY/SELL/HOLD)  (Sharpe, MDD)
+                         ┌─────────────────────────────────────────────┐
+                         │           main.py — Orchestrator            │
+                         │     Watchlist: [AAPL, RDW, JOBY]            │
+                         └─────────────────────┬───────────────────────┘
+                                               │
+              ┌────────────────────────────────┼────────────────────────────────┐
+              │                                │                                │
+              ▼                                ▼                                ▼
+     ┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
+     │  AAPL Pipeline  │              │  RDW Pipeline   │              │  JOBY Pipeline  │
+     ├─────────────────┤              ├─────────────────┤              ├─────────────────┤
+     │ yfinance fetch  │              │ yfinance fetch  │              │ yfinance fetch  │
+     │ → aapl_daily.csv│              │ → rdw_daily.csv │              │ → joby_daily.csv│
+     │ analytics.py    │              │ analytics.py    │              │ analytics.py    │
+     │ Live Signal     │              │ Live Signal     │              │ Live Signal     │
+     │ Backtrader BT   │              │ Backtrader BT   │              │ Backtrader BT   │
+     └─────────────────┘              └─────────────────┘              └─────────────────┘
+              │                                │                                │
+              └────────────────────────────────┼────────────────────────────────┘
+                                               ▼
+                         ┌─────────────────────────────────────────────┐
+                         │   Session Report + Watchlist Signal Summary │
+                         └─────────────────────────────────────────────┘
 ```
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| Orchestration | `main.py` | Data ingestion, signal dispatch, backtest execution, console reporting |
-| Indicators | `analytics.py` | SMA, RSI calculation, latest-session metric extraction, signal evaluation |
-| Strategy | `strategy.py` | Backtrader SMA crossover strategy with RSI momentum filter |
-| Persistence | `data/aapl_daily.csv` | Normalized OHLCV cache written on every run |
+| Orchestration | `main.py` | Multi-ticker ingestion loop, per-asset session reports, watchlist signal summary |
+| Indicators | `analytics.py` | SMA, RSI, ATR, Volume SMA computation; position replay; live signal evaluation |
+| Strategy | `strategy.py` | Backtrader SmaCross with RSI filter, volume gate, and dynamic ATR trailing stop |
+| Persistence | `data/{ticker}_daily.csv` | Normalized OHLCV cache written on every run per asset |
 
----
+### Execution Priority Logic
 
-## 3. End-to-End Pipeline Flow
+Signal evaluation runs independently for each ticker. The engine evaluates conditions in strict descending priority:
 
-| Step | Action | Output |
-|---|---|---|
-| 1. Fetch | Call yfinance for 3-year AAPL daily OHLCV data | Normalized `DataFrame` |
-| 2. Persist | Write the DataFrame to `data/aapl_daily.csv` | Updated local data store |
-| 3. Calculate | Compute SMA(10) and RSI(14) for Today and Yesterday | Indicator metric dict |
-| 4. Evaluate | Apply crossover and RSI threshold rules | `BUY`, `SELL`, or `HOLD` |
-| 5. Signal | Render the live trading banner to the terminal | Standardized banner block |
-| 6. Backtest | Run the optimized strategy over full history via Backtrader | Final value, Sharpe, MDD |
+| Priority | Signal Code | Terminal Banner | Trigger Condition |
+|---|---|---|---|
+| **1** | `DYNAMIC_ATR_SELL` | `[LIVE SIGNAL: SELL {TICKER} - DYNAMIC ATR VOLATILITY LIQUIDATION]` | Active long position AND `today.close <= peak - (ATR(14) × 2.0)` |
+| **2** | `STANDARD_SELL` | `[LIVE SIGNAL: SELL {TICKER}]` | Death cross (close crosses below SMA 10) **OR** `RSI(14) > 70` |
+| **3** | `BUY` | `[LIVE SIGNAL: BUY {TICKER}]` | Golden cross (close crosses above SMA 10) **AND** `RSI(14) >= 50` **AND** Volume Liquidity Gate **PASS** |
+| **4** | `HOLD` | `[LIVE SIGNAL: HOLD/HOLDING POSITION - {TICKER}]` | No higher-priority criteria met; BUY invalidated if volume < Volume SMA(20) |
 
----
-
-## 4. Optimized Strategy Parameters
-
-These parameters were selected through prior grid-search optimization (SMA periods 10–50, step 5) and are applied consistently across both the live signal engine and the backtest.
-
-| Parameter | Value | Description |
-|---|---|---|
-| `sma_period` | **10** | Simple Moving Average lookback (days) |
-| `rsi_period` | **14** | Relative Strength Index lookback (days) |
-| `rsi_buy_threshold` | **50** | Minimum RSI required to confirm a BUY signal |
-| `rsi_sell_threshold` | **70** | RSI level that triggers an overbought SELL exit |
-
----
-
-## 5. Live Breakout Evaluation Criteria
-
-The signal engine compares **Today** (most recent session) against **Yesterday** (prior session) using the following precise rules defined in `analytics.py`.
-
-### Crossover Definitions
+#### Crossover Definitions
 
 | Event | Condition |
 |---|---|
-| Golden Cross (cross above) | `today.close > today.sma` **AND** `yesterday.close <= yesterday.sma` |
-| Death Cross (cross below) | `today.close < today.sma` **AND** `yesterday.close >= yesterday.sma` |
+| Golden Cross | `today.close > today.sma` **AND** `yesterday.close <= yesterday.sma` |
+| Death Cross | `today.close < today.sma` **AND** `yesterday.close >= yesterday.sma` |
 
-### Signal Priority (evaluated in order)
+#### Volume Liquidity Gate
 
-| Priority | Signal | Banner | Trigger |
-|---|---|---|---|
-| 1 | **SELL** | `[LIVE SIGNAL: SELL AAPL]` | Death cross **OR** `today.rsi > 70` |
-| 2 | **BUY** | `[LIVE SIGNAL: BUY AAPL]` | Golden cross **AND** `today.rsi >= 50` |
-| 3 | **HOLD** | `[LIVE SIGNAL: HOLD/HOLDING POSITION]` | No SELL or BUY criteria met |
+| Rule | Condition |
+|---|---|
+| **PASS** | `today.volume >= Volume_SMA(20)` — entry permitted |
+| **FAIL** | `today.volume < Volume_SMA(20)` — BUY signal invalidated; treated as insufficient institutional liquidity |
+
+#### Dynamic ATR Stop Formula
+
+```
+Dynamic Stop Distance = ATR(14) × 2.0
+Trigger Floor Price   = Highest Price Achieved Since Entry − Dynamic Stop Distance
+```
+
+The trigger floor recalculates daily. Rising ATR widens the buffer during macro shocks; falling ATR tightens the buffer to preserve gains.
 
 ---
 
-## 6. Terminal Output Logging Blueprint
+## Optimized Strategy Parameters
 
-All console output is standardized in professional English. Each run produces four sequential blocks:
+| Parameter | Value | Description |
+|---|---|---|
+| `sma_period` | **10** | Price trend filter (days) |
+| `rsi_period` | **14** | Momentum oscillator lookback (days) |
+| `rsi_buy_threshold` | **50** | Minimum RSI to confirm a BUY signal |
+| `rsi_sell_threshold` | **70** | RSI overbought exit threshold |
+| `atr_period` | **14** | Average True Range lookback (days) |
+| `atr_multiplier` | **2.0** | Volatility buffer multiplier for trailing stop |
+| `volume_sma_period` | **20** | Volume moving average for liquidity gate |
 
-### Block 1 — Pipeline Header
+---
+
+## End-to-End Pipeline Flow
+
+| Step | Action | Scope |
+|---|---|---|
+| 1. Ingest | Fetch 3-year daily OHLCV via yfinance for each watchlist ticker | Per asset |
+| 2. Persist | Write normalized DataFrame to `data/{ticker}_daily.csv` | Per asset |
+| 3. Calculate | Compute SMA(10), RSI(14), ATR(14), Volume SMA(20) for Today and Yesterday | Per asset |
+| 4. Evaluate | Apply priority-ordered signal logic with liquidity and ATR risk gates | Per asset |
+| 5. Report | Emit session telemetry, live signal banner, and backtest comparison | Per asset |
+| 6. Summarize | Print consolidated watchlist signal summary | Global |
+
+---
+
+## Terminal Output Blueprint
+
+### Pipeline Header
 
 ```
-Live Signal Generator Pipeline
+Multi-Asset Live Signal Generator Pipeline
 Execution Timestamp : YYYY-MM-DD HH:MM:SS
-Target Ticker       : AAPL
---------------------------------------------------------------
-Data Ingestion      : N daily bars fetched and saved to ./data/aapl_daily.csv
+Watchlist           : AAPL, RDW, JOBY
+Dynamic ATR Engine  : ATR(14) x 2.0 volatility buffer
+Volume Liquidity    : Volume SMA(20) entry gate
 ```
 
-### Block 2 — Latest Technical Metrics
+### Per-Ticker Session Report
+
+Each ticker produces an independent block containing:
+
+1. **Latest Technical Metrics** — Close, SMA, RSI, ATR, Volume, Volume SMA
+2. **Volume Liquidity Filter** — Gate status (PASS / FAIL)
+3. **Dynamic ATR Stop Position State** — Captured peak, trigger floor (when in position)
+4. **Dynamic ATR Liquidation Telemetry** — Breach details (when triggered)
+5. **Live Signal Banner** — Priority-resolved action
+6. **Backtest Performance Summary** — Baseline vs Risk-Managed comparison
+
+### Watchlist Signal Summary
 
 ```
-Latest Technical Metrics
-==============================================================
-Yesterday  YYYY-MM-DD | Close: $  XXX.XX | SMA(10): $  XXX.XX | RSI(14):  XX.XX
-Today      YYYY-MM-DD | Close: $  XXX.XX | SMA(10): $  XXX.XX | RSI(14):  XX.XX
-==============================================================
-```
-
-### Block 3 — Live Signal Banner
-
-```
-==============================================================
-                   [LIVE SIGNAL: BUY AAPL]
-==============================================================
-```
-
-Valid banner values: `BUY AAPL` | `SELL AAPL` | `HOLD/HOLDING POSITION`
-
-### Block 4 — Backtest Performance Summary
-
-```
-Backtest Performance Summary
-==============================================================
-Final Portfolio Value : $XX,XXX.XX
-Sharpe Ratio          : X.XXXX
-Max Drawdown (MDD)    : X.XX%
-==============================================================
+========================================================================================
+                                WATCHLIST SIGNAL SUMMARY
+========================================================================================
+  AAPL   -> SELL
+  RDW    -> SELL
+  JOBY   -> HOLD
+========================================================================================
 ```
 
 ---
 
-## 7. Project Structure
+## Project Structure
 
 ```
 Toss Trading Bot/
-├── main.py              # Pipeline orchestrator: ingestion, signals, backtest
-├── strategy.py          # Backtrader SmaCross strategy (SMA + RSI filter)
-├── analytics.py         # Indicator computation and live signal evaluation
+├── main.py              # Multi-ticker orchestrator: ingestion, signals, backtest
+├── strategy.py          # Backtrader SmaCross with RSI, volume gate, dynamic ATR stop
+├── analytics.py         # Indicator computation, position replay, signal evaluation
 ├── requirements.txt     # Python dependencies
 ├── README.md            # Project documentation
 └── data/
-    └── aapl_daily.csv   # Auto-generated OHLCV cache (refreshed on each run)
+    ├── aapl_daily.csv   # Auto-generated OHLCV cache (refreshed on each run)
+    ├── rdw_daily.csv
+    └── joby_daily.csv
 ```
 
 ---
 
-## 8. Dependencies
+## Dependencies
 
 ```
 yfinance
@@ -165,7 +206,7 @@ matplotlib
 backtrader
 ```
 
-Install dependencies:
+Install:
 
 ```powershell
 pip install -r requirements.txt
@@ -173,10 +214,10 @@ pip install -r requirements.txt
 
 ---
 
-## 9. Usage
+## Usage
 
 ```powershell
 python main.py
 ```
 
-Each invocation fetches fresh market data, evaluates the current session, prints the live signal banner, and reports backtest performance metrics in a single uninterrupted run.
+Each invocation sequentially ingests all watchlist tickers, evaluates live signals with full risk telemetry, prints per-asset session reports, and outputs a consolidated watchlist signal summary in a single uninterrupted run.
