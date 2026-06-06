@@ -38,6 +38,13 @@ A production-oriented quantitative trading infrastructure for US equities. The s
 - **Volatility Control**: Upgraded from a static percentage trailing stop to an adaptive **Dynamic ATR Trailing Stop** — trigger floor calibrated at **`ATR(14) × 2.0`**, widening automatically during macro volatility spikes (geopolitical events, rate decisions) and tightening as volatility subsides to lock in accumulated profits.
 - **Signal Priority**: `[DYNAMIC_ATR_SELL]` → `[STANDARD_SELL]` → `[BUY]` → `[HOLD]` enforced independently per ticker.
 
+### Operational Hardening Refactor *(Latest)*
+
+- Resolved Backtrader data feed sharing bug by guaranteeing independent object instantiation per backtest run.
+- Implemented robust `REQUIRED_OHLCV_COLS` structural validation and a strict **22-bar minimum lookback gate**.
+- Configured formalized annualized Sharpe Ratio analyzer calibrated for daily timeframes.
+- Injected a **0.1% transaction commission** to eliminate idealized backtest optimization bias.
+
 ---
 
 ## System Architecture & Priority Order
@@ -79,7 +86,17 @@ Each watchlist ticker is processed through an independent, parallel analytics pi
 | Strategy | `strategy.py` | Backtrader SmaCross with RSI filter, volume gate, and dynamic ATR trailing stop |
 | Persistence | `data/{ticker}_daily.csv` | Normalized OHLCV cache written on every run per asset |
 
-### Execution Priority Logic
+### Data Integrity & Backtest Calibration
+
+| Control | Implementation |
+|---|---|
+| **Feed Isolation** | Each backtest run receives a fresh `load_backtrader_feed(df)` instance — baseline and risk-managed runs never share a feed object |
+| **Schema Validation** | `REQUIRED_OHLCV_COLS = [Open, High, Low, Close, Volume]` — missing fields raise `ValueError` at ingestion |
+| **Minimum Lookback** | `MIN_DATA_BARS = 22` enforced before indicator extraction (`max(SMA, RSI, ATR, Volume SMA) + 2`) |
+| **Sharpe Analyzer** | `SharpeRatio(timeframe=Days, annualize=True)` — daily returns with annualized output |
+| **Transaction Friction** | `setcommission(commission=0.001)` — 0.1% institutional commission on all backtest trades |
+
+---
 
 Signal evaluation runs independently for each ticker. The engine evaluates conditions in strict descending priority:
 
@@ -126,6 +143,8 @@ The trigger floor recalculates daily. Rising ATR widens the buffer during macro 
 | `atr_period` | **14** | Average True Range lookback (days) |
 | `atr_multiplier` | **2.0** | Volatility buffer multiplier for trailing stop |
 | `volume_sma_period` | **20** | Volume moving average for liquidity gate |
+| `commission_rate` | **0.001** | Backtest transaction cost (0.1% per trade) |
+| `min_data_bars` | **22** | Minimum bar count required before analytics execution |
 
 ---
 
@@ -133,12 +152,14 @@ The trigger floor recalculates daily. Rising ATR widens the buffer during macro 
 
 | Step | Action | Scope |
 |---|---|---|
-| 1. Ingest | Fetch 3-year daily OHLCV via yfinance for each watchlist ticker | Per asset |
-| 2. Persist | Write normalized DataFrame to `data/{ticker}_daily.csv` | Per asset |
-| 3. Calculate | Compute SMA(10), RSI(14), ATR(14), Volume SMA(20) for Today and Yesterday | Per asset |
-| 4. Evaluate | Apply priority-ordered signal logic with liquidity and ATR risk gates | Per asset |
-| 5. Report | Emit session telemetry, live signal banner, and backtest comparison | Per asset |
-| 6. Summarize | Print consolidated watchlist signal summary | Global |
+| 1. Ingest | Fetch 3-year daily OHLCV via yfinance; validate `REQUIRED_OHLCV_COLS` | Per asset |
+| 2. Validate | Enforce `MIN_DATA_BARS` (22) before indicator computation | Per asset |
+| 3. Persist | Write normalized DataFrame to `data/{ticker}_daily.csv` | Per asset |
+| 4. Calculate | Compute SMA(10), RSI(14), ATR(14), Volume SMA(20) for Today and Yesterday | Per asset |
+| 5. Evaluate | Apply priority-ordered signal logic with liquidity and ATR risk gates | Per asset |
+| 6. Backtest | Run isolated baseline and risk-managed feeds with 0.1% commission | Per asset |
+| 7. Report | Emit session telemetry, live signal banner, and backtest comparison | Per asset |
+| 8. Summarize | Print consolidated watchlist signal summary | Global |
 
 ---
 

@@ -19,6 +19,11 @@ VOLUME_SMA_PERIOD = 20
 RSI_BUY_THRESHOLD = 50
 RSI_SELL_THRESHOLD = 70
 LOOKBACK_YEARS = 3
+MIN_DATA_BARS = (
+    max(OPTIMIZED_SMA_PERIOD, RSI_PERIOD, ATR_PERIOD, VOLUME_SMA_PERIOD) + 2
+)
+REQUIRED_OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
+COMMISSION_RATE = 0.001
 
 
 def data_path_for_ticker(ticker: str) -> str:
@@ -41,9 +46,25 @@ def fetch_market_data(ticker: str, years: int) -> pd.DataFrame:
 
     df = raw.reset_index()
     df = df.rename(columns={"Date": "Date"})
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+
+    missing_cols = [col for col in REQUIRED_OHLCV_COLS if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for {ticker}: {', '.join(missing_cols)}"
+        )
+
+    df = df[["Date", *REQUIRED_OHLCV_COLS]].copy()
     df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
     return df
+
+
+def validate_dataframe_length(df: pd.DataFrame, ticker: str) -> None:
+    """Ensure sufficient bar count before indicator extraction and replay."""
+    if len(df) < MIN_DATA_BARS:
+        raise ValueError(
+            f"Insufficient data for {ticker}: {len(df)} bars "
+            f"(minimum required: {MIN_DATA_BARS})"
+        )
 
 
 def persist_market_data(df: pd.DataFrame, path: str) -> None:
@@ -79,6 +100,7 @@ def run_backtest(
     """Execute backtest with optional dynamic ATR stop and volume filter."""
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(INITIAL_CASH)
+    cerebro.broker.setcommission(commission=COMMISSION_RATE)
     cerebro.adddata(data_feed)
     cerebro.addstrategy(
         SmaCross,
@@ -92,7 +114,12 @@ def run_backtest(
         enable_dynamic_atr_stop=enable_dynamic_atr_stop,
         enable_volume_filter=enable_volume_filter,
     )
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe")
+    cerebro.addanalyzer(
+        bt.analyzers.SharpeRatio,
+        _name="sharpe",
+        timeframe=bt.TimeFrame.Days,
+        annualize=True,
+    )
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
 
     results = cerebro.run()
@@ -110,6 +137,8 @@ def run_backtest(
 
 def analyze_ticker(ticker: str, df: pd.DataFrame) -> dict:
     """Run full indicator, signal, and backtest analytics for a single ticker."""
+    validate_dataframe_length(df, ticker)
+
     metrics = extract_latest_metrics(
         df,
         OPTIMIZED_SMA_PERIOD,
@@ -135,12 +164,15 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> dict:
         rsi_buy_threshold=RSI_BUY_THRESHOLD,
         rsi_sell_threshold=RSI_SELL_THRESHOLD,
     )
-    data_feed = load_backtrader_feed(df)
     baseline = run_backtest(
-        data_feed, enable_dynamic_atr_stop=False, enable_volume_filter=False
+        load_backtrader_feed(df),
+        enable_dynamic_atr_stop=False,
+        enable_volume_filter=False,
     )
     with_risk = run_backtest(
-        data_feed, enable_dynamic_atr_stop=True, enable_volume_filter=True
+        load_backtrader_feed(df),
+        enable_dynamic_atr_stop=True,
+        enable_volume_filter=True,
     )
 
     return {
