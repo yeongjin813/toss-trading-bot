@@ -7,7 +7,9 @@ Setup:
     KIS_APP_KEY=your_app_key
     KIS_APP_SECRET=your_app_secret
     KIS_CANO=your_account_number
-    KIS_ACNT_PRDT_CD=02
+    KIS_ACNT_PRDT_CD=01
+    WATCHLIST=NVDA,PLTR,AAPL
+    CAPITAL_AT_RISK=10000
 
 Run:
   python main.py
@@ -27,7 +29,12 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from analytics import LiveSignalEngine, StrategyConfig
+from analytics import (
+    LiveSignalEngine,
+    PositionState,
+    StrategyConfig,
+    is_us_equity_session,
+)
 
 load_dotenv(override=True)
 
@@ -41,8 +48,6 @@ BASE_URL = "https://openapivts.koreainvestment.com:29443"
 TR_ID_US_BUY = "VTTT1002U"
 TR_ID_US_SELL = "VTTT1006U"
 TR_ID_DAILY_PRICE = "HHDFS76240000"
-# Overseas mock present-balance inquiry (v1_해외주식-008).
-# Note: VTTT3402R is rejected by the VTS server (OPSQ0002); the working mock TR is VTRP6504R.
 TR_ID_US_PRESENT_BALANCE = "VTRP6504R"
 
 TOKEN_PATH = "/oauth2/tokenP"
@@ -51,41 +56,38 @@ DAILY_PRICE_PATH = "/uapi/overseas-price/v1/quotations/dailyprice"
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 PRESENT_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
 
-WATCHLIST = ["NVDA", "PLTR", "AAPL"]
+DEFAULT_WATCHLIST = ["NVDA", "PLTR", "AAPL"]
 
-# excd: KIS daily-price EXCD (quotations) | ovrs_excg_cd: KIS order OVRS_EXCG_CD (trading)
-# NVDA and PLTR route through NASD on the VTS mock server (NYS fails for PLTR candle fetch).
+
+def _parse_watchlist(raw: str | None) -> list[str]:
+    if not raw:
+        return DEFAULT_WATCHLIST.copy()
+    tickers = [token.strip().upper() for token in raw.split(",") if token.strip()]
+    return tickers or DEFAULT_WATCHLIST.copy()
+
+
+WATCHLIST = _parse_watchlist(os.getenv("WATCHLIST"))
+
 MARKET_META: dict[str, dict[str, str]] = {
-    "NVDA": {"excd": "NAS", "ovrs_excg_cd": "NASD"},   # High-vol market leader (NASDAQ)
-    "PLTR": {"excd": "NAS", "ovrs_excg_cd": "NASD"},   # High-momentum breakout (VTS: NASD)
-    "AAPL": {"excd": "NAS", "ovrs_excg_cd": "NASD"},   # Low-vol large-cap baseline (NASDAQ)
+    "NVDA": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
+    "PLTR": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
+    "AAPL": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
 }
 
 ANALYTICS_SMA_PERIOD = 20
+MIN_DATA_BARS = 22
 
 DATA_DIR = "./data"
 STATE_FILE = "./trading_state.json"
 TOKEN_CACHE_FILE = "./kis_token_cache.json"
 LOOKBACK_YEARS = 3
 TARGET_BARS = LOOKBACK_YEARS * 252
-CAPITAL_AT_RISK = 10_000.0
-RISK_PER_TRADE = 0.01
-TICKER_SLEEP_SECONDS = 1
-LOOP_COOLDOWN_SECONDS = 60
+CAPITAL_AT_RISK = float(os.getenv("CAPITAL_AT_RISK", "10000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
+LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 
-STRATEGY_CONFIG = StrategyConfig(
-    sma_period=10,
-    rsi_period=14,
-    atr_period=14,
-    volume_sma_period=20,
-    atr_multiplier=2.0,
-    rsi_buy_threshold=50.0,
-    rsi_upper_limit=70.0,
-    volume_threshold=1.2,
-    use_trailing_stop=True,
-    rsi_exit_mode="crossdown",
-    execution_mode="eod",
-)
+STRATEGY_CONFIG = StrategyConfig.from_env()
 
 
 def validate_environment() -> None:
@@ -105,6 +107,12 @@ def validate_environment() -> None:
             "Missing required environment variables: "
             + ", ".join(missing)
             + ". Create a .env file with these keys before running."
+        )
+
+    unknown = [ticker for ticker in WATCHLIST if ticker not in MARKET_META]
+    if unknown:
+        raise RuntimeError(
+            f"Watchlist tickers missing MARKET_META routing: {', '.join(unknown)}"
         )
 
 
@@ -210,6 +218,38 @@ class KISApiClient:
             raise RuntimeError(f"Hashkey issuance failed: {payload}")
         return hashkey
 
+    def _fetch_daily_price_batch(
+        self,
+        ticker: str,
+        excd: str,
+        bymd: str,
+    ) -> list[dict[str, Any]]:
+        url = f"{BASE_URL}{DAILY_PRICE_PATH}"
+        params = {
+            "AUTH": "",
+            "EXCD": excd,
+            "SYMB": ticker,
+            "GUBN": "0",
+            "BYMD": bymd,
+            "MODP": "1",
+        }
+        response = requests.get(
+            url,
+            headers=self._build_headers(TR_ID_DAILY_PRICE),
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if payload.get("rt_cd") not in (None, "0"):
+            raise RuntimeError(
+                f"Daily price API error for {ticker}: "
+                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
+            )
+
+        return payload.get("output2") or []
+
     def fetch_us_daily_bars(
         self,
         ticker: str,
@@ -217,35 +257,11 @@ class KISApiClient:
         target_bars: int = TARGET_BARS,
     ) -> pd.DataFrame:
         """Fetch US daily OHLCV via TR ID HHDFS76240000 with pagination."""
-        url = f"{BASE_URL}{DAILY_PRICE_PATH}"
         collected: list[dict[str, Any]] = []
         bymd = datetime.now().strftime("%Y%m%d")
 
         while len(collected) < target_bars:
-            params = {
-                "AUTH": "",
-                "EXCD": excd,
-                "SYMB": ticker,
-                "GUBN": "0",
-                "BYMD": bymd,
-                "MODP": "1",
-            }
-            response = requests.get(
-                url,
-                headers=self._build_headers(TR_ID_DAILY_PRICE),
-                params=params,
-                timeout=15,
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-            if payload.get("rt_cd") not in (None, "0"):
-                raise RuntimeError(
-                    f"Daily price API error for {ticker}: "
-                    f"{payload.get('msg_cd')} | {payload.get('msg1')}"
-                )
-
-            batch = payload.get("output2") or []
+            batch = self._fetch_daily_price_batch(ticker, excd, bymd)
             if not batch:
                 break
 
@@ -268,6 +284,18 @@ class KISApiClient:
         df = _parse_kis_daily_output(collected)
         df = df.drop_duplicates(subset=["Date"]).sort_values("Date").tail(target_bars)
         return df.reset_index(drop=True)
+
+    def fetch_us_daily_latest(
+        self,
+        ticker: str,
+        excd: str,
+    ) -> pd.DataFrame:
+        """Fetch only the most recent daily price page (single API call)."""
+        bymd = datetime.now().strftime("%Y%m%d")
+        batch = self._fetch_daily_price_batch(ticker, excd, bymd)
+        if not batch:
+            return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+        return _parse_kis_daily_output(batch)
 
     def place_us_order(
         self,
@@ -347,6 +375,84 @@ class KISApiClient:
         return payload
 
 
+class MarketDataCache:
+    """
+    Bootstrap full historical windows once, then refresh only the latest bar.
+
+    Avoids re-downloading ~756 bars every 60-second polling cycle.
+    """
+
+    def __init__(self, client: KISApiClient) -> None:
+        self._client = client
+        self._frames: dict[str, pd.DataFrame] = {}
+
+    def bootstrap(self, tickers: list[str]) -> None:
+        for ticker in tickers:
+            self._frames[ticker] = self._load_or_fetch_full_history(ticker)
+            persist_market_data(self._frames[ticker], data_path_for_ticker(ticker))
+            print(
+                f"  -> Bootstrap {ticker}: {len(self._frames[ticker])} bars cached "
+                f"to {data_path_for_ticker(ticker)}"
+            )
+
+    def get_frame(self, ticker: str) -> pd.DataFrame:
+        if ticker not in self._frames:
+            raise KeyError(f"Ticker {ticker} is not bootstrapped in MarketDataCache.")
+        return self._frames[ticker].copy()
+
+    def refresh_latest(self, ticker: str) -> tuple[pd.DataFrame, bool]:
+        """
+        Pull the latest KIS daily page and merge into the cached frame.
+
+        Returns (updated_frame, is_new_bar).
+        """
+        excd = MARKET_META[ticker]["excd"]
+        latest_batch = self._client.fetch_us_daily_latest(ticker, excd)
+        cached = self._frames.get(ticker)
+
+        if cached is None or cached.empty:
+            cached = self._load_or_fetch_full_history(ticker)
+            self._frames[ticker] = cached
+            return cached, True
+
+        if latest_batch.empty:
+            return cached, False
+
+        latest_batch = normalize_market_frame(latest_batch)
+        latest_row = latest_batch.sort_values("Date").iloc[-1]
+        latest_date = latest_row["Date"]
+
+        if latest_date not in set(cached["Date"]):
+            merged = pd.concat([cached, latest_row.to_frame().T], ignore_index=True)
+            merged = (
+                merged.drop_duplicates(subset=["Date"])
+                .sort_values("Date")
+                .tail(TARGET_BARS)
+                .reset_index(drop=True)
+            )
+            self._frames[ticker] = merged
+            return merged, True
+
+        idx = cached[cached["Date"] == latest_date].index[-1]
+        cached.loc[idx, ["Open", "High", "Low", "Close", "Volume"]] = latest_row[
+            ["Open", "High", "Low", "Close", "Volume"]
+        ].values
+        self._frames[ticker] = cached.reset_index(drop=True)
+        return self._frames[ticker], False
+
+    def _load_or_fetch_full_history(self, ticker: str) -> pd.DataFrame:
+        path = data_path_for_ticker(ticker)
+        if os.path.exists(path):
+            cached = pd.read_csv(path)
+            cached = normalize_market_frame(cached)
+            if len(cached) >= MIN_DATA_BARS:
+                return cached
+
+        excd = MARKET_META[ticker]["excd"]
+        df = self._client.fetch_us_daily_bars(ticker=ticker, excd=excd)
+        return normalize_market_frame(df)
+
+
 def _parse_amount(value: Any) -> float:
     if value in (None, ""):
         return 0.0
@@ -354,7 +460,6 @@ def _parse_amount(value: Any) -> float:
 
 
 def _summarize_overseas_present_balance(payload: dict[str, Any]) -> dict[str, float]:
-    """Extract deposit and valuation fields from inquire-present-balance output."""
     summary: dict[str, float] = {
         "total_asset_krw": 0.0,
         "total_deposit_krw": 0.0,
@@ -390,7 +495,6 @@ def _summarize_overseas_present_balance(payload: dict[str, Any]) -> dict[str, fl
 
 
 def print_mock_account_balance(client: KISApiClient) -> None:
-    """Print mock account cash/deposit summary before the monitoring loop starts."""
     print("Fetching mock account balance/deposit (inquire-present-balance)...")
     payload = client.fetch_overseas_present_balance(natn_cd="840")
     summary = _summarize_overseas_present_balance(payload)
@@ -410,7 +514,6 @@ def print_mock_account_balance(client: KISApiClient) -> None:
 
 
 def log_configured_capital_model() -> None:
-    """State that order sizing uses STRATEGY_CONFIG capital, not live broker balances."""
     print("-" * 88)
     print("CAPITAL MODEL - MANUAL (STRATEGY_CONFIG)".center(88))
     print("-" * 88)
@@ -426,12 +529,6 @@ def log_configured_capital_model() -> None:
 
 
 def try_print_mock_account_balance(client: KISApiClient) -> None:
-    """
-    Best-effort mock balance probe.
-
-    Any failure (network, invalid CANO suffix, VTS rt_cd errors) is swallowed so
-    the monitoring loop always starts and orders use STRATEGY_CONFIG capital only.
-    """
     try:
         print_mock_account_balance(client)
     except requests.RequestException as exc:
@@ -441,7 +538,6 @@ def try_print_mock_account_balance(client: KISApiClient) -> None:
 
 
 def _parse_kis_daily_output(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    """Normalize KIS overseas daily price output2 rows into OHLCV DataFrame."""
     records: list[dict[str, Any]] = []
 
     for row in rows:
@@ -467,17 +563,20 @@ def _parse_kis_daily_output(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def normalize_market_frame(df: pd.DataFrame) -> pd.DataFrame:
+    frame = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
+    frame = frame[(frame["Close"] > 0) & (frame["Volume"] >= 0)]
+    frame = frame.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    if len(frame) < MIN_DATA_BARS:
+        raise ValueError(f"Insufficient bar count after normalization: {len(frame)}")
+    return frame
+
+
 def data_path_for_ticker(ticker: str) -> str:
     return os.path.join(DATA_DIR, f"{ticker.lower()}_daily.csv")
 
 
 def load_persisted_states(path: str = STATE_FILE) -> dict[str, Any]:
-    """
-    Load multi-ticker persistence state.
-
-    Expected structure:
-      {"NVDA": {...}, "PLTR": {...}, "AAPL": {...}}
-    """
     if not os.path.exists(path):
         return {}
 
@@ -500,62 +599,121 @@ def persist_market_data(df: pd.DataFrame, path: str) -> None:
     df.to_csv(path, index=False)
 
 
-def fetch_us_stock_candles(
-    client: KISApiClient,
-    ticker: str,
-) -> pd.DataFrame:
-    """Fetch and normalize US daily OHLCV candles for a watchlist ticker."""
-    if ticker not in MARKET_META:
-        raise ValueError(f"Ticker {ticker} is not configured in MARKET_META.")
+def _resolve_execution_quantity(
+    signal: str,
+    proposed_size: int,
+    runtime: PositionState,
+) -> int:
+    if signal == "BUY":
+        return max(int(proposed_size), 0)
 
-    excd = MARKET_META[ticker]["excd"]
-    df = client.fetch_us_daily_bars(ticker=ticker, excd=excd)
-    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-    df = df[(df["Close"] > 0) & (df["Volume"] >= 0)].reset_index(drop=True)
+    if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
+        held = max(int(runtime.held_quantity), 0)
+        if held <= 0 and runtime.has_position:
+            held = max(int(proposed_size), 1)
+        return held
 
-    if len(df) < 22:
-        raise ValueError(f"Insufficient bar count for {ticker}: {len(df)}")
-
-    return df
+    return 0
 
 
 def execute_broker_order(
     client: KISApiClient,
     ticker: str,
     signal: str,
-    size: int,
-) -> dict[str, Any] | None:
-    """Route actionable signals to the KIS US equity order endpoint."""
+    quantity: int,
+) -> dict[str, Any]:
     ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
 
-    if signal == "BUY" and size > 0:
+    if signal == "BUY" and quantity > 0:
         print(
-            f"[KIS ORDER] BUY  {ticker} | qty={size} | market order | "
+            f"[KIS ORDER] BUY  {ticker} | qty={quantity} | market order | "
             f"tr_id={TR_ID_US_BUY}"
         )
         return client.place_us_order(
             side="BUY",
             ticker=ticker,
             ovrs_excg_cd=ovrs_excg_cd,
-            quantity=size,
+            quantity=quantity,
             price=0.0,
         )
 
-    if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
+    if signal in {"SELL", "DYNAMIC_ATR_SELL"} and quantity > 0:
         print(
-            f"[KIS ORDER] SELL {ticker} | close-position | market order | "
-            f"tr_id={TR_ID_US_SELL}"
+            f"[KIS ORDER] SELL {ticker} | qty={quantity} | close-position | "
+            f"market order | tr_id={TR_ID_US_SELL}"
         )
         return client.place_us_order(
             side="SELL",
             ticker=ticker,
             ovrs_excg_cd=ovrs_excg_cd,
-            quantity=max(size, 1),
+            quantity=quantity,
             price=0.0,
         )
 
-    print(f"[KIS ORDER] NO ACTION | {ticker} | signal={signal}")
-    return None
+    print(f"[KIS ORDER] NO ACTION | {ticker} | signal={signal} | qty={quantity}")
+    return {"rt_cd": "0", "skipped": True}
+
+
+def dispatch_order_with_state_machine(
+    client: KISApiClient,
+    engine: LiveSignalEngine,
+    ticker: str,
+    runtime: PositionState,
+    signal: str,
+    proposed_size: int,
+    current_bar_date: str,
+    allow_crossover: bool,
+    states: dict[str, Any],
+) -> str:
+    """
+    Enforce order lifecycle:
+      pending lock -> KIS dispatch -> rt_cd verify -> transition -> persist
+    """
+    if runtime.pending_order:
+        print(f"[LOCK] {ticker} pending_order=True — signal suppressed")
+        return "LOCKED"
+
+    execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
+    if signal in {"SELL", "DYNAMIC_ATR_SELL"} and execution_qty <= 0:
+        print(f"[SKIP] {ticker} liquidation skipped — no held quantity tracked")
+        return "HOLD"
+
+    if signal == "BUY" and execution_qty <= 0:
+        print(f"[SKIP] {ticker} BUY skipped — zero share size")
+        return "HOLD"
+
+    if signal not in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
+        return signal
+
+    order_payload = execute_broker_order(client, ticker, signal, execution_qty)
+    if order_payload.get("skipped"):
+        return signal
+
+    if str(order_payload.get("rt_cd", "")) != "0":
+        raise RuntimeError(
+            f"Order transmission failed for {ticker}: rt_cd={order_payload.get('rt_cd')}"
+        )
+
+    runtime.pending_order = True
+    states[ticker] = engine.dump_state(runtime)
+    save_persisted_states(states)
+
+    engine.apply_post_order_transition(
+        runtime,
+        signal=signal,
+        filled_quantity=execution_qty,
+        current_bar_date=current_bar_date,
+        allow_crossover=allow_crossover,
+    )
+
+    states[ticker] = engine.dump_state(runtime)
+    save_persisted_states(states)
+
+    print(
+        f"  -> Order accepted (rt_cd=0). State transition applied for {ticker}: "
+        f"has_position={runtime.has_position}, held_qty={runtime.held_quantity}"
+    )
+    return signal
 
 
 def _analytics_sma20(df: pd.DataFrame) -> float:
@@ -566,12 +724,11 @@ def _analytics_sma20(df: pd.DataFrame) -> float:
 
 def print_session_telemetry(
     ticker: str,
-    session: dict[str, Any],
+    cycle: dict[str, Any],
     df: pd.DataFrame,
 ) -> None:
-    """Emit pipe-friendly metrics for empirical log collection and visualization."""
-    metrics = session["metrics"]["today"]
-    signal = session["signal_result"]["signal"]
+    metrics = cycle["metrics"]["today"]
+    signal = cycle["signal_result"]["signal"]
     close = float(metrics["close"])
     sma_20 = _analytics_sma20(df)
     rsi = float(metrics["rsi"])
@@ -597,72 +754,107 @@ def print_session_telemetry(
         f"{volume:,.0f} / {volume_avg_20:,.0f}"
     )
     print(f"Session Date         : {metrics['date']}")
+    print(f"Bar Date             : {cycle['current_bar_date']}")
+    print(f"Session Low          : {cycle['session_low']:.4f}")
+    print(f"Market Open Gate     : {cycle['market_open']}")
+    print(f"Crossover Allowed    : {cycle['allow_crossover']}")
     print(f"Signal               : {signal}")
-    print(f"Position Size (shares): {session['position_size']}")
-    print(f"Liquidity OK         : {session['signal_result'].get('liquidity_ok', 'N/A')}")
+    print(f"Position Size (shares): {cycle['position_size']}")
+    print(f"Liquidity OK         : {cycle['signal_result'].get('liquidity_ok', 'N/A')}")
+    runtime = cycle["runtime_state"]
+    print(
+        f"Runtime Registry     : pending={runtime.get('pending_order')} | "
+        f"held_qty={runtime.get('held_quantity')} | "
+        f"last_processed={runtime.get('last_processed_date')}"
+    )
 
     if signal == "DYNAMIC_ATR_SELL":
-        stop = session["signal_result"]["dynamic_atr_stop"]
+        stop = cycle["signal_result"].get("dynamic_atr_stop") or {}
         print(
-            f"ATR Stop Telemetry   : peak=${stop['captured_peak']:.2f} | "
-            f"floor=${stop['trigger_floor']:.2f} | "
-            f"exec=${stop['current_execution_price']:.2f}"
+            f"ATR Stop Telemetry   : peak=${stop.get('captured_peak', 0):.2f} | "
+            f"floor=${stop.get('trigger_floor', 0):.2f} | "
+            f"session_low=${stop.get('session_low', cycle['session_low']):.2f}"
         )
 
 
 def process_ticker(
     client: KISApiClient,
     engine: LiveSignalEngine,
+    cache: MarketDataCache,
     ticker: str,
     states: dict[str, Any],
 ) -> str:
-    """Run the full fetch-evaluate-execute-persist cycle for one ticker."""
+    """Run fetch-evaluate-execute-persist cycle for one ticker with state machine gates."""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing ticker: {ticker}")
 
-    df = fetch_us_stock_candles(client, ticker)
+    df, is_new_bar = cache.refresh_latest(ticker)
     persist_market_data(df, data_path_for_ticker(ticker))
-    print(f"  -> {len(df)} bars cached to {data_path_for_ticker(ticker)}")
+    print(
+        f"  -> {len(df)} bars in memory "
+        f"({'new daily bar' if is_new_bar else 'intraday refresh'})"
+    )
 
-    ticker_state = states.get(ticker)
-    session = engine.evaluate_session(
+    ticker_state = states.get(ticker, {})
+    cycle = engine.evaluate_trading_cycle(
         df,
-        external_state=ticker_state,
+        runtime_state=ticker_state,
         capital_at_risk=CAPITAL_AT_RISK,
         risk_per_trade=RISK_PER_TRADE,
     )
 
-    print_session_telemetry(ticker, session, df)
+    print_session_telemetry(ticker, cycle, df)
 
-    signal = session["signal_result"]["signal"]
-    size = int(session["position_size"])
+    runtime = engine.load_state(cycle["runtime_state"])
+    signal = cycle["signal_result"]["signal"]
+    proposed_size = int(cycle["position_size"])
+
+    if cycle["signal_result"].get("pending_order_locked"):
+        print(f"[LOCK] {ticker} pending order lock active — no dispatch")
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        return "LOCKED"
 
     if signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
-        execute_broker_order(client, ticker, signal, size)
-
-    enriched = engine.enrich(df)
-    post_session_state = engine.replay_state(
-        enriched,
-        end_index=len(enriched) - 1,
-        initial_state=ticker_state,
-    )
-    states[ticker] = engine.dump_state(post_session_state)
-    save_persisted_states(states)
+        final_signal = dispatch_order_with_state_machine(
+            client,
+            engine,
+            ticker,
+            runtime,
+            signal,
+            proposed_size,
+            cycle["current_bar_date"],
+            cycle["allow_crossover"],
+            states,
+        )
+    else:
+        final_signal = signal
+        engine.mark_crossover_processed(
+            runtime,
+            cycle["current_bar_date"],
+            cycle["allow_crossover"],
+            signal,
+        )
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
 
     print(f"  -> State persisted for {ticker}")
-    return signal
+    return final_signal
 
 
 def run_watchlist_cycle(
     client: KISApiClient,
     engine: LiveSignalEngine,
+    cache: MarketDataCache,
     states: dict[str, Any],
 ) -> dict[str, Any]:
-    """Execute one full pass across the watchlist."""
     summary: list[tuple[str, str]] = []
+
+    if not is_us_equity_session():
+        print("[GATE] US equity session closed (weekend) — crossover signals suppressed")
 
     for index, ticker in enumerate(WATCHLIST):
         try:
-            signal = process_ticker(client, engine, ticker, states)
+            signal = process_ticker(client, engine, cache, ticker, states)
             summary.append((ticker, signal))
         except requests.Timeout as exc:
             print(f"[ERROR] Timeout for {ticker}: {exc}")
@@ -692,11 +884,12 @@ def run_watchlist_cycle(
 def main() -> None:
     validate_environment()
 
-    print("KIS Mock Trading - Continuous Market Monitor")
+    print("KIS Mock Trading - Production Execution Engine")
     print(f"Execution Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Base URL            : {BASE_URL}")
     print(f"Account             : {CANO}-{ACNT_PRDT_CD}")
     print(f"Watchlist           : {', '.join(WATCHLIST)}")
+    print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
     print(f"State File          : {STATE_FILE}")
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
@@ -704,10 +897,14 @@ def main() -> None:
 
     client = KISApiClient()
     engine = LiveSignalEngine(STRATEGY_CONFIG)
+    cache = MarketDataCache(client)
 
     print("Requesting KIS access token...")
     client.get_access_token()
     print("Access token ready.")
+
+    print("Bootstrapping historical market data cache (one-time full fetch)...")
+    cache.bootstrap(WATCHLIST)
 
     states = load_persisted_states()
     print(f"Loaded state entries: {len(states)}")
@@ -715,8 +912,8 @@ def main() -> None:
     try_print_mock_account_balance(client)
     log_configured_capital_model()
 
-    print("Starting continuous monitoring loop. Press Ctrl+C to stop.")
-    print("Order execution is NOT blocked by balance inquiry status.")
+    print("Starting production monitoring loop. Press Ctrl+C to stop.")
+    print("Order pipeline: KIS dispatch -> rt_cd verify -> state transition -> persist")
     print("=" * 88)
 
     cycle_count = 0
@@ -726,9 +923,12 @@ def main() -> None:
             cycle_count += 1
             cycle_started = datetime.now()
             print()
-            print(f"--- Cycle {cycle_count} started at {cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---")
+            print(
+                f"--- Cycle {cycle_count} started at "
+                f"{cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---"
+            )
 
-            states = run_watchlist_cycle(client, engine, states)
+            states = run_watchlist_cycle(client, engine, cache, states)
 
             print(
                 f"Cycle {cycle_count} complete. "

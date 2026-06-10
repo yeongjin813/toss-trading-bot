@@ -1,4 +1,15 @@
+from __future__ import annotations
+
+import os
+
 import backtrader as bt
+
+from analytics import StrategyConfig
+
+
+def load_backtest_config() -> StrategyConfig:
+    """Load backtest parameters aligned with live STRATEGY_CONFIG / .env overrides."""
+    return StrategyConfig.from_env()
 
 
 class SmaCross(bt.Strategy):
@@ -9,13 +20,33 @@ class SmaCross(bt.Strategy):
         ("rsi_period", 14),
         ("rsi_buy_threshold", 50),
         ("rsi_sell_threshold", 70),
+        ("rsi_exit_mode", "crossdown"),
         ("atr_period", 14),
         ("atr_multiplier", 2.0),
         ("volume_sma_period", 20),
+        ("volume_threshold", 1.2),
         ("use_rsi_filter", True),
         ("use_volume_filter", True),
         ("use_trailing_stop", True),
     )
+
+    @classmethod
+    def params_from_config(cls, config: StrategyConfig | None = None) -> tuple:
+        cfg = config or load_backtest_config()
+        return (
+            ("sma_period", cfg.sma_period),
+            ("rsi_period", cfg.rsi_period),
+            ("rsi_buy_threshold", cfg.rsi_buy_threshold),
+            ("rsi_sell_threshold", cfg.rsi_upper_limit),
+            ("rsi_exit_mode", cfg.rsi_exit_mode),
+            ("atr_period", cfg.atr_period),
+            ("atr_multiplier", cfg.atr_multiplier),
+            ("volume_sma_period", cfg.volume_sma_period),
+            ("volume_threshold", cfg.volume_threshold),
+            ("use_rsi_filter", True),
+            ("use_volume_filter", True),
+            ("use_trailing_stop", cfg.use_trailing_stop),
+        )
 
     def __init__(self):
         self.sma = bt.indicators.SMA(self.data.close, period=self.params.sma_period)
@@ -73,7 +104,9 @@ class SmaCross(bt.Strategy):
     def _passes_volume_filter(self) -> bool:
         if not self.params.use_volume_filter:
             return True
-        return float(self.data.volume[0]) >= float(self.volume_sma[0])
+        return float(self.data.volume[0]) > float(self.volume_sma[0]) * float(
+            self.params.volume_threshold
+        )
 
     def _rsi_allows_entry(self) -> bool:
         if not self.params.use_rsi_filter:
@@ -83,7 +116,9 @@ class SmaCross(bt.Strategy):
     def _rsi_triggers_exit(self) -> bool:
         if not self.params.use_rsi_filter:
             return False
-        return self.rsi[0] > self.params.rsi_sell_threshold
+        if self.params.rsi_exit_mode == "threshold":
+            return self.rsi[0] > self.params.rsi_sell_threshold
+        return self.rsi[-1] >= self.params.rsi_sell_threshold and self.rsi[0] < self.params.rsi_sell_threshold
 
     def next(self):
         if len(self) < self._min_period:
@@ -111,3 +146,7 @@ class SmaCross(bt.Strategy):
                 and self._passes_volume_filter()
             ):
                 self.order = self.buy()
+
+
+def default_capital_at_risk() -> float:
+    return float(os.getenv("CAPITAL_AT_RISK", "10000"))

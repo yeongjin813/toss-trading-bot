@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import os
+from dataclasses import asdict, dataclass, fields
+from datetime import date, datetime
 from typing import Any, Literal
 
 import pandas as pd
@@ -23,29 +25,77 @@ class StrategyConfig:
     rsi_exit_mode: RsiExitMode = "crossdown"
     execution_mode: ExecutionMode = "eod"
 
+    @classmethod
+    def from_env(cls, base: StrategyConfig | None = None) -> StrategyConfig:
+        """Build strategy config with optional environment overrides."""
+        seed = base or cls()
+        return cls(
+            sma_period=int(os.getenv("SMA_PERIOD", str(seed.sma_period))),
+            rsi_period=int(os.getenv("RSI_PERIOD", str(seed.rsi_period))),
+            atr_period=int(os.getenv("ATR_PERIOD", str(seed.atr_period))),
+            volume_sma_period=int(
+                os.getenv("VOLUME_SMA_PERIOD", str(seed.volume_sma_period))
+            ),
+            atr_multiplier=float(
+                os.getenv("ATR_MULTIPLIER", str(seed.atr_multiplier))
+            ),
+            rsi_buy_threshold=float(
+                os.getenv("RSI_BUY_THRESHOLD", str(seed.rsi_buy_threshold))
+            ),
+            rsi_upper_limit=float(
+                os.getenv("RSI_UPPER_LIMIT", str(seed.rsi_upper_limit))
+            ),
+            volume_threshold=float(
+                os.getenv("VOLUME_THRESHOLD", str(seed.volume_threshold))
+            ),
+            use_trailing_stop=os.getenv("USE_TRAILING_STOP", "true").lower()
+            in {"1", "true", "yes"},
+            rsi_exit_mode=os.getenv("RSI_EXIT_MODE", seed.rsi_exit_mode),  # type: ignore[arg-type]
+            execution_mode=os.getenv("EXECUTION_MODE", seed.execution_mode),  # type: ignore[arg-type]
+        )
+
 
 @dataclass
 class PositionState:
-    """Mutable position and trailing-stop state with external persistence hooks."""
+    """
+    Unified runtime registry: position, trailing stop, and order lifecycle.
+
+    Persisted fields include has_position (in_position), pending_order,
+    last_processed_date, latest_bar_date, held_quantity, and session_low.
+    """
 
     in_position: bool = False
+    pending_order: bool = False
+    last_processed_date: str | None = None
+    latest_bar_date: str | None = None
+    held_quantity: int = 0
+    session_low: float | None = None
     highest_price_achieved: float | None = None
     current_atr: float | None = None
     dynamic_stop_distance: float | None = None
     trigger_floor: float | None = None
 
+    @property
+    def has_position(self) -> bool:
+        return self.in_position
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> PositionState:
-        return cls(
-            in_position=bool(payload.get("in_position", False)),
-            highest_price_achieved=_optional_float(payload.get("highest_price_achieved")),
-            current_atr=_optional_float(payload.get("current_atr")),
-            dynamic_stop_distance=_optional_float(payload.get("dynamic_stop_distance")),
-            trigger_floor=_optional_float(payload.get("trigger_floor")),
-        )
+    def from_dict(cls, payload: dict[str, Any] | None) -> PositionState:
+        if not payload:
+            return cls()
+
+        valid = {field.name for field in fields(cls)}
+        filtered = {key: payload[key] for key in payload if key in valid}
+        if "held_quantity" in filtered:
+            filtered["held_quantity"] = int(filtered["held_quantity"] or 0)
+        if "in_position" in filtered:
+            filtered["in_position"] = bool(filtered["in_position"])
+        if "pending_order" in filtered:
+            filtered["pending_order"] = bool(filtered["pending_order"])
+        return cls(**filtered)
 
 
 @dataclass
@@ -95,6 +145,10 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _format_bar_date(value: Any) -> str:
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
 
 
 def _wilder_ewm(series: pd.Series, period: int) -> pd.Series:
@@ -173,14 +227,34 @@ def calculate_position_size(
     return max(shares, 0)
 
 
+def is_us_equity_session(now: datetime | None = None) -> bool:
+    """Weekday gate for US equity crossover evaluation (Mon-Fri)."""
+    current = now or datetime.now()
+    return current.weekday() < 5
+
+
+def should_allow_crossover_signals(
+    current_bar_date: str,
+    last_processed_date: str | None,
+    market_open: bool,
+) -> bool:
+    """
+    Crossover BUY/SELL is allowed only on a new daily bar during market weekdays.
+    """
+    if not market_open:
+        return False
+    if last_processed_date is None:
+        return True
+    return current_bar_date != last_processed_date
+
+
 class LiveSignalEngine:
     """
     Unified live signal engine with shared bar-level decision logic.
 
     Execution assumption: EOD signal generation on completed daily bars.
-    Crossovers are evaluated using prior-session references (prev_close,
-    prev_sma) to avoid look-ahead bias. Orders are assumed filled at the
-    session close unless execution_mode is switched to 'next_open'.
+    Intraday cycles may re-evaluate Priority-1 DYNAMIC_ATR_SELL using the
+    session low sequence (Low_t <= floor) without re-firing crossover entries.
     """
 
     def __init__(self, config: StrategyConfig | None = None) -> None:
@@ -204,8 +278,6 @@ class LiveSignalEngine:
         return self.enrich(df)
 
     def load_state(self, payload: dict[str, Any] | None) -> PositionState:
-        if payload is None:
-            return PositionState()
         return PositionState.from_dict(payload)
 
     def dump_state(self, state: PositionState) -> dict[str, Any]:
@@ -215,10 +287,14 @@ class LiveSignalEngine:
         threshold = self.config.volume_threshold
         return volume > volume_sma * threshold
 
-    def _golden_cross(self, close: float, sma: float, prev_close: float, prev_sma: float) -> bool:
+    def _golden_cross(
+        self, close: float, sma: float, prev_close: float, prev_sma: float
+    ) -> bool:
         return close > sma and prev_close <= prev_sma
 
-    def _death_cross(self, close: float, sma: float, prev_close: float, prev_sma: float) -> bool:
+    def _death_cross(
+        self, close: float, sma: float, prev_close: float, prev_sma: float
+    ) -> bool:
         return close < sma and prev_close >= prev_sma
 
     def _rsi_allows_entry(self, rsi: float) -> bool:
@@ -230,7 +306,9 @@ class LiveSignalEngine:
             return rsi > upper
         return prev_rsi >= upper and rsi < upper
 
-    def _update_trailing_state(self, state: PositionState, close: float, atr: float) -> None:
+    def _update_trailing_state(
+        self, state: PositionState, close: float, atr: float
+    ) -> None:
         if not state.in_position:
             return
 
@@ -244,7 +322,9 @@ class LiveSignalEngine:
         state.dynamic_stop_distance = atr * self.config.atr_multiplier
         state.trigger_floor = state.highest_price_achieved - state.dynamic_stop_distance
 
-    def _dynamic_atr_stop_triggered(self, state: PositionState, bar_low: float) -> bool:
+    def _dynamic_atr_stop_triggered(
+        self, state: PositionState, bar_low: float
+    ) -> bool:
         if not self.config.use_trailing_stop or not state.in_position:
             return False
         if state.trigger_floor is None:
@@ -255,13 +335,60 @@ class LiveSignalEngine:
         self,
         state: PositionState,
         bar: BarSnapshot,
+        session_low: float,
     ) -> dict[str, float]:
         return {
             "captured_peak": float(state.highest_price_achieved or bar.close),
             "current_atr": float(state.current_atr or bar.atr),
             "dynamic_stop_distance": float(state.dynamic_stop_distance or 0.0),
             "trigger_floor": float(state.trigger_floor or 0.0),
+            "session_low": float(session_low),
             "current_execution_price": bar.close,
+        }
+
+    def evaluate_intraday_atr_stop(
+        self,
+        state: PositionState,
+        bar: BarSnapshot,
+        session_low: float,
+        mutate_state: bool = False,
+    ) -> dict[str, Any] | None:
+        """
+        Priority-1 intraday scan: DYNAMIC_ATR_SELL when Low_t <= trigger floor.
+
+        Uses the running session_low for the active daily bar, not only the
+        static EOD low stored in the historical dataframe row.
+        """
+        if not state.in_position or state.pending_order:
+            return None
+
+        working = PositionState.from_dict(state.to_dict())
+        self._update_trailing_state(working, bar.close, bar.atr)
+        dynamic_atr_stop = self._build_dynamic_atr_payload(
+            working, bar, session_low
+        )
+
+        if not self._dynamic_atr_stop_triggered(working, session_low):
+            if mutate_state:
+                state.highest_price_achieved = working.highest_price_achieved
+                state.current_atr = working.current_atr
+                state.dynamic_stop_distance = working.dynamic_stop_distance
+                state.trigger_floor = working.trigger_floor
+            return None
+
+        if mutate_state:
+            state.in_position = False
+            state.held_quantity = 0
+            state.highest_price_achieved = None
+            state.current_atr = None
+            state.dynamic_stop_distance = None
+            state.trigger_floor = None
+            state.session_low = None
+
+        return {
+            "signal": "DYNAMIC_ATR_SELL",
+            "dynamic_atr_stop": dynamic_atr_stop,
+            "liquidity_ok": True,
         }
 
     def evaluate_bar(
@@ -270,33 +397,38 @@ class LiveSignalEngine:
         bar: BarSnapshot,
         prev_bar: BarSnapshot,
         mutate_state: bool = True,
+        allow_crossover: bool = True,
+        session_low: float | None = None,
     ) -> dict[str, Any]:
         """
         Evaluate one bar using unified priority:
         DYNAMIC_ATR_SELL -> SELL -> BUY -> HOLD.
+
+        When allow_crossover is False, only the intraday ATR stop path runs.
         """
         liquidity_ok = self._passes_volume_filter(bar.volume, bar.volume_sma)
-        cross_above = self._golden_cross(
-            bar.close, bar.sma, prev_bar.close, prev_bar.sma
-        )
-        cross_below = self._death_cross(
-            bar.close, bar.sma, prev_bar.close, prev_bar.sma
-        )
+        effective_low = session_low if session_low is not None else bar.low
 
-        working_state = PositionState.from_dict(state.to_dict()) if not mutate_state else state
+        working_state = (
+            PositionState.from_dict(state.to_dict()) if not mutate_state else state
+        )
         dynamic_atr_stop: dict[str, float] | None = None
 
         if working_state.in_position:
             self._update_trailing_state(working_state, bar.close, bar.atr)
-            dynamic_atr_stop = self._build_dynamic_atr_payload(working_state, bar)
+            dynamic_atr_stop = self._build_dynamic_atr_payload(
+                working_state, bar, effective_low
+            )
 
-            if self._dynamic_atr_stop_triggered(working_state, bar.low):
+            if self._dynamic_atr_stop_triggered(working_state, effective_low):
                 if mutate_state:
                     state.in_position = False
+                    state.held_quantity = 0
                     state.highest_price_achieved = None
                     state.current_atr = None
                     state.dynamic_stop_distance = None
                     state.trigger_floor = None
+                    state.session_low = None
                 return {
                     "signal": "DYNAMIC_ATR_SELL",
                     "dynamic_atr_stop": dynamic_atr_stop,
@@ -304,14 +436,32 @@ class LiveSignalEngine:
                     "state": working_state.to_dict(),
                 }
 
+        if not allow_crossover:
+            return {
+                "signal": "HOLD",
+                "dynamic_atr_stop": dynamic_atr_stop,
+                "liquidity_ok": liquidity_ok,
+                "crossover_suppressed": True,
+                "state": working_state.to_dict(),
+            }
+
+        cross_above = self._golden_cross(
+            bar.close, bar.sma, prev_bar.close, prev_bar.sma
+        )
+        cross_below = self._death_cross(
+            bar.close, bar.sma, prev_bar.close, prev_bar.sma
+        )
+
         if working_state.in_position:
             if cross_below or self._rsi_triggers_exit(bar.rsi, prev_bar.rsi):
                 if mutate_state:
                     state.in_position = False
+                    state.held_quantity = 0
                     state.highest_price_achieved = None
                     state.current_atr = None
                     state.dynamic_stop_distance = None
                     state.trigger_floor = None
+                    state.session_low = None
                 return {
                     "signal": "SELL",
                     "dynamic_atr_stop": dynamic_atr_stop,
@@ -367,39 +517,118 @@ class LiveSignalEngine:
         for i in range(1, last_index + 1):
             bar = BarSnapshot.from_row(enriched.iloc[i])
             prev_bar = BarSnapshot.from_row(enriched.iloc[i - 1])
-            self.evaluate_bar(state, bar, prev_bar, mutate_state=True)
+            self.evaluate_bar(
+                state,
+                bar,
+                prev_bar,
+                mutate_state=True,
+                allow_crossover=True,
+            )
 
         return state
 
-    def evaluate_session(
+    def update_session_low(
+        self, runtime: PositionState, bar: BarSnapshot
+    ) -> float:
+        """Track the minimum low observed for the active daily bar."""
+        bar_date = _format_bar_date(bar.date)
+        if runtime.latest_bar_date != bar_date:
+            runtime.latest_bar_date = bar_date
+            runtime.session_low = bar.low
+        elif runtime.session_low is None:
+            runtime.session_low = bar.low
+        else:
+            runtime.session_low = min(runtime.session_low, bar.low)
+        return float(runtime.session_low)
+
+    def evaluate_trading_cycle(
         self,
         df: pd.DataFrame,
-        external_state: dict[str, Any] | None = None,
-        end_index: int | None = None,
-        capital_at_risk: float = 10_000.0,
-        risk_per_trade: float = 0.01,
+        runtime_state: dict[str, Any] | None,
+        capital_at_risk: float,
+        risk_per_trade: float,
+        *,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
+        """
+        Evaluate one live monitoring cycle with bar-trailing and session gates.
+
+        Returns signal_result, metrics, sizing, and the non-mutated replay snapshot.
+        """
         enriched = self.enrich(df)
-        replay_end = len(enriched) - 2 if end_index is None else end_index
+        replay_end = len(enriched) - 2
 
         if replay_end < 1:
             raise ValueError("Insufficient data length for signal evaluation.")
 
+        runtime = self.load_state(runtime_state)
         position_state = self.replay_state(
             enriched,
             end_index=replay_end,
-            initial_state=external_state,
+            initial_state={
+                key: runtime_state.get(key)
+                for key in PositionState.from_dict(runtime_state).to_dict()
+                if key
+                not in {
+                    "pending_order",
+                    "last_processed_date",
+                    "latest_bar_date",
+                    "held_quantity",
+                    "session_low",
+                }
+            }
+            if runtime_state
+            else None,
         )
+
+        runtime.in_position = position_state.in_position
+        runtime.highest_price_achieved = position_state.highest_price_achieved
+        runtime.current_atr = position_state.current_atr
+        runtime.dynamic_stop_distance = position_state.dynamic_stop_distance
+        runtime.trigger_floor = position_state.trigger_floor
+        if runtime.in_position and runtime.held_quantity <= 0:
+            runtime.held_quantity = max(
+                int(runtime_state.get("held_quantity", 0) if runtime_state else 0),
+                0,
+            )
+
         today = BarSnapshot.from_row(enriched.iloc[-1])
         yesterday = BarSnapshot.from_row(enriched.iloc[-2])
+        current_bar_date = _format_bar_date(today.date)
+        session_low = self.update_session_low(runtime, today)
+
+        market_open = is_us_equity_session(now)
+        allow_crossover = should_allow_crossover_signals(
+            current_bar_date,
+            runtime.last_processed_date,
+            market_open,
+        )
 
         eval_state = PositionState.from_dict(position_state.to_dict())
-        signal_result = self.evaluate_bar(
-            eval_state,
-            today,
-            yesterday,
-            mutate_state=False,
-        )
+        eval_state.pending_order = runtime.pending_order
+        eval_state.last_processed_date = runtime.last_processed_date
+        eval_state.latest_bar_date = runtime.latest_bar_date
+        eval_state.held_quantity = runtime.held_quantity
+        eval_state.session_low = runtime.session_low
+
+        signal_result: dict[str, Any]
+        if runtime.pending_order:
+            signal_result = {
+                "signal": "HOLD",
+                "liquidity_ok": self._passes_volume_filter(
+                    today.volume, today.volume_sma
+                ),
+                "pending_order_locked": True,
+            }
+        else:
+            signal_result = self.evaluate_bar(
+                eval_state,
+                today,
+                yesterday,
+                mutate_state=False,
+                allow_crossover=allow_crossover,
+                session_low=session_low,
+            )
 
         stop_distance = today.atr * self.config.atr_multiplier
         position_size = calculate_position_size(
@@ -414,12 +643,85 @@ class LiveSignalEngine:
                 "today": today.to_metrics_dict(),
                 "yesterday": yesterday.to_metrics_dict(),
             },
+            "runtime_state": runtime.to_dict(),
             "position_state": position_state.to_dict(),
-            "signal_result": {
-                k: v for k, v in signal_result.items() if k != "state"
-            },
+            "signal_result": signal_result,
             "position_size": position_size,
+            "current_bar_date": current_bar_date,
+            "session_low": session_low,
+            "allow_crossover": allow_crossover,
+            "market_open": market_open,
             "state_snapshot": self.dump_state(position_state),
+        }
+
+    def apply_post_order_transition(
+        self,
+        runtime: PositionState,
+        signal: str,
+        filled_quantity: int,
+        current_bar_date: str,
+        allow_crossover: bool,
+    ) -> None:
+        """Mutate runtime registry after a confirmed KIS order (rt_cd == 0)."""
+        if signal == "BUY":
+            runtime.in_position = True
+            runtime.held_quantity = filled_quantity
+            runtime.pending_order = False
+            if allow_crossover:
+                runtime.last_processed_date = current_bar_date
+            return
+
+        if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
+            runtime.in_position = False
+            runtime.held_quantity = 0
+            runtime.highest_price_achieved = None
+            runtime.current_atr = None
+            runtime.dynamic_stop_distance = None
+            runtime.trigger_floor = None
+            runtime.session_low = None
+            runtime.pending_order = False
+            if allow_crossover and signal == "SELL":
+                runtime.last_processed_date = current_bar_date
+            elif signal == "DYNAMIC_ATR_SELL":
+                runtime.last_processed_date = current_bar_date
+            return
+
+        runtime.pending_order = False
+
+    def mark_crossover_processed(
+        self,
+        runtime: PositionState,
+        current_bar_date: str,
+        allow_crossover: bool,
+        signal: str,
+    ) -> None:
+        """Record that crossover logic ran for this daily bar without duplication."""
+        if not allow_crossover:
+            return
+        if signal in {"BUY", "SELL", "HOLD"}:
+            runtime.last_processed_date = current_bar_date
+
+    def evaluate_session(
+        self,
+        df: pd.DataFrame,
+        external_state: dict[str, Any] | None = None,
+        end_index: int | None = None,
+        capital_at_risk: float = 10_000.0,
+        risk_per_trade: float = 0.01,
+    ) -> dict[str, Any]:
+        """Backward-compatible session wrapper used by tests and legacy callers."""
+        cycle = self.evaluate_trading_cycle(
+            df,
+            runtime_state=external_state,
+            capital_at_risk=capital_at_risk,
+            risk_per_trade=risk_per_trade,
+        )
+        return {
+            "metrics": cycle["metrics"],
+            "position_state": cycle["position_state"],
+            "signal_result": cycle["signal_result"],
+            "position_size": cycle["position_size"],
+            "state_snapshot": cycle["state_snapshot"],
         }
 
 
@@ -534,5 +836,11 @@ def evaluate_live_signal(
     )
 
     state = engine.load_state(position_state)
-    result = engine.evaluate_bar(state, today, yesterday, mutate_state=False)
+    result = engine.evaluate_bar(
+        state,
+        today,
+        yesterday,
+        mutate_state=False,
+        allow_crossover=True,
+    )
     return {k: v for k, v in result.items() if k != "state"}
