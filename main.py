@@ -33,6 +33,7 @@ from analytics import (
     LiveSignalEngine,
     PositionState,
     StrategyConfig,
+    describe_us_market_closure,
     is_us_equity_session,
 )
 
@@ -86,6 +87,7 @@ CAPITAL_AT_RISK = float(os.getenv("CAPITAL_AT_RISK", "10000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
+MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
 
 STRATEGY_CONFIG = StrategyConfig.from_env()
 
@@ -850,7 +852,11 @@ def run_watchlist_cycle(
     summary: list[tuple[str, str]] = []
 
     if not is_us_equity_session():
-        print("[GATE] US equity session closed (weekend) — crossover signals suppressed")
+        closure_reason = describe_us_market_closure() or "market closed"
+        print(
+            f"[GATE] US equity session closed ({closure_reason}) — "
+            "crossover signals suppressed"
+        )
 
     for index, ticker in enumerate(WATCHLIST):
         try:
@@ -893,6 +899,7 @@ def main() -> None:
     print(f"State File          : {STATE_FILE}")
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
+    print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
     print("=" * 88)
 
     client = KISApiClient()
@@ -922,6 +929,21 @@ def main() -> None:
         while True:
             cycle_count += 1
             cycle_started = datetime.now()
+            closure_reason = describe_us_market_closure(cycle_started)
+
+            if closure_reason is not None:
+                print()
+                print(
+                    f"--- Cycle {cycle_count} skipped at "
+                    f"{cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---"
+                )
+                print(
+                    f"[GATE] US market closed ({closure_reason}). "
+                    f"Sleeping {MARKET_CLOSED_SLEEP_SECONDS} seconds..."
+                )
+                time.sleep(MARKET_CLOSED_SLEEP_SECONDS)
+                continue
+
             print()
             print(
                 f"--- Cycle {cycle_count} started at "

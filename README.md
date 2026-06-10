@@ -4,12 +4,14 @@ An automated quantitative trading infrastructure and empirical data collection p
 
 | Field | Value |
 |---|---|
-| **Current Phase** | **Phase 4** — Production-Grade Execution Engine & State-Gated Order Lifecycle |
+| **Current Phase** | **Phase 4** — Production-Grade Execution Engine, Mathematical Logic Corrections & State-Gated Order Lifecycle |
 | **Watchlist** | Configurable via `.env` (`WATCHLIST`); default `NVDA`, `PLTR`, `AAPL` |
 | **Broker Infrastructure** | Korea Investment & Securities (KIS) Developers API (Virtual Trading Server) |
 | **Target Unified Account** | `CANO` + `KIS_ACNT_PRDT_CD` from `.env` (no hardcoded credentials) |
 | **Initial Capital Base** | `CAPITAL_AT_RISK` from `.env` (default `$10,000` per sizing model) |
 | **Data Architecture** | Bootstrap full history once → 1-bar micro-fetch per 60-second cycle |
+| **Session Gate** | NYSE holiday registry + weekday filter (`is_us_equity_session()`) |
+| **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
 
 ---
 
@@ -17,20 +19,24 @@ An automated quantitative trading infrastructure and empirical data collection p
 
 1. [Project Evolution & Development Milestones (Phase 1 – 4)](#1-project-evolution--development-milestones-phase-1--4)
 2. [Phase 4 Production Architecture Overview](#2-phase-4-production-architecture-overview)
-3. [Dynamic Memory Window Caching (`MarketDataCache`)](#3-dynamic-memory-window-caching-marketdatacache)
-4. [State-Gated Synchronous Order Lifecycle Chain](#4-state-gated-synchronous-order-lifecycle-chain)
-5. [Hybrid EOD and Intraday Scanning Engine](#5-hybrid-eod-and-intraday-scanning-engine)
-6. [Liquidity Gate Calibration](#6-liquidity-gate-calibration)
-7. [Configuration Externalization Matrix](#7-configuration-externalization-matrix)
-8. [System Architecture & Core Subsystems](#8-system-architecture--core-subsystems)
-9. [Infrastructure Patch Ledger (VTS Mock API Bypasses)](#9-infrastructure-patch-ledger-vts-mock-api-bypasses)
-10. [Signal Priority & Execution Rules](#10-signal-priority--execution-rules)
-11. [Optimized Strategy Parameters](#11-optimized-strategy-parameters)
-12. [Operational Guidelines](#12-operational-guidelines)
-13. [KIS API Reference (Live Production Paths)](#13-kis-api-reference-live-production-paths)
-14. [Project Structure](#14-project-structure)
-15. [Academic Regime Mapping (Watchlist Design)](#15-academic-regime-mapping-watchlist-design)
-16. [License & Disclaimer](#license--disclaimer)
+3. [Look-Ahead Bias Eradication (Same-Bar Sequential Integrity)](#3-look-ahead-bias-eradication-same-bar-sequential-integrity)
+4. [Refactored RSI Momentum Exit (Crossdown Mode)](#4-refactored-rsi-momentum-exit-crossdown-mode)
+5. [Dual-Clamp Capital-Resilient Position Sizing](#5-dual-clamp-capital-resilient-position-sizing)
+6. [NYSE Holiday Registry Infrastructure](#6-nyse-holiday-registry-infrastructure)
+7. [Dynamic Memory Window Caching (`MarketDataCache`)](#7-dynamic-memory-window-caching-marketdatacache)
+8. [State-Gated Synchronous Order Lifecycle Chain](#8-state-gated-synchronous-order-lifecycle-chain)
+9. [Hybrid EOD and Intraday Scanning Engine](#9-hybrid-eod-and-intraday-scanning-engine)
+10. [Liquidity Gate Calibration](#10-liquidity-gate-calibration)
+11. [Configuration Externalization Matrix](#11-configuration-externalization-matrix)
+12. [System Architecture & Data Topology](#12-system-architecture--data-topology)
+13. [Infrastructure Patch Ledger (VTS Mock API Bypasses)](#13-infrastructure-patch-ledger-vts-mock-api-bypasses)
+14. [Signal Priority & Execution Rules](#14-signal-priority--execution-rules)
+15. [Optimized Strategy Parameters](#15-optimized-strategy-parameters)
+16. [Operational Guidelines](#16-operational-guidelines)
+17. [KIS API Reference (Live Production Paths)](#17-kis-api-reference-live-production-paths)
+18. [Project Structure](#18-project-structure)
+19. [Academic Regime Mapping (Watchlist Design)](#19-academic-regime-mapping-watchlist-design)
+20. [License & Disclaimer](#license--disclaimer)
 
 ---
 
@@ -55,10 +61,14 @@ An automated quantitative trading infrastructure and empirical data collection p
 
 ### Phase 4: Production-Grade Execution Engine *(Current)*
 
-Phase 4 evolved from a fragile infinite polling loop into a **robust, production-ready quantitative execution engine**. The refactor preserves all existing infrastructure assets — KIS API wrappers, `.env` overrides, OAuth token caching, and KIS VTS exchange proxies for `PLTR` via `NASD` — while introducing five core architectural upgrades:
+Phase 4 evolved from a fragile infinite polling loop into a **robust, production-ready quantitative execution engine** with rigorous **mathematical logic corrections**. The refactor preserves all existing infrastructure assets — KIS API wrappers, `.env` overrides, OAuth token caching, and KIS VTS exchange proxies for `PLTR` via `NASD` — while delivering the following architectural and quantitative upgrades:
 
 | Upgrade | Module | Summary |
 |---|---|---|
+| **Same-Bar Sequential Integrity** | `analytics.py` + `strategy.py` | ATR stop evaluated against *prior* floor before peak update — eliminates look-ahead bias |
+| **RSI Crossdown Exit** | `analytics.py` + `strategy.py` | Exit only on verified crossdown event, not blind >70 threshold |
+| **Dual-Clamp Position Sizing** | `analytics.py` | Risk budget ∩ capital budget prevents over-leverage rejections |
+| **NYSE Holiday Registry** | `analytics.py` + `main.py` | Full US market calendar replaces naive `weekday < 5` gate |
 | **Dynamic Memory Window Caching** | `main.py` → `MarketDataCache` | Full 756-bar bootstrap once; 1-bar micro-fetch per cycle |
 | **State-Gated Order Lifecycle** | `main.py` + `analytics.py` | Deterministic dispatch → verify → lock → persist → transition |
 | **Hybrid EOD / Intraday Engine** | `analytics.py` | Bar-trailing crossover gate + continuous ATR stop scanning |
@@ -68,15 +78,14 @@ Phase 4 evolved from a fragile infinite polling loop into a **robust, production
 Additional hardening delivered in Phase 4:
 
 - **Exact liquidation quantity synchronization**: SELL orders clamp to `held_quantity` in persisted state — never sell more than locally tracked holdings.
-- **Weekday market session gate**: Crossover signals suppressed on weekends via `is_us_equity_session()`.
 - **Non-blocking balance inquiry**: `try_print_mock_account_balance()` remains optional; loop never deadlocks on VTS suffix mismatches.
-- **Backtest parity**: `strategy.py` volume gate aligned to analytics (`volume > volume_sma × 1.2`).
+- **Backtest/live parity**: `strategy.py` and `analytics.py` share identical trailing-stop sequence, RSI crossdown logic, and volume gate rules.
 
 ---
 
 ## 2. Phase 4 Production Architecture Overview
 
-The live engine operates as a **self-contained state machine** orchestrated by `main.py` and evaluated by `LiveSignalEngine` in `analytics.py`. Each 60-second cycle follows a deterministic pipeline:
+The live engine operates as a **self-contained state machine** orchestrated by `main.py` and evaluated by `LiveSignalEngine` in `analytics.py`. Each monitoring cycle follows a deterministic pipeline:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -87,16 +96,18 @@ The live engine operates as a **self-contained state machine** orchestrated by `
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    MONITORING LOOP (every LOOP_COOLDOWN_SECONDS)            │
+│              MONITORING LOOP (every LOOP_COOLDOWN_SECONDS = 60)             │
 │                                                                             │
-│  For each ticker in WATCHLIST:                                              │
-│    1. MarketDataCache.refresh_latest()     ← 1-bar micro-fetch only         │
-│    2. LiveSignalEngine.evaluate_trading_cycle()  ← hybrid EOD + intraday      │
-│    3. print_session_telemetry()             ← [METRICS] stream              │
-│    4. dispatch_order_with_state_machine()   ← if actionable signal          │
-│    5. save trading_state.json               ← deterministic persist         │
-│                                                                             │
-│  sleep(LOOP_COOLDOWN_SECONDS)                                               │
+│  IF describe_us_market_closure() != None:                                   │
+│      → skip entire cycle, sleep MARKET_CLOSED_SLEEP_SECONDS (3600)          │
+│  ELSE:                                                                      │
+│      For each ticker in WATCHLIST:                                          │
+│        1. MarketDataCache.refresh_latest()     ← 1-bar micro-fetch only     │
+│        2. LiveSignalEngine.evaluate_trading_cycle()                         │
+│        3. print_session_telemetry()             ← [METRICS] stream          │
+│        4. dispatch_order_with_state_machine()   ← if actionable signal    │
+│        5. save trading_state.json               ← deterministic persist     │
+│      sleep(LOOP_COOLDOWN_SECONDS)                                           │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -115,7 +126,7 @@ Each watchlist ticker maintains an isolated `PositionState` record persisted to 
 | `highest_price_achieved` | `float \| null` | Peak close since entry (trailing stop anchor) |
 | `current_atr` | `float \| null` | Latest Wilder ATR(14) at evaluation time |
 | `dynamic_stop_distance` | `float \| null` | `ATR × atr_multiplier` |
-| `trigger_floor` | `float \| null` | `highest_price_achieved − dynamic_stop_distance` |
+| `trigger_floor` | `float \| null` | **Prior-bar** trailing floor: `highest_price_achieved − dynamic_stop_distance` |
 
 Example persisted entry:
 
@@ -136,9 +147,314 @@ Example persisted entry:
 }
 ```
 
+The **`trigger_floor`** field is the critical persisted artifact for look-ahead-free stop evaluation: it reflects the floor computed at the *end of the previous bar*, never inflated by the current bar's close before the intraday low check runs.
+
 ---
 
-## 3. Dynamic Memory Window Caching (`MarketDataCache`)
+## 3. Look-Ahead Bias Eradication (Same-Bar Sequential Integrity)
+
+### Problem Statement
+
+A common quantitative pitfall occurs when a trailing stop engine **updates the highest peak and recalculates the trigger floor using the current bar's close** *before* testing whether the current bar's low breached the prior floor. This introduces **same-bar look-ahead bias**: the stop floor is artificially raised by information (the close) that would not have been known at the moment the intraday low occurred.
+
+This bias affects both:
+- **Historical backtests** (`strategy.py` / Backtrader `SmaCross.next()`)
+- **Live evaluation cycles** (`analytics.py` / `LiveSignalEngine.evaluate_bar()`)
+
+### Corrected 3-Step Position-Active Sequence
+
+When a position is active, both modules now execute this **strict sequential integrity chain**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  POSITION ACTIVE — Same-Bar Sequential Integrity (No Look-Ahead)          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  STEP 1 — Prior-Floor ATR Stop Check (IMMEDIATE)                        │
+│  ───────────────────────────────────────────────                        │
+│  Condition:  Low_t ≤ Prior Trigger Floor                                │
+│              (uses persisted trigger_floor / self.trigger_floor)         │
+│              NOT recalculated with current bar close                     │
+│                                                                         │
+│  If TRUE  → DYNAMIC_ATR_SELL / self.close() → RETURN (exit bar logic)   │
+│  If FALSE → proceed to Step 2                                           │
+│                                                                         │
+│  STEP 2 — Trailing State Update (SURVIVAL CONFIRMED ONLY)               │
+│  ─────────────────────────────────────────────────────────              │
+│  Update highest_price_achieved with current close (if higher)           │
+│  Recalculate dynamic_stop_distance and trigger_floor with current ATR   │
+│                                                                         │
+│  STEP 3 — Alternative Standard Exits                                    │
+│  ────────────────────────────────────                                   │
+│  Evaluate Death Cross (Close_t < SMA_10 cross)                          │
+│  Evaluate RSI Crossdown exit (see Section 4)                            │
+│  If triggered → SELL / self.close()                                     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Mathematical Stop Condition (Step 1)
+
+$$
+\text{Liquidation Trigger} \iff \text{Low}_t \le \text{Prior Trigger Floor}
+$$
+
+Where:
+
+$$
+\text{Prior Trigger Floor} = \text{Peak}_{t-1} - (\text{ATR}_{t-1} \times \text{Multiplier})
+$$
+
+The prior floor is read from persisted state (`PositionState.trigger_floor` in live mode, `self.trigger_floor` in backtest mode) **without** first applying $\text{Close}_t$ to the peak.
+
+### Implementation Map
+
+| Step | `analytics.py` (`evaluate_bar`) | `strategy.py` (`SmaCross.next`) |
+|---|---|---|
+| **1** | `_dynamic_atr_stop_triggered(state, effective_low)` using prior `trigger_floor` | `_dynamic_atr_stop_triggered(bar_low)` using prior `self.trigger_floor` |
+| **2** | `_update_trailing_state(state, bar.close, bar.atr)` | `_update_trailing_state(close)` → recomputes `self.trigger_floor` |
+| **3** | `_death_cross()` OR `_rsi_triggers_exit(rsi, prev_rsi)` | `crossover < 0` OR `_rsi_triggers_exit()` |
+
+### Live Intraday Extension
+
+During live 60-second polling cycles, Step 1 uses the **running session low** (`session_low`) rather than only the static EOD low from the dataframe row:
+
+$$
+\text{session\_low} = \min(\text{Low observed on active daily bar})
+$$
+
+$$
+\text{Liquidation Trigger (live)} \iff \text{session\_low} \le \text{Prior Trigger Floor}
+$$
+
+This preserves intraday risk protection without re-firing crossover signals on the same daily bar.
+
+### Verification
+
+`test_analytics.py` Test 3 validates the corrected sequence:
+
+1. **BUY** at close 101.0 — peak and floor initialized.
+2. **HOLD** at close 110.0 — floor updated to 106.0 only after surviving Step 1.
+3. **DYNAMIC_ATR_SELL** when bar low (105.50) ≤ prior floor (106.00) — stop fires **before** any close-based peak inflation on that bar.
+
+---
+
+## 4. Refactored RSI Momentum Exit (Crossdown Mode)
+
+### Problem Statement
+
+The RSI overbought exit must **not** trigger blindly upon entering the >70 territory. A position could remain valid while RSI sustains above 70 during a strong trend. Exiting merely because $\text{RSI}_t > 70$ would cause premature liquidation and diverge from the Phase 2 optimization intent.
+
+### Crossdown Exit Specification (Default Mode)
+
+The system executes RSI exits only on a verified **Crossdown event**:
+
+$$
+\text{RSI Exit Trigger} \iff \text{RSI}_{t-1} \ge 70 \quad \text{AND} \quad \text{RSI}_t < 70
+$$
+
+| Mode | Env Variable | Condition | Use Case |
+|---|---|---|---|
+| **crossdown** *(default)* | `RSI_EXIT_MODE=crossdown` | $\text{RSI}_{t-1} \ge \text{upper\_limit}$ AND $\text{RSI}_t < \text{upper\_limit}$ | Confirmed momentum reversal from overbought |
+| **threshold** | `RSI_EXIT_MODE=threshold` | $\text{RSI}_t > \text{upper\_limit}$ | Aggressive overbought exit (non-default) |
+
+Default `upper_limit = 70` (override via `RSI_UPPER_LIMIT` in `.env`).
+
+### Implementation Parity
+
+Both execution paths implement identical crossdown logic:
+
+**`analytics.py` — `LiveSignalEngine._rsi_triggers_exit()`**
+
+```python
+def _rsi_triggers_exit(self, rsi: float, prev_rsi: float) -> bool:
+    upper = self.config.rsi_upper_limit
+    if self.config.rsi_exit_mode == "threshold":
+        return rsi > upper
+    return prev_rsi >= upper and rsi < upper
+```
+
+**`strategy.py` — `SmaCross._rsi_triggers_exit()`**
+
+```python
+def _rsi_triggers_exit(self) -> bool:
+    upper = self.params.rsi_sell_threshold
+    if self.params.rsi_exit_mode == "threshold":
+        return float(self.rsi[0]) > upper
+    return float(self.rsi[-1]) >= upper and float(self.rsi[0]) < upper
+```
+
+### Execution Priority Relative to ATR Stop
+
+RSI crossdown evaluation occurs exclusively in **Step 3** — after the position survives the prior-floor ATR stop check (Step 1) and trailing state update (Step 2). This ordering guarantees that volatility liquidation takes precedence over momentum reversal signals.
+
+---
+
+## 5. Dual-Clamp Capital-Resilient Position Sizing
+
+### Problem Statement
+
+Pure risk-based sizing ($\lfloor \text{Dollar Risk} / \text{Stop Distance} \rfloor$) can propose share counts whose **notional cost exceeds deployable capital**, especially on high-priced momentum names such as `PLTR`. KIS mock and live brokers reject these orders with insufficient-funds errors, particularly when micro-volatility scaling produces oversized risk allocations.
+
+### Dual-Constraint Framework
+
+`calculate_position_size()` in `analytics.py` computes a **dual-clamp** that intersects the risk budget with the capital budget:
+
+$$
+\text{shares\_by\_risk} = \left\lfloor \frac{\text{Dollar Risk}}{\text{Stop Distance}} \right\rfloor
+$$
+
+$$
+\text{shares\_by\_capital} = \left\lfloor \frac{\text{Capital At Risk}}{\text{Current Price}} \right\rfloor
+$$
+
+$$
+\text{Final Shares} = \max\left(1,\; \min(\text{shares\_by\_risk},\; \text{shares\_by\_capital})\right)
+$$
+
+Where:
+
+| Variable | Source | Description |
+|---|---|---|
+| **Dollar Risk** | `CAPITAL_AT_RISK × RISK_PER_TRADE` | Maximum capital willing to lose per trade |
+| **Stop Distance** | `ATR(14) × atr_multiplier` | Dynamic trailing stop width at entry |
+| **Capital At Risk** | `.env` `CAPITAL_AT_RISK` | Deployable capital ceiling for notional sizing |
+| **Current Price** | Latest bar close | Entry price proxy for notional calculation |
+
+### Guard Conditions
+
+The function returns **`0`** (no order) when:
+
+- `entry_price <= 0`, `stop_distance <= 0`, or `risk_per_trade <= 0`
+- `deployable capital <= 0`
+- Either `shares_by_risk <= 0` or `shares_by_capital <= 0`
+
+Otherwise it returns at least **1 share** when both constraints permit trading.
+
+### Implementation
+
+```python
+def calculate_position_size(
+    capital_at_risk: float,
+    risk_per_trade: float,
+    entry_price: float,
+    stop_distance: float,
+    available_capital: float | None = None,
+) -> int:
+    deployable = available_capital if available_capital is not None else capital_at_risk
+    dollar_risk = capital_at_risk * risk_per_trade
+    shares_by_risk = int(dollar_risk / stop_distance)
+    shares_by_capital = int(deployable / entry_price)
+    if shares_by_risk <= 0 or shares_by_capital <= 0:
+        return 0
+    return max(1, min(shares_by_risk, shares_by_capital))
+```
+
+Called from `LiveSignalEngine.evaluate_trading_cycle()` with `available_capital=capital_at_risk`.
+
+### Worked Example
+
+| Parameter | Value |
+|---|---|
+| `CAPITAL_AT_RISK` | $10,000 |
+| `RISK_PER_TRADE` | 1% → Dollar Risk = $100 |
+| `ATR(14)` | $4.00 → Stop Distance = $8.00 (×2.0) |
+| `Current Price` | $180.00 (e.g., PLTR) |
+
+$$
+\text{shares\_by\_risk} = \lfloor 100 / 8.0 \rfloor = 12
+$$
+
+$$
+\text{shares\_by\_capital} = \lfloor 10{,}000 / 180.0 \rfloor = 55
+$$
+
+$$
+\text{Final Shares} = \max(1,\; \min(12,\; 55)) = 12
+$$
+
+If price were $900 with the same risk parameters:
+
+$$
+\text{shares\_by\_capital} = \lfloor 10{,}000 / 900.0 \rfloor = 11
+$$
+
+$$
+\text{Final Shares} = \max(1,\; \min(12,\; 11)) = 11 \quad \text{(capital clamp binds)}
+$$
+
+---
+
+## 6. NYSE Holiday Registry Infrastructure
+
+### Problem Statement
+
+The legacy session gate (`weekday < 5`) treated **US market holidays as normal trading days**, causing the monitoring loop to:
+
+- Query stale broker environments on full market closures
+- Waste API quota on days with no meaningful price discovery
+- Risk network-layer instability from repeated failed or empty responses
+
+### Replacement Architecture
+
+The simple weekday check has been replaced with a **full-scale automated US Market Holiday Calendar framework** in `analytics.py`, consumed by `main.py` for loop gating.
+
+#### Core Functions
+
+| Function | Module | Purpose |
+|---|---|---|
+| `us_market_holidays_for_year(year)` | `analytics.py` | Returns `{date: holiday_name}` registry for a calendar year |
+| `is_us_market_holiday(day)` | `analytics.py` | Boolean holiday check for a given date |
+| `describe_us_market_closure(now)` | `analytics.py` | Returns `"weekend"`, holiday name, or `None` (open) |
+| `is_us_equity_session(now)` | `analytics.py` | `True` only on non-weekend, non-holiday dates |
+
+#### Registered NYSE Full-Day Closures
+
+| Holiday | Calculation Rule | Observed-Date Handling |
+|---|---|---|
+| **New Year's Day** | January 1 | Friday if Saturday; Monday if Sunday |
+| **Memorial Day** | Last Monday in May | Floating |
+| **Independence Day** | July 4 | Friday if Saturday; Monday if Sunday |
+| **Labor Day** | First Monday in September | Floating |
+| **Thanksgiving** | Fourth Thursday in November | Floating |
+| **Christmas** | December 25 | Friday if Saturday; Monday if Sunday |
+
+#### Holiday Registry Implementation
+
+```python
+def us_market_holidays_for_year(year: int) -> dict[date, str]:
+    return {
+        _observed_fixed_holiday(year, 1, 1): "New Year's Day",
+        _memorial_day(year): "Memorial Day",
+        _observed_fixed_holiday(year, 7, 4): "Independence Day",
+        _labor_day(year): "Labor Day",
+        _thanksgiving_day(year): "Thanksgiving",
+        _observed_fixed_holiday(year, 12, 25): "Christmas",
+    }
+```
+
+### Extended Sleep Cycle on Market Closure
+
+When `describe_us_market_closure()` returns a non-`None` value (weekend or registered holiday), `main.py` **skips the entire watchlist cycle** and enters an extended sleep:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MARKET_CLOSED_SLEEP_SECONDS` | **3600** (1 hour) | Sleep duration when market is closed |
+
+```
+--- Cycle N skipped at 2026-12-25 09:00:00 ---
+[GATE] US market closed (Christmas). Sleeping 3600 seconds...
+```
+
+During open sessions, the standard `LOOP_COOLDOWN_SECONDS = 60` inter-cycle pause applies.
+
+### Crossover Signal Interaction
+
+`is_us_equity_session()` feeds into `should_allow_crossover_signals()`, suppressing BUY/SELL crossover evaluation on weekends and holidays. Priority-1 `DYNAMIC_ATR_SELL` intraday scanning remains architecturally available during partial sessions when the loop runs; on full closure days the cycle skip prevents all broker queries entirely.
+
+---
+
+## 7. Dynamic Memory Window Caching (`MarketDataCache`)
 
 ### Problem Addressed
 
@@ -207,7 +523,7 @@ The in-memory DataFrame and on-disk CSV stay synchronized: after each `refresh_l
 
 ---
 
-## 4. State-Gated Synchronous Order Lifecycle Chain
+## 8. State-Gated Synchronous Order Lifecycle Chain
 
 ### Problem Addressed
 
@@ -215,7 +531,7 @@ The legacy loop evaluated an EOD strategy every 60 seconds against the same dail
 
 ### Solution: Deterministic Sequential Pipeline
 
-All order execution flows through `dispatch_order_with_state_machine()` in `main.py`. The lifecycle enforces strict ordering with **no state mutation before broker verification**:
+All order execution flows through `dispatch_order_with_state_machine()` in `main.py`:
 
 ```
 ┌──────────────┐    ┌─────────────────┐    ┌──────────────────────┐
@@ -246,73 +562,26 @@ All order execution flows through `dispatch_order_with_state_machine()` in `main
 | **6** | **Execution Confirmation** — `apply_post_order_transition()` updates position, clears lock | `analytics.py` | Full transition |
 | **7** | **Final Persist** — `save_persisted_states()` with confirmed state | `main.py` | Committed |
 
-### Concurrency Lock Semantics
-
-When `pending_order` is `True`:
-
-- `evaluate_trading_cycle()` returns `signal: "HOLD"` with `pending_order_locked: True`.
-- `dispatch_order_with_state_machine()` immediately returns `LOCKED` without contacting KIS.
-- The lock prevents duplicate order spam across consecutive 60-second cycles.
-
-If the process crashes between Step 5 (interim save) and Step 6 (transition), `pending_order` remains `True` on restart, blocking further orders until manual intervention or state correction — a deliberate trade-off favoring **no duplicate transmissions** over **automatic retry**.
-
-### Post-Order State Transitions (`apply_post_order_transition`)
-
-| Signal | `in_position` | `held_quantity` | Trailing Fields | `last_processed_date` |
-|---|---|---|---|---|
-| `BUY` | `True` | `filled_quantity` | Peak initialized | Set to `current_bar_date` |
-| `SELL` | `False` | `0` | Cleared | Set to `current_bar_date` |
-| `DYNAMIC_ATR_SELL` | `False` | `0` | Cleared | Set to `current_bar_date` |
-
-All transitions set `pending_order = False` upon completion.
-
 ### Exact Liquidation Quantity Synchronization
 
-Before any `SELL` or `DYNAMIC_ATR_SELL`, `_resolve_execution_quantity()` enforces:
+Before any `SELL` or `DYNAMIC_ATR_SELL`:
 
 ```
 execution_quantity = min(proposed_size, held_quantity)
 ```
 
-If `held_quantity <= 0`, the liquidation is skipped entirely — preventing broker rejections from order volume exceeding held balance. This replaces the legacy pattern of issuing market sells using static calculated targets (`quantity = size`) that could mismatch real holdings.
+If `held_quantity <= 0`, liquidation is skipped — preventing broker rejections from order volume exceeding held balance.
 
 ---
 
-## 5. Hybrid EOD and Intraday Scanning Engine
+## 9. Hybrid EOD and Intraday Scanning Engine
 
-### Problem Addressed
+### Dual-Mode Evaluation Architecture
 
-Running an EOD (end-of-day) crossover strategy inside a 60-second polling loop caused **identical daily bars to be evaluated repeatedly**, re-firing golden-cross and death-cross signals on every cycle. The system also attempted crossover evaluation on **weekends** when US equity markets are closed.
-
-### Solution: Dual-Mode Evaluation Architecture
-
-`LiveSignalEngine.evaluate_trading_cycle()` in `analytics.py` implements a **hybrid scanning model**:
+`LiveSignalEngine.evaluate_trading_cycle()` implements:
 
 - **EOD crossover baseline** — BUY/SELL signals fire at most **once per daily bar**.
-- **Intraday risk engine** — Priority-1 `DYNAMIC_ATR_SELL` scans continuously every 60 seconds using the running session low.
-
-```
-                    evaluate_trading_cycle()
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-    is_us_equity_session()          update_session_low()
-    (weekday gate)                  (track min low on active bar)
-              │                               │
-              └───────────────┬───────────────┘
-                              ▼
-              should_allow_crossover_signals()
-                              │
-              ┌───────────────┴───────────────┐
-              │                               │
-     allow_crossover = True          allow_crossover = False
-     (new bar + weekday)             (same bar OR weekend)
-              │                               │
-              ▼                               ▼
-    Full evaluate_bar():            evaluate_bar() with
-    ATR stop + BUY + SELL           crossover suppressed:
-                                    ATR stop ONLY
-```
+- **Intraday risk engine** — Priority-1 `DYNAMIC_ATR_SELL` uses running `session_low` every 60 seconds.
 
 ### Bar-Trailing Gate: `should_allow_crossover_signals()`
 
@@ -331,49 +600,20 @@ def should_allow_crossover_signals(
 
 | Condition | Crossover BUY/SELL | DYNAMIC_ATR_SELL |
 |---|---|---|
-| New daily bar + weekday | **Allowed** | **Active** |
-| Same daily bar (`current_bar_date == last_processed_date`) | **Suppressed** | **Active** |
-| Weekend (`market_open == False`) | **Suppressed** | **Active** (if in position) |
+| New daily bar + open session | **Allowed** | **Active** |
+| Same daily bar | **Suppressed** | **Active** (session_low scan) |
+| Weekend or NYSE holiday | **Suppressed** | Cycle skipped entirely |
 | `pending_order == True` | **Suppressed** (locked) | **Suppressed** (locked) |
 
-When crossover is suppressed, `evaluate_bar()` returns `HOLD` with `crossover_suppressed: True` — but the **Priority-1 ATR stop path executes first**, before the crossover gate is checked.
-
-### Intraday Session Low Tracking
-
-On each cycle, `update_session_low()` maintains the minimum low observed for the active daily bar:
-
-```
-If latest_bar_date != current_bar_date:
-    session_low = bar.low          ← new trading day reset
-Else:
-    session_low = min(session_low, bar.low)   ← intraday accumulation
-```
-
-The ATR liquidation trigger uses this **running session low** rather than only the static EOD low stored in the historical dataframe row:
-
-```
-Liquidation Trigger:  session_low ≤ trigger_floor
-Where:
-    trigger_floor = highest_price_achieved − (ATR(14) × 2.0)
-```
-
-This guarantees the system acts as a **true intraday risk engine** over an EOD signal baseline — protecting open positions between daily bar closes without re-firing duplicate entry/exit crossover signals.
-
-### Crossover Deduplication on HOLD
-
-When no order is placed and crossover evaluation is allowed, `mark_crossover_processed()` sets `last_processed_date = current_bar_date` for `BUY`, `SELL`, and `HOLD` signals — ensuring the same bar's crossover logic is not re-evaluated on subsequent 60-second cycles.
+When crossover is suppressed, Step 1 (prior-floor ATR stop) still executes before the crossover gate — preserving intraday risk protection on open-session same-bar cycles.
 
 ---
 
-## 6. Liquidity Gate Calibration
+## 10. Liquidity Gate Calibration
 
 ### Institutional Volume Surge Filter
 
-Long entry (`BUY`) signals require confirmation of an **institutional volume surge** — participation materially above the 20-day average — before capital is deployed. This mitigates slippage and false breakouts on thin-volume sessions, particularly on high-momentum names such as `PLTR`.
-
-### Precise Filtering Rule
-
-Implemented identically in `analytics.py` (`LiveSignalEngine._passes_volume_filter`) and `strategy.py` (`SmaCross._passes_volume_filter`):
+Long entry (`BUY`) signals require an **institutional volume surge**:
 
 ```
 Volume Gate PASS (entry permitted):
@@ -385,13 +625,7 @@ Volume Gate FAIL (signal downgraded to HOLD):
 Default: volume_threshold = 1.2  (120% of 20-day average)
 ```
 
-Where:
-
-- `Volume_t` — latest session volume from the active daily bar.
-- `Volume_SMA_20` — simple moving average of volume over `volume_sma_period = 20` bars.
-- `volume_threshold` — configurable via `.env` (`VOLUME_THRESHOLD`) or `StrategyConfig.from_env()`.
-
-### Signal Interaction
+Implemented identically in `analytics.py` (`LiveSignalEngine._passes_volume_filter`) and `strategy.py` (`SmaCross._passes_volume_filter`).
 
 | Signal | Volume Gate Required? | Behavior on FAIL |
 |---|---|---|
@@ -400,7 +634,7 @@ Where:
 | `DYNAMIC_ATR_SELL` | No | Risk liquidation proceeds regardless |
 | `HOLD` | N/A | Default state |
 
-The `[METRICS]` telemetry stream reports the live volume ratio for empirical validation:
+Sample `[METRICS]` volume ratio line:
 
 ```
 [METRICS] PLTR | 2026-06-05 14:30:01 | Close=142.50 | SMA20=138.20 | RSI=58.32 |
@@ -411,17 +645,17 @@ A ratio below `1.200x` indicates the liquidity gate would block a concurrent BUY
 
 ---
 
-## 7. Configuration Externalization Matrix
+## 11. Configuration Externalization Matrix
 
 ### Zero-Leak Environment Architecture
 
-Phase 4 eliminates hardcoded watchlist entries, capital baselines, and strategy parameters from orchestrator scripts. All runtime configuration flows through:
+All runtime configuration flows through:
 
 1. **`.env`** — local secrets and deployment overrides (never committed).
 2. **`.env.example`** — documented template with placeholder values (safe to commit).
 3. **`StrategyConfig.from_env()`** — typed dataclass loader with sensible defaults.
 
-`.gitignore` enforces zero credential leakage by excluding:
+`.gitignore` enforces zero credential leakage:
 
 ```
 .env
@@ -431,7 +665,7 @@ project_metrics.log
 __pycache__/
 ```
 
-`load_dotenv(override=True)` in `main.py` ensures `.env` values take precedence over stale shell exports when `CANO`, suffix, or watchlist changes between sessions.
+`load_dotenv(override=True)` ensures `.env` values take precedence over stale shell exports.
 
 ### Environment Variable Reference
 
@@ -448,7 +682,7 @@ __pycache__/
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `WATCHLIST` | No | `NVDA,PLTR,AAPL` | Comma-separated ticker symbols (uppercased at load) |
+| `WATCHLIST` | No | `NVDA,PLTR,AAPL` | Comma-separated ticker symbols |
 | `CAPITAL_AT_RISK` | No | `10000` | USD capital base for position sizing |
 | `RISK_PER_TRADE` | No | `0.01` | Fraction of capital risked per trade (1%) |
 
@@ -456,8 +690,9 @@ __pycache__/
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `LOOP_COOLDOWN_SECONDS` | No | `60` | Inter-cycle pause in the monitoring loop |
-| `TICKER_SLEEP_SECONDS` | No | `1` | Pause between tickers within a single cycle |
+| `LOOP_COOLDOWN_SECONDS` | No | `60` | Inter-cycle pause during open sessions |
+| `TICKER_SLEEP_SECONDS` | No | `1` | Pause between tickers within a cycle |
+| `MARKET_CLOSED_SLEEP_SECONDS` | No | `3600` | Extended sleep on weekends/holidays |
 
 #### Strategy Parameters (via `StrategyConfig.from_env()`)
 
@@ -469,28 +704,13 @@ __pycache__/
 | `VOLUME_SMA_PERIOD` | No | `20` | Volume moving average period |
 | `ATR_MULTIPLIER` | No | `2.0` | Trailing stop buffer multiplier |
 | `RSI_BUY_THRESHOLD` | No | `50` | Minimum RSI for BUY confirmation |
-| `RSI_UPPER_LIMIT` | No | `70` | RSI overbought exit threshold |
+| `RSI_UPPER_LIMIT` | No | `70` | RSI overbought crossdown threshold |
 | `VOLUME_THRESHOLD` | No | `1.2` | Volume surge multiplier (liquidity gate) |
 | `RSI_EXIT_MODE` | No | `crossdown` | `crossdown` or `threshold` |
 | `USE_TRAILING_STOP` | No | `true` | Enable dynamic ATR trailing stop |
 | `EXECUTION_MODE` | No | `eod` | Signal execution timing mode |
 
-### Loading Chain
-
-```
-.env  ──▶  load_dotenv(override=True)
-              │
-              ├─▶  WATCHLIST          → _parse_watchlist() in main.py
-              ├─▶  CAPITAL_AT_RISK    → position sizing in process_ticker()
-              ├─▶  RISK_PER_TRADE     → calculate_position_size() in analytics.py
-              └─▶  StrategyConfig.from_env()  → STRATEGY_CONFIG in main.py
-                                                    └─▶ LiveSignalEngine(STRATEGY_CONFIG)
-                                                         └─▶ strategy.py load_backtest_config()
-```
-
 ### Example `.env` Configuration
-
-Copy from `.env.example` and substitute your credentials:
 
 ```ini
 # KIS Virtual Trading Server credentials
@@ -507,6 +727,7 @@ RISK_PER_TRADE=0.01
 # Loop timing
 LOOP_COOLDOWN_SECONDS=60
 TICKER_SLEEP_SECONDS=1
+MARKET_CLOSED_SLEEP_SECONDS=3600
 
 # Optional strategy overrides
 SMA_PERIOD=10
@@ -515,13 +736,14 @@ ATR_PERIOD=14
 ATR_MULTIPLIER=2.0
 VOLUME_THRESHOLD=1.2
 RSI_EXIT_MODE=crossdown
+RSI_UPPER_LIMIT=70
 ```
 
 **Never commit `.env` to version control.**
 
 ---
 
-## 8. System Architecture & Core Subsystems
+## 12. System Architecture & Data Topology
 
 ### Multi-Asset Tracking Matrix
 
@@ -531,7 +753,7 @@ Each watchlist ticker is processed through an independent analytics pipeline, sh
                      ┌─────────────────────────────────────────────┐
                      │             main.py — Orchestrator          │
                      │   WATCHLIST from .env | MarketDataCache     │
-                     │   dispatch_order_with_state_machine()       │
+                     │   NYSE holiday gate | state-gated orders    │
                      └─────────────────────┬───────────────────────┘
                                            │
           ┌────────────────────────────────┼────────────────────────────────┐
@@ -543,8 +765,8 @@ Each watchlist ticker is processed through an independent analytics pipeline, sh
  │ 1-bar refresh   │              │ 1-bar refresh   │              │ 1-bar refresh   │
  │ evaluate_trading│              │ evaluate_trading│              │ evaluate_trading│
  │ _cycle()        │              │ _cycle()        │              │ _cycle()        │
- │ State machine   │              │ (NASD proxy)    │              │ State machine   │
- │ order dispatch  │              │ order dispatch  │              │ order dispatch  │
+ │ 3-step bar eval │              │ (NASD proxy)    │              │ 3-step bar eval │
+ │ dual-clamp size │              │ dual-clamp size │              │ dual-clamp size │
  └─────────────────┘              └─────────────────┘              └─────────────────┘
           │                                │                                │
           └────────────────────────────────┼────────────────────────────────┘
@@ -556,117 +778,125 @@ Each watchlist ticker is processed through an independent analytics pipeline, sh
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| Orchestration | `main.py` | KIS auth, `MarketDataCache`, 60s watchlist loop, state-gated order routing, `[METRICS]` telemetry |
-| Indicators & State Machine | `analytics.py` | Wilder RSI/ATR, SMA, Volume SMA; `LiveSignalEngine.evaluate_trading_cycle()`; `PositionState` lifecycle |
-| Backtest Strategy | `strategy.py` | Backtrader `SmaCross` with env-driven params, RSI filter, volume gate, dynamic ATR trailing stop |
+| Orchestration | `main.py` | KIS auth, `MarketDataCache`, holiday gate, 60s watchlist loop, state-gated order routing, `[METRICS]` telemetry |
+| Indicators & State Machine | `analytics.py` | Wilder RSI/ATR, SMA, dual-clamp sizing, NYSE calendar, 3-step bar evaluation, `PositionState` lifecycle |
+| Backtest Strategy | `strategy.py` | Backtrader `SmaCross` with identical 3-step trailing sequence and RSI crossdown parity |
 | Persistence | `data/{ticker}_daily.csv`, `trading_state.json` | OHLCV cache mirror and per-ticker runtime registry |
 
 ### Strategic Parameter Telemetry Disconnect
 
-To capture cross-regime statistical divergence for empirical visualization, the pipeline implements an intentional telemetry disconnect:
+- **Execution Signal Engine**: Evaluates entries using $\text{SMA}_{10}$ via `StrategyConfig` for higher breakout sensitivity.
+- **Telemetry Logging Layer**: Independent extraction of $\text{SMA}_{20}$ (`ANALYTICS_SMA_PERIOD = 20` in `main.py`) for external regression and confusion-matrix modeling.
 
-- **Execution Signal Engine**: Evaluates entries using a short-term trend index ($\text{SMA}_{10}$) via `StrategyConfig` for higher breakout sensitivity.
-- **Telemetry Logging Layer**: Independent extraction of a medium-term structural baseline ($\text{SMA}_{20}$) mapped onto the streaming telemetry log for external regression/confusion-matrix modeling (`ANALYTICS_SMA_PERIOD = 20` in `main.py`).
-
-### Position Sizing Formula
-
-Share count is computed by `calculate_position_size()` in `analytics.py`:
+### Continuous Monitoring Loop (Detailed)
 
 ```
-Shares = floor((CAPITAL_AT_RISK × RISK_PER_TRADE) / stop_distance)
-
-Where:
-    stop_distance = ATR(14) × atr_multiplier
+validate_environment()
+  → KIS token (cached: kis_token_cache.json)
+  → MarketDataCache.bootstrap()          # 756 bars × tickers, once
+  → load trading_state.json
+  → try_print_mock_account_balance()     # non-blocking
+  → log_configured_capital_model()
+  → while True:
+        IF market closed (weekend/holiday):
+            sleep(MARKET_CLOSED_SLEEP_SECONDS)
+            continue
+        run_watchlist_cycle()
+        sleep(LOOP_COOLDOWN_SECONDS)
 ```
-
-Both `CAPITAL_AT_RISK` and `RISK_PER_TRADE` are loaded from `.env` — not hardcoded in the orchestrator.
 
 ---
 
-## 9. Infrastructure Patch Ledger (VTS Mock API Bypasses)
+## 13. Infrastructure Patch Ledger (VTS Mock API Bypasses)
 
 During live integration deployment, several severe sandbox anomalies within the KIS Virtual Trading Server (VTS) were programmatically intercepted and neutralized. **All patches remain active in Phase 4.**
 
 ### Incident 1: Core API Query Failure (`403 Forbidden` / Suffix Mismatch)
 
 - **Symptom**: Connection configurations using legacy real-money environments or mismatched product suffixes threw persistent structural verification faults (`INPUT INVALID_CHECK_ACNO`, `OPSQ2000`).
-- **Resolution**: Hardened the authentication wrapper to dynamically prioritize environment overrides (`load_dotenv(override=True)`). Balance inquiry is wrapped in `try_print_mock_account_balance()` — failures are logged as `[INFO]` and never block the monitoring loop. Order placement proceeds under `CAPITAL_AT_RISK` from `.env`, not live balance.
+- **Resolution**: Hardened authentication wrapper with `load_dotenv(override=True)`. Balance inquiry wrapped in `try_print_mock_account_balance()` — failures logged as `[INFO]` and never block the monitoring loop.
 
 ### Incident 2: High-Momentum Target Data Truncation (`PLTR` Candle Drop)
 
-- **Symptom**: Querying daily historical bars for NYSE-listed tickers (`PLTR`) with standard exchange mappings (`excd: "NYS"`) returned an empty bar array (0 bars cached) due to VTS database replication lag.
-- **Resolution**: Patched the routing logic inside the `MARKET_META` configuration block. Forced the execution engine to proxy `PLTR` candle and order execution sequences via the NASDAQ gateway (`excd: "NAS"`, `ovrs_excg_cd: "NASD"`). This effectively bypassed the mock data drop, successfully caching **756** historical bars for quantitative metrics processing.
+- **Symptom**: Querying daily historical bars for NYSE-listed tickers (`PLTR`) with standard exchange mappings (`excd: "NYS"`) returned an empty bar array (0 bars) due to VTS database replication lag.
+- **Resolution**: Patched routing in `MARKET_META`. Forced `PLTR` candle and order execution through the NASDAQ gateway.
 
 ### Incident 3: Invalid Balance TR ID (`VTTT3402R`)
 
-- **Symptom**: User-specified TR ID `VTTT3402R` returned `OPSQ0002` (invalid TR code) on the VTS server.
-- **Resolution**: Confirmed working mock TR for present-balance inquiry is **`VTRP6504R`** (`/uapi/overseas-stock/v1/trading/inquire-present-balance`). Inquiry remains optional and non-blocking.
+- **Symptom**: TR ID `VTTT3402R` returned `OPSQ0002` (invalid TR code) on VTS.
+- **Resolution**: Working mock TR is **`VTRP6504R`** on `/uapi/overseas-stock/v1/trading/inquire-present-balance`. Inquiry remains optional and non-blocking.
 
 ### KIS Exchange Routing Table (`MARKET_META`)
 
-| Ticker | Regime Role | `excd` (Price) | `ovrs_excg_cd` (Orders) |
-|---|---|---|---|
-| `NVDA` | High-volatility market leader | `NAS` | `NASD` |
-| `PLTR` | High-momentum breakout (VTS proxy) | `NAS` | `NASD` |
-| `AAPL` | Low-volatility large-cap baseline | `NAS` | `NASD` |
+| Ticker | Regime Role | `excd` (Price API) | `ovrs_excg_cd` (Order API) | Notes |
+|---|---|---|---|---|
+| `NVDA` | High-volatility market leader | `NAS` | `NASD` | Standard NASDAQ routing |
+| `PLTR` | High-momentum breakout | `NAS` | `NASD` | **VTS proxy** — bypasses 0-bar NYS drop |
+| `AAPL` | Low-volatility large-cap baseline | `NAS` | `NASD` | Standard NASDAQ routing |
 
-New watchlist tickers must be registered in `MARKET_META` inside `main.py` with valid KIS exchange codes before being added to `WATCHLIST` in `.env`.
+New watchlist tickers must be registered in `MARKET_META` inside `main.py` before being added to `WATCHLIST` in `.env`.
 
 ---
 
-## 10. Signal Priority & Execution Rules
+## 14. Signal Priority & Execution Rules
 
-Signal evaluation runs independently per ticker according to strict descending criteria priorities:
+Signal evaluation runs independently per ticker according to strict descending criteria priorities. **Within an active position, Steps 1–3 of Section 3 execute before any signal priority table lookup.**
 
-| Priority | Signal Code | Terminal Banner / Log Ingestion Template | Trigger Condition |
+| Priority | Signal Code | Terminal Banner | Trigger Condition |
 |---|---|---|---|
-| **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position \| market order` | Position active AND $\text{session\_low} \le \text{Peak} - (\text{ATR}_{14} \times 2.0)$ |
-| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position \| market order` | Death Cross ($\text{Close}_t < \text{SMA}_{10}$ while $\text{Close}_{t-1} \ge \text{SMA}_{10}$) OR RSI crossdown exit ($\text{RSI}_{t-1} \ge 70$ and $\text{RSI}_t < 70$) — *only on new daily bar* |
-| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross ($\text{Close}_t > \text{SMA}_{10}$ while $\text{Close}_{t-1} \le \text{SMA}_{10}$) AND $\text{RSI}_{14} \ge 50$ AND Volume Gate **PASS** — *only on new daily bar* |
-| **4** | `HOLD` | `[METRICS] ... Signal: HOLD` | Default state; BUY invalidated if Volume Gate **FAIL** or crossover suppressed |
+| **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{Low}_t \le \text{Prior Trigger Floor}$ (or `session_low` live) |
+| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 3: Death Cross OR RSI crossdown ($\text{RSI}_{t-1} \ge 70$ AND $\text{RSI}_t < 70$) — *new daily bar only* |
+| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross AND $\text{RSI}_{14} \ge 50$ AND Volume Gate PASS — *new daily bar only* |
+| **4** | `HOLD` | `[METRICS] ... Signal: HOLD` | Default; BUY blocked on liquidity fail or crossover suppression |
 
 ### Dynamic ATR Stop Formula
 
 ```
 Dynamic Stop Distance = ATR(14) × 2.0
-Trigger Floor Price   = Highest Close Since Entry − Dynamic Stop Distance
-Liquidation Trigger   = session_low ≤ Trigger Floor    (evaluated every 60 seconds)
+Prior Trigger Floor   = Peak_{t-1} − Dynamic Stop Distance_{t-1}
+Liquidation (Step 1)  = Low_t ≤ Prior Trigger Floor
+Post-Survival Update  = Peak_t = max(Peak_{t-1}, Close_t); recalculate floor
 ```
 
-### Crossover Suppression Rules
+### RSI Exit Formula (Crossdown Mode — Default)
 
-Crossover signals (Priority 2 and 3) are evaluated **only when** `should_allow_crossover_signals()` returns `True`. Priority 1 (`DYNAMIC_ATR_SELL`) is **never suppressed** by the bar-trailing gate (unless `pending_order` is locked).
+$$
+\text{RSI Exit} \iff \text{RSI}_{t-1} \ge 70 \quad \text{AND} \quad \text{RSI}_t < 70
+$$
+
+RSI sustained above 70 without crossing down does **not** trigger an exit.
 
 ---
 
-## 11. Optimized Strategy Parameters
+## 15. Optimized Strategy Parameters
 
-All parameters below are defaults. Override any value via `.env` (see [Configuration Externalization Matrix](#7-configuration-externalization-matrix)).
+All parameters below are defaults. Override via `.env` (see [Section 11](#11-configuration-externalization-matrix)).
 
 | Parameter | Default | Env Override | Description |
 |---|---|---|---|
-| `sma_period` | **10** | `SMA_PERIOD` | Price trend filter (days) — execution signal engine |
-| `ANALYTICS_SMA_PERIOD` | **20** | — | Structural baseline for `[METRICS]` telemetry only (hardcoded in `main.py`) |
-| `rsi_period` | **14** | `RSI_PERIOD` | Momentum oscillator lookback (days); Wilder smoothing |
-| `rsi_buy_threshold` | **50** | `RSI_BUY_THRESHOLD` | Minimum RSI to confirm a BUY signal |
-| `rsi_upper_limit` | **70** | `RSI_UPPER_LIMIT` | RSI overbought exit threshold (crossdown mode) |
-| `rsi_exit_mode` | **crossdown** | `RSI_EXIT_MODE` | Exit when RSI crosses below 70 from above |
-| `atr_period` | **14** | `ATR_PERIOD` | Average True Range lookback (days); Wilder smoothing |
-| `atr_multiplier` | **2.0** | `ATR_MULTIPLIER` | Volatility buffer multiplier for trailing stop |
+| `sma_period` | **10** | `SMA_PERIOD` | Price trend filter — execution signal engine |
+| `ANALYTICS_SMA_PERIOD` | **20** | — | Structural baseline for `[METRICS]` telemetry only |
+| `rsi_period` | **14** | `RSI_PERIOD` | RSI lookback; Wilder smoothing |
+| `rsi_buy_threshold` | **50** | `RSI_BUY_THRESHOLD` | Minimum RSI to confirm BUY |
+| `rsi_upper_limit` | **70** | `RSI_UPPER_LIMIT` | Crossdown overbought threshold |
+| `rsi_exit_mode` | **crossdown** | `RSI_EXIT_MODE` | Verified crossdown (not blind >70) |
+| `atr_period` | **14** | `ATR_PERIOD` | ATR lookback; Wilder smoothing |
+| `atr_multiplier` | **2.0** | `ATR_MULTIPLIER` | Trailing stop buffer multiplier |
 | `volume_sma_period` | **20** | `VOLUME_SMA_PERIOD` | Volume moving average for liquidity gate |
-| `volume_threshold` | **1.2** | `VOLUME_THRESHOLD` | Volume must exceed 120% of 20-day average for BUY |
+| `volume_threshold` | **1.2** | `VOLUME_THRESHOLD` | Volume must exceed 120% of 20-day average |
 | `use_trailing_stop` | **true** | `USE_TRAILING_STOP` | Enable dynamic ATR trailing stop |
-| `commission_rate` | **0.001** | — | Backtest transaction cost (0.1% per trade) |
-| `min_data_bars` | **22** | — | Minimum bar count required before analytics execution |
-| `CAPITAL_AT_RISK` | **10000** | `CAPITAL_AT_RISK` | Manual capital base for live position sizing (USD) |
-| `RISK_PER_TRADE` | **0.01** | `RISK_PER_TRADE` | Fraction of capital risked per trade (1%) |
-| `TARGET_BARS` | **756** | — | Rolling historical window (3 years × 252 days) |
-| `LOOP_COOLDOWN_SECONDS` | **60** | `LOOP_COOLDOWN_SECONDS` | Inter-cycle pause |
+| `commission_rate` | **0.001** | — | Backtest transaction cost (0.1%) |
+| `min_data_bars` | **22** | — | Minimum bars before analytics execution |
+| `CAPITAL_AT_RISK` | **10000** | `CAPITAL_AT_RISK` | Deployable capital for dual-clamp sizing |
+| `RISK_PER_TRADE` | **0.01** | `RISK_PER_TRADE` | Per-trade risk fraction (1%) |
+| `TARGET_BARS` | **756** | — | Rolling historical window (3 × 252) |
+| `LOOP_COOLDOWN_SECONDS` | **60** | `LOOP_COOLDOWN_SECONDS` | Open-session inter-cycle pause |
+| `MARKET_CLOSED_SLEEP_SECONDS` | **3600** | `MARKET_CLOSED_SLEEP_SECONDS` | Closed-session sleep duration |
 | `TICKER_SLEEP_SECONDS` | **1** | `TICKER_SLEEP_SECONDS` | Pause between tickers within a cycle |
 
 ---
 
-## 12. Operational Guidelines
+## 16. Operational Guidelines
 
 ### Dependency Installation
 
@@ -692,18 +922,20 @@ python main.py
 
 Expected startup sequence:
 
-1. Environment validation (`validate_environment()`) — KIS credentials + `MARKET_META` routing for all `WATCHLIST` tickers
+1. Environment validation — KIS credentials + `MARKET_META` routing for all `WATCHLIST` tickers
 2. KIS OAuth token issuance (cached in `kis_token_cache.json`)
 3. **One-time bootstrap** — `MarketDataCache.bootstrap()` fetches ~756 bars per ticker
 4. Load `trading_state.json` (or initialize empty registry)
-5. Optional balance probe (`try_print_mock_account_balance`) — failures ignored
-6. Capital model banner (`log_configured_capital_model`) — confirms `CAPITAL_AT_RISK` from `.env`
-7. Infinite watchlist loop with per-ticker `[METRICS]` emission and state-gated order dispatch
+5. Optional balance probe — failures ignored (`[INFO]`)
+6. Capital model banner — confirms `CAPITAL_AT_RISK` from `.env`
+7. Infinite watchlist loop with `[METRICS]` emission and state-gated order dispatch
 
 Expected runtime log markers:
 
 ```
 Order pipeline: KIS dispatch -> rt_cd verify -> state transition -> persist
+--- Cycle 12 skipped at 2026-12-25 09:00:00 ---
+[GATE] US market closed (Christmas). Sleeping 3600 seconds...
 [GATE] US equity session closed (weekend) — crossover signals suppressed
 [LOCK] NVDA pending_order=True — signal suppressed
 [SKIP] PLTR liquidation skipped — no held quantity tracked
@@ -733,6 +965,7 @@ Session Low          : 138.4200
 Market Open Gate     : True
 Crossover Allowed    : False
 Signal               : HOLD
+Position Size (shares): 12
 Runtime Registry     : pending=False | held_qty=12 | last_processed=2026-06-05
 ATR Stop Telemetry   : peak=$145.80 | floor=$137.37 | session_low=$138.42
 ```
@@ -747,8 +980,8 @@ Runs unit tests against `LiveSignalEngine`:
 
 - Wilder RSI/ATR/SMA indicator computation
 - O(1) state replay determinism
-- Bar-by-bar BUY → peak tracking → DYNAMIC_ATR_SELL transitions
-- External state serialization round-trip (all `PositionState` fields including `pending_order`, `held_quantity`, `session_low`)
+- **3-step bar transitions**: BUY → peak tracking → prior-floor DYNAMIC_ATR_SELL (look-ahead free)
+- External state serialization round-trip (all `PositionState` fields)
 
 ### Graceful Shutdown
 
@@ -756,13 +989,13 @@ Press `Ctrl+C` during the monitoring loop. The handler persists the latest multi
 
 ---
 
-## 13. KIS API Reference (Live Production Paths)
+## 17. KIS API Reference (Live Production Paths)
 
 | Operation | TR ID (Mock) | HTTP Path | Phase 4 Usage |
 |---|---|---|---|
 | OAuth Token | — | `POST /oauth2/tokenP` | Cached in `kis_token_cache.json` |
 | US Daily OHLCV (full) | `HHDFS76240000` | `GET /uapi/overseas-price/v1/quotations/dailyprice` | Bootstrap only (~756 bars) |
-| US Daily OHLCV (latest) | `HHDFS76240000` | `GET /uapi/overseas-price/v1/quotations/dailyprice` | Every cycle (1 page) |
+| US Daily OHLCV (latest) | `HHDFS76240000` | `GET /uapi/overseas-price/v1/quotations/dailyprice` | Every open-session cycle (1 page) |
 | US Market Buy | `VTTT1002U` | `POST /uapi/overseas-stock/v1/trading/order` | State-gated dispatch |
 | US Market Sell | `VTTT1006U` | `POST /uapi/overseas-stock/v1/trading/order` | Clamped to `held_quantity` |
 | Present Balance *(optional)* | `VTRP6504R` | `GET /uapi/overseas-stock/v1/trading/inquire-present-balance` | Non-blocking probe |
@@ -772,14 +1005,14 @@ Press `Ctrl+C` during the monitoring loop. The handler persists the latest multi
 
 ---
 
-## 14. Project Structure
+## 18. Project Structure
 
 ```
 Toss Trading Bot/
-├── main.py                 # KIS orchestrator, MarketDataCache, state-gated order machine, [METRICS]
-├── analytics.py            # LiveSignalEngine, PositionState, StrategyConfig.from_env(), cycle evaluation
-├── strategy.py             # Backtrader SmaCross backtest strategy (env-driven params)
-├── test_analytics.py       # Engine verification suite
+├── main.py                 # KIS orchestrator, MarketDataCache, holiday gate, state-gated orders, [METRICS]
+├── analytics.py            # LiveSignalEngine, PositionState, dual-clamp sizing, NYSE calendar, 3-step bar eval
+├── strategy.py             # Backtrader SmaCross — look-ahead-free trailing stop + RSI crossdown parity
+├── test_analytics.py       # Engine verification suite (includes 3-step transition tests)
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Full configuration template (copy to .env)
 ├── .gitignore              # Excludes .env, kis_token_cache.json, trading_state.json
@@ -794,20 +1027,20 @@ Toss Trading Bot/
 
 ---
 
-## 15. Academic Regime Mapping (Watchlist Design)
+## 19. Academic Regime Mapping (Watchlist Design)
 
 The default watchlist (`NVDA`, `PLTR`, `AAPL`) targets three distinct volatility regimes. Customize via `WATCHLIST` in `.env` while registering exchange routing in `MARKET_META`.
 
 | Ticker | Volatility Regime | Primary Experimental Target |
 |---|---|---|
-| `NVDA` | High-volatility market leader | Dynamic ATR Trailing Stop stress test (intraday session_low scan) |
-| `PLTR` | High-momentum growth / breakout | Volume Liquidity Gate validation + NASD VTS proxy |
-| `AAPL` | Low-volatility large-cap control | Baseline comparative analysis + crossover deduplication |
+| `NVDA` | High-volatility market leader | 3-step ATR stop under elevated realized volatility |
+| `PLTR` | High-momentum growth / breakout | Dual-clamp sizing + volume gate + NASD VTS proxy |
+| `AAPL` | Low-volatility large-cap control | RSI crossdown stability + crossover deduplication |
 
-This three-asset design enables cross-regime empirical comparison: ATR stop behavior under elevated realized volatility (`NVDA`), liquidity-filter efficacy on momentum names (`PLTR`), and signal stability on a mature benchmark (`AAPL`).
+This three-asset design enables cross-regime empirical comparison: look-ahead-free ATR behavior under stress (`NVDA`), capital-clamped liquidity-filter efficacy on momentum names (`PLTR`), and signal stability on a mature benchmark (`AAPL`).
 
 ---
 
 ## License & Disclaimer
 
-This repository is an academic quantitative infrastructure project. It connects to the **KIS Virtual Trading Server** for sandbox execution only. Past backtest performance (Phase 1–2 figures) does not guarantee future results. Always validate signals, `.env` configuration, and account routing independently before any real-capital deployment.
+This repository is an academic quantitative infrastructure project. It connects to the **KIS Virtual Trading Server** for sandbox execution only. Past backtest performance (Phase 1–2 figures) does not guarantee future results. Always validate signals, `.env` configuration, holiday calendar behavior, and account routing independently before any real-capital deployment.

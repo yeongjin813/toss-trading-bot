@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass, fields
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
 import pandas as pd
@@ -213,24 +213,99 @@ def calculate_position_size(
     risk_per_trade: float,
     entry_price: float,
     stop_distance: float,
+    available_capital: float | None = None,
 ) -> int:
     """
-    Compute share count from fixed fractional risk sizing.
+    Dual-clamp position sizing: risk budget and deployable capital.
 
-    Shares = floor((capital * risk_pct) / stop_distance).
+    shares_by_risk = int(dollar_risk / stop_distance)
+    shares_by_capital = int(available_capital / entry_price)
+    final_shares = max(1, min(shares_by_risk, shares_by_capital))
     """
     if entry_price <= 0 or stop_distance <= 0 or risk_per_trade <= 0:
         return 0
 
+    deployable = (
+        available_capital if available_capital is not None else capital_at_risk
+    )
+    if deployable <= 0:
+        return 0
+
     dollar_risk = capital_at_risk * risk_per_trade
-    shares = int(dollar_risk / stop_distance)
-    return max(shares, 0)
+    shares_by_risk = int(dollar_risk / stop_distance)
+    shares_by_capital = int(deployable / entry_price)
+
+    if shares_by_risk <= 0 or shares_by_capital <= 0:
+        return 0
+
+    return max(1, min(shares_by_risk, shares_by_capital))
+
+
+def _observed_fixed_holiday(year: int, month: int, day: int) -> date:
+    """NYSE observed-date rule for fixed calendar holidays."""
+    observed = date(year, month, day)
+    if observed.weekday() == 5:
+        return observed - timedelta(days=1)
+    if observed.weekday() == 6:
+        return observed + timedelta(days=1)
+    return observed
+
+
+def _memorial_day(year: int) -> date:
+    observed = date(year, 5, 31)
+    while observed.weekday() != 0:
+        observed -= timedelta(days=1)
+    return observed
+
+
+def _labor_day(year: int) -> date:
+    observed = date(year, 9, 1)
+    while observed.weekday() != 0:
+        observed += timedelta(days=1)
+    return observed
+
+
+def _thanksgiving_day(year: int) -> date:
+    observed = date(year, 11, 1)
+    while observed.weekday() != 3:
+        observed += timedelta(days=1)
+    return observed + timedelta(weeks=3)
+
+
+def us_market_holidays_for_year(year: int) -> dict[date, str]:
+    """Return NYSE full-day closure dates for a calendar year."""
+    holidays = {
+        _observed_fixed_holiday(year, 1, 1): "New Year's Day",
+        _memorial_day(year): "Memorial Day",
+        _observed_fixed_holiday(year, 7, 4): "Independence Day",
+        _labor_day(year): "Labor Day",
+        _thanksgiving_day(year): "Thanksgiving",
+        _observed_fixed_holiday(year, 12, 25): "Christmas",
+    }
+    return holidays
+
+
+def is_us_market_holiday(day: date | datetime | None = None) -> bool:
+    """True when the given date is a registered US equity market holiday."""
+    current = day.date() if isinstance(day, datetime) else (day or date.today())
+    return current in us_market_holidays_for_year(current.year)
+
+
+def describe_us_market_closure(now: datetime | None = None) -> str | None:
+    """Return a closure reason string, or None when the session is open."""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return "weekend"
+
+    holiday_name = us_market_holidays_for_year(current.year).get(current.date())
+    if holiday_name:
+        return holiday_name
+    return None
 
 
 def is_us_equity_session(now: datetime | None = None) -> bool:
-    """Weekday gate for US equity crossover evaluation (Mon-Fri)."""
-    current = now or datetime.now()
-    return current.weekday() < 5
+    """US equity session gate: weekdays excluding registered market holidays."""
+    return describe_us_market_closure(now) is None
 
 
 def should_allow_crossover_signals(
@@ -301,6 +376,12 @@ class LiveSignalEngine:
         return rsi >= self.config.rsi_buy_threshold
 
     def _rsi_triggers_exit(self, rsi: float, prev_rsi: float) -> bool:
+        """
+        RSI exit criteria (default crossdown mode).
+
+        crossdown: RSI_{t-1} >= upper_limit and RSI_t < upper_limit
+        threshold: RSI_t > upper_limit
+        """
         upper = self.config.rsi_upper_limit
         if self.config.rsi_exit_mode == "threshold":
             return rsi > upper
@@ -363,33 +444,32 @@ class LiveSignalEngine:
             return None
 
         working = PositionState.from_dict(state.to_dict())
-        self._update_trailing_state(working, bar.close, bar.atr)
-        dynamic_atr_stop = self._build_dynamic_atr_payload(
-            working, bar, session_low
-        )
 
-        if not self._dynamic_atr_stop_triggered(working, session_low):
+        if self._dynamic_atr_stop_triggered(working, session_low):
+            dynamic_atr_stop = self._build_dynamic_atr_payload(
+                working, bar, session_low
+            )
             if mutate_state:
-                state.highest_price_achieved = working.highest_price_achieved
-                state.current_atr = working.current_atr
-                state.dynamic_stop_distance = working.dynamic_stop_distance
-                state.trigger_floor = working.trigger_floor
-            return None
+                state.in_position = False
+                state.held_quantity = 0
+                state.highest_price_achieved = None
+                state.current_atr = None
+                state.dynamic_stop_distance = None
+                state.trigger_floor = None
+                state.session_low = None
+            return {
+                "signal": "DYNAMIC_ATR_SELL",
+                "dynamic_atr_stop": dynamic_atr_stop,
+                "liquidity_ok": True,
+            }
 
+        self._update_trailing_state(working, bar.close, bar.atr)
         if mutate_state:
-            state.in_position = False
-            state.held_quantity = 0
-            state.highest_price_achieved = None
-            state.current_atr = None
-            state.dynamic_stop_distance = None
-            state.trigger_floor = None
-            state.session_low = None
-
-        return {
-            "signal": "DYNAMIC_ATR_SELL",
-            "dynamic_atr_stop": dynamic_atr_stop,
-            "liquidity_ok": True,
-        }
+            state.highest_price_achieved = working.highest_price_achieved
+            state.current_atr = working.current_atr
+            state.dynamic_stop_distance = working.dynamic_stop_distance
+            state.trigger_floor = working.trigger_floor
+        return None
 
     def evaluate_bar(
         self,
@@ -404,7 +484,12 @@ class LiveSignalEngine:
         Evaluate one bar using unified priority:
         DYNAMIC_ATR_SELL -> SELL -> BUY -> HOLD.
 
-        When allow_crossover is False, only the intraday ATR stop path runs.
+        Position-active sequence (no look-ahead):
+          1. ATR stop vs prior trigger_floor and current low
+          2. Update trailing peak/floor with close only after survival
+          3. Death cross or RSI exit evaluation
+
+        When allow_crossover is False, only steps 1-2 run for open positions.
         """
         liquidity_ok = self._passes_volume_filter(bar.volume, bar.volume_sma)
         effective_low = session_low if session_low is not None else bar.low
@@ -415,12 +500,10 @@ class LiveSignalEngine:
         dynamic_atr_stop: dict[str, float] | None = None
 
         if working_state.in_position:
-            self._update_trailing_state(working_state, bar.close, bar.atr)
-            dynamic_atr_stop = self._build_dynamic_atr_payload(
-                working_state, bar, effective_low
-            )
-
             if self._dynamic_atr_stop_triggered(working_state, effective_low):
+                dynamic_atr_stop = self._build_dynamic_atr_payload(
+                    working_state, bar, effective_low
+                )
                 if mutate_state:
                     state.in_position = False
                     state.held_quantity = 0
@@ -436,23 +519,23 @@ class LiveSignalEngine:
                     "state": working_state.to_dict(),
                 }
 
-        if not allow_crossover:
-            return {
-                "signal": "HOLD",
-                "dynamic_atr_stop": dynamic_atr_stop,
-                "liquidity_ok": liquidity_ok,
-                "crossover_suppressed": True,
-                "state": working_state.to_dict(),
-            }
+            self._update_trailing_state(working_state, bar.close, bar.atr)
+            dynamic_atr_stop = self._build_dynamic_atr_payload(
+                working_state, bar, effective_low
+            )
 
-        cross_above = self._golden_cross(
-            bar.close, bar.sma, prev_bar.close, prev_bar.sma
-        )
-        cross_below = self._death_cross(
-            bar.close, bar.sma, prev_bar.close, prev_bar.sma
-        )
+            if not allow_crossover:
+                return {
+                    "signal": "HOLD",
+                    "dynamic_atr_stop": dynamic_atr_stop,
+                    "liquidity_ok": liquidity_ok,
+                    "crossover_suppressed": True,
+                    "state": working_state.to_dict(),
+                }
 
-        if working_state.in_position:
+            cross_below = self._death_cross(
+                bar.close, bar.sma, prev_bar.close, prev_bar.sma
+            )
             if cross_below or self._rsi_triggers_exit(bar.rsi, prev_bar.rsi):
                 if mutate_state:
                     state.in_position = False
@@ -469,34 +552,52 @@ class LiveSignalEngine:
                     "state": working_state.to_dict(),
                 }
 
-        if not working_state.in_position:
-            if cross_above and self._rsi_allows_entry(bar.rsi):
-                if liquidity_ok:
-                    if mutate_state:
-                        state.in_position = True
-                        state.highest_price_achieved = bar.close
-                        self._update_trailing_state(state, bar.close, bar.atr)
-                    return {
-                        "signal": "BUY",
-                        "dynamic_atr_stop": None,
-                        "liquidity_ok": True,
-                        "state": (
-                            state.to_dict()
-                            if mutate_state
-                            else working_state.to_dict()
-                        ),
-                    }
+            return {
+                "signal": "HOLD",
+                "dynamic_atr_stop": dynamic_atr_stop,
+                "liquidity_ok": liquidity_ok,
+                "state": working_state.to_dict(),
+            }
+
+        if not allow_crossover:
+            return {
+                "signal": "HOLD",
+                "dynamic_atr_stop": None,
+                "liquidity_ok": liquidity_ok,
+                "crossover_suppressed": True,
+                "state": working_state.to_dict(),
+            }
+
+        cross_above = self._golden_cross(
+            bar.close, bar.sma, prev_bar.close, prev_bar.sma
+        )
+        if cross_above and self._rsi_allows_entry(bar.rsi):
+            if liquidity_ok:
+                if mutate_state:
+                    state.in_position = True
+                    state.highest_price_achieved = bar.close
+                    self._update_trailing_state(state, bar.close, bar.atr)
                 return {
-                    "signal": "HOLD",
+                    "signal": "BUY",
                     "dynamic_atr_stop": None,
-                    "liquidity_ok": False,
-                    "liquidity_blocked": True,
-                    "state": working_state.to_dict(),
+                    "liquidity_ok": True,
+                    "state": (
+                        state.to_dict()
+                        if mutate_state
+                        else working_state.to_dict()
+                    ),
                 }
+            return {
+                "signal": "HOLD",
+                "dynamic_atr_stop": None,
+                "liquidity_ok": False,
+                "liquidity_blocked": True,
+                "state": working_state.to_dict(),
+            }
 
         return {
             "signal": "HOLD",
-            "dynamic_atr_stop": dynamic_atr_stop,
+            "dynamic_atr_stop": None,
             "liquidity_ok": liquidity_ok,
             "state": working_state.to_dict(),
         }
@@ -636,6 +737,7 @@ class LiveSignalEngine:
             risk_per_trade=risk_per_trade,
             entry_price=today.close,
             stop_distance=stop_distance,
+            available_capital=capital_at_risk,
         )
 
         return {
