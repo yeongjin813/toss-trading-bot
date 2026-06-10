@@ -1,0 +1,6 @@
+.env
+kis_token_cache.json
+__pycache__/
+*.pyc
+project_metrics.log
+trading_state.json

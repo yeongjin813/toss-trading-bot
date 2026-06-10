@@ -3,3 +3,5 @@ pandas
 numpy
 matplotlib
 backtrader
+requests
+python-dotenv
