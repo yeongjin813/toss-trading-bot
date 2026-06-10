@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass, fields
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal
 
 import pandas as pd
+import pytz
 
 ExecutionMode = Literal["eod", "next_open"]
 RsiExitMode = Literal["threshold", "crossdown"]
+
+NY_TZ = pytz.timezone("America/New_York")
+US_REGULAR_MARKET_OPEN = time(hour=9, minute=30)
+US_REGULAR_MARKET_CLOSE = time(hour=16, minute=0)
 
 
 @dataclass(frozen=True)
@@ -291,32 +296,65 @@ def is_us_market_holiday(day: date | datetime | None = None) -> bool:
     return current in us_market_holidays_for_year(current.year)
 
 
+def _to_ny_datetime(current_dt: datetime | None) -> datetime:
+    """Convert any aware/naive datetime to America/New_York (DST-safe via pytz)."""
+    if current_dt is None:
+        return datetime.now(NY_TZ)
+
+    if current_dt.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        current_dt = current_dt.replace(tzinfo=local_tz)
+
+    return current_dt.astimezone(NY_TZ)
+
+
+def is_us_regular_market_hours(current_dt: datetime | None = None) -> bool:
+    """
+    True during NYSE regular session: Mon–Fri 09:30–16:00 America/New_York.
+
+    Uses pytz for DST transitions — no hardcoded Korea/local offset math.
+    """
+    ny_dt = _to_ny_datetime(current_dt)
+
+    if ny_dt.weekday() >= 5:
+        return False
+
+    if ny_dt.date() in us_market_holidays_for_year(ny_dt.year):
+        return False
+
+    current_clock = ny_dt.time()
+    return US_REGULAR_MARKET_OPEN <= current_clock < US_REGULAR_MARKET_CLOSE
+
+
 def describe_us_market_closure(now: datetime | None = None) -> str | None:
-    """Return a closure reason string, or None when the session is open."""
-    current = now or datetime.now()
-    if current.weekday() >= 5:
+    """Return a closure reason string, or None when the calendar session is open."""
+    ny_dt = _to_ny_datetime(now)
+
+    if ny_dt.weekday() >= 5:
         return "weekend"
 
-    holiday_name = us_market_holidays_for_year(current.year).get(current.date())
+    holiday_name = us_market_holidays_for_year(ny_dt.year).get(ny_dt.date())
     if holiday_name:
         return holiday_name
     return None
 
 
 def is_us_equity_session(now: datetime | None = None) -> bool:
-    """US equity session gate: weekdays excluding registered market holidays."""
+    """Calendar session gate: NY weekday excluding registered market holidays."""
     return describe_us_market_closure(now) is None
 
 
 def should_allow_crossover_signals(
     current_bar_date: str,
     last_processed_date: str | None,
-    market_open: bool,
+    regular_market_hours: bool,
 ) -> bool:
     """
-    Crossover BUY/SELL is allowed only on a new daily bar during market weekdays.
+    Crossover BUY/SELL allowed only during regular NY hours on a new daily bar.
+
+    Pre-market, post-market, weekends, and holidays force crossover off.
     """
-    if not market_open:
+    if not regular_market_hours:
         return False
     if last_processed_date is None:
         return True
@@ -357,6 +395,10 @@ class LiveSignalEngine:
 
     def dump_state(self, state: PositionState) -> dict[str, Any]:
         return state.to_dict()
+
+    def _has_active_position(self, state: PositionState) -> bool:
+        """ATR stop path requires an open position (held shares or in_position flag)."""
+        return state.in_position or state.held_quantity > 0
 
     def _passes_volume_filter(self, volume: float, volume_sma: float) -> bool:
         threshold = self.config.volume_threshold
@@ -443,6 +485,9 @@ class LiveSignalEngine:
         if not state.in_position or state.pending_order:
             return None
 
+        if not self._has_active_position(state):
+            return None
+
         working = PositionState.from_dict(state.to_dict())
 
         if self._dynamic_atr_stop_triggered(working, session_low):
@@ -499,7 +544,7 @@ class LiveSignalEngine:
         )
         dynamic_atr_stop: dict[str, float] | None = None
 
-        if working_state.in_position:
+        if self._has_active_position(working_state):
             if self._dynamic_atr_stop_triggered(working_state, effective_low):
                 dynamic_atr_stop = self._build_dynamic_atr_payload(
                     working_state, bar, effective_low
@@ -698,11 +743,12 @@ class LiveSignalEngine:
         current_bar_date = _format_bar_date(today.date)
         session_low = self.update_session_low(runtime, today)
 
-        market_open = is_us_equity_session(now)
+        calendar_open = is_us_equity_session(now)
+        regular_market_hours = is_us_regular_market_hours(now)
         allow_crossover = should_allow_crossover_signals(
             current_bar_date,
             runtime.last_processed_date,
-            market_open,
+            regular_market_hours,
         )
 
         eval_state = PositionState.from_dict(position_state.to_dict())
@@ -721,6 +767,15 @@ class LiveSignalEngine:
                 ),
                 "pending_order_locked": True,
             }
+        elif not regular_market_hours and not self._has_active_position(runtime):
+            signal_result = {
+                "signal": "HOLD",
+                "liquidity_ok": self._passes_volume_filter(
+                    today.volume, today.volume_sma
+                ),
+                "crossover_suppressed": True,
+                "outside_regular_hours": True,
+            }
         else:
             signal_result = self.evaluate_bar(
                 eval_state,
@@ -730,6 +785,17 @@ class LiveSignalEngine:
                 allow_crossover=allow_crossover,
                 session_low=session_low,
             )
+
+        if (
+            not regular_market_hours
+            and signal_result.get("signal") in {"BUY", "SELL"}
+        ):
+            signal_result = {
+                "signal": "HOLD",
+                "liquidity_ok": signal_result.get("liquidity_ok", False),
+                "crossover_suppressed": True,
+                "outside_regular_hours": True,
+            }
 
         stop_distance = today.atr * self.config.atr_multiplier
         position_size = calculate_position_size(
@@ -752,7 +818,9 @@ class LiveSignalEngine:
             "current_bar_date": current_bar_date,
             "session_low": session_low,
             "allow_crossover": allow_crossover,
-            "market_open": market_open,
+            "calendar_open": calendar_open,
+            "regular_market_hours": regular_market_hours,
+            "market_open": regular_market_hours,
             "state_snapshot": self.dump_state(position_state),
         }
 
@@ -769,8 +837,7 @@ class LiveSignalEngine:
             runtime.in_position = True
             runtime.held_quantity = filled_quantity
             runtime.pending_order = False
-            if allow_crossover:
-                runtime.last_processed_date = current_bar_date
+            runtime.last_processed_date = current_bar_date
             return
 
         if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
@@ -782,26 +849,10 @@ class LiveSignalEngine:
             runtime.trigger_floor = None
             runtime.session_low = None
             runtime.pending_order = False
-            if allow_crossover and signal == "SELL":
-                runtime.last_processed_date = current_bar_date
-            elif signal == "DYNAMIC_ATR_SELL":
-                runtime.last_processed_date = current_bar_date
+            runtime.last_processed_date = current_bar_date
             return
 
         runtime.pending_order = False
-
-    def mark_crossover_processed(
-        self,
-        runtime: PositionState,
-        current_bar_date: str,
-        allow_crossover: bool,
-        signal: str,
-    ) -> None:
-        """Record that crossover logic ran for this daily bar without duplication."""
-        if not allow_crossover:
-            return
-        if signal in {"BUY", "SELL", "HOLD"}:
-            runtime.last_processed_date = current_bar_date
 
     def evaluate_session(
         self,

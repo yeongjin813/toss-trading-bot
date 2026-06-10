@@ -10,8 +10,9 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Anchor Account** | CANO: `50191906` \| ACNT_PRDT_CD: `01` (Unified Portfolio Suffix) — override via `.env` |
 | **Execution Loop** | 60-Second Real-Time Polling Loop with Asymmetric Network Bypass |
 | **Data Architecture** | Bootstrap 756 bars once → 1-bar micro-fetch per open-session cycle |
-| **Session Gate** | NYSE holiday registry + weekday filter (`is_us_equity_session()`) |
+| **Session Gate** | NYSE holiday registry + **`is_us_regular_market_hours()`** (09:30–16:00 ET via `pytz`) |
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
+| **Timeline Alignment** | Pre/post-market crossover blocked; ATR stop bypasses hours gate when positioned |
 | **Risk Posture** | Documented in Sections 11–14 — backtest/live parity gaps, reconciliation vectors, monitoring telemetry |
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
@@ -76,6 +77,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **RSI Crossdown Exit** | `analytics.py` + `strategy.py` | Verified crossdown — not blind >70 threshold |
 | **Dual-Clamp Position Sizing** | `analytics.py` | Risk budget ∩ capital budget |
 | **NYSE Holiday Registry** | `analytics.py` + `main.py` | Replaces naive `weekday < 5` |
+| **NY Regular Hours Gate** | `analytics.py` (`pytz`) | 09:30–16:00 America/New_York; DST-safe |
+| **State Persistence Fix** | `analytics.py` + `main.py` | `last_processed_date` only on executed signals |
 | **Dynamic Memory Window Caching** | `main.py` → `MarketDataCache` | 756-bar bootstrap once; 1-bar micro-fetch per cycle |
 | **State-Gated Order Lifecycle** | `main.py` + `analytics.py` | Dispatch → verify → lock → persist → transition |
 | **Hybrid EOD / Intraday Engine** | `analytics.py` | Bar-trailing crossover gate + continuous ATR scan |
@@ -87,7 +90,9 @@ Additional Phase 4 safeguards preserved from prior milestones:
 - **Exact liquidation quantity synchronization**: SELL orders clamp to `held_quantity` — never sell more than locally tracked holdings.
 - **Non-blocking balance inquiry**: `try_print_mock_account_balance()` via TR `VTRP6504R` — failures logged as `[INFO]`, never block the loop.
 - **PLTR NASDAQ VTS proxy**: `excd: NAS`, `ovrs_excg_cd: NASD` — bypasses 0-bar NYS truncation.
-- **Backtest/live parity**: `strategy.py` and `analytics.py` share identical 3-step trailing sequence and RSI crossdown logic.
+- **NY regular-hours gate**: `is_us_regular_market_hours()` blocks pre/post-market crossover; `DYNAMIC_ATR_SELL` remains active for open positions outside regular hours.
+- **State persistence fix**: `last_processed_date` updates only after `BUY` / `SELL` / `DYNAMIC_ATR_SELL` order transitions — never on `HOLD`.
+- **Backtest/live parity**: `strategy.py` and `analytics.py` share identical 3-step trailing sequence, RSI crossdown logic, and Backtrader `set_coc(True)`.
 
 ---
 
@@ -314,12 +319,41 @@ The orchestration engine completely removes basic `weekday < 5` date processing 
 |---|---|---|
 | `us_market_holidays_for_year(year)` | `analytics.py` | Returns `{date: holiday_name}` registry |
 | `is_us_market_holiday(day)` | `analytics.py` | Boolean holiday check |
-| `describe_us_market_closure(now)` | `analytics.py` | Returns `"weekend"`, holiday name, or `None` |
-| `is_us_equity_session(now)` | `analytics.py` | `True` only on non-weekend, non-holiday dates |
+| `describe_us_market_closure(now)` | `analytics.py` | Returns `"weekend"`, holiday name, or `None` (NY calendar date) |
+| `is_us_equity_session(now)` | `analytics.py` | Calendar open: NY weekday excluding holidays |
+| `is_us_regular_market_hours(now)` | `analytics.py` | Regular session: Mon–Fri 09:30–16:00 **America/New_York** via `pytz` |
+| `_to_ny_datetime(now)` | `analytics.py` | DST-safe conversion to NY time (no hardcoded KST offset) |
 
-Weekends are detected via `current.weekday() >= 5` inside `describe_us_market_closure()`.
+Weekends and holidays are evaluated on the **New York local calendar date** inside `describe_us_market_closure()`.
 
-### C. Extended Sleep Logic Behavior
+### D. Regular Market Hours Gate (Pre/Post-Market Crossover Block)
+
+The calendar gate (`is_us_equity_session`) and the **regular-hours gate** (`is_us_regular_market_hours`) operate as two distinct layers:
+
+| Layer | Function | Scope |
+|---|---|---|
+| **Calendar** | `is_us_equity_session()` | NY weekday, not a registered holiday |
+| **Regular Hours** | `is_us_regular_market_hours()` | Calendar open **AND** 09:30 ≤ clock < 16:00 ET |
+
+```python
+import pytz
+
+NY_TZ = pytz.timezone("America/New_York")
+
+def is_us_regular_market_hours(current_dt=None) -> bool:
+    ny_dt = _to_ny_datetime(current_dt)  # DST-safe via pytz
+    if ny_dt.weekday() >= 5 or ny_dt.date() in us_market_holidays_for_year(ny_dt.year):
+        return False
+    return time(9, 30) <= ny_dt.time() < time(16, 0)
+```
+
+**Pre-market / post-market behavior:**
+
+- `should_allow_crossover_signals(..., regular_market_hours=False)` → **Crossover Allowed = False**
+- Default signal outside regular hours (no position): **`HOLD`** — `BUY`/`SELL` blocked in `main.py`
+- **`DYNAMIC_ATR_SELL`**: Still evaluated when `_has_active_position()` is true — **bypasses** the regular-hours gate for flash-crash protection
+
+### E. Extended Sleep Logic Behavior
 
 When `is_us_market_holiday()` or weekend validations return `True`, the orchestrator in `main.py` completely suspends asset data fetching. It short-circuits execution and puts the master thread into an extended standby mode controlled by:
 
@@ -332,7 +366,7 @@ When `is_us_market_holiday()` or weekend validations return `True`, the orchestr
 [GATE] US market closed (Christmas). Sleeping 3600 seconds...
 ```
 
-During open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. `is_us_equity_session()` feeds `should_allow_crossover_signals()`, suppressing BUY/SELL on closures while the full cycle skip prevents all broker queries on holidays/weekends.
+During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **weekends and holidays**, the full cycle skip prevents all broker queries. On **weekday pre/post-market**, the loop still runs for **positioned ATR stop** monitoring while crossover remains suppressed.
 
 ---
 
@@ -387,7 +421,7 @@ During open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. `is_us_equity_sessio
 | `in_position` | `bool` | Active position flag (`has_position` property) |
 | `pending_order` | `bool` | Concurrency lock during in-flight orders |
 | `held_quantity` | `int` | Share count for exact liquidation clamping |
-| `last_processed_date` | `str \| null` | Last crossover evaluation date |
+| `last_processed_date` | `str \| null` | Set **only** after `BUY`/`SELL`/`DYNAMIC_ATR_SELL` order transition — never on `HOLD` |
 | `latest_bar_date` | `str \| null` | Active daily bar for session-low tracking |
 | `session_low` | `float \| null` | Running min low on active daily bar |
 | `highest_price_achieved` | `float \| null` | Peak close since entry |
@@ -497,9 +531,11 @@ If `held_quantity <= 0`, liquidation is skipped — avoiding broker rejections c
 
 ### D. Hybrid EOD / Intraday Monitoring Logic
 
-**`should_allow_crossover_signals()` Integration:** If the system detects that the current session bar date matches `last_processed_date`, it suppresses trend and momentum evaluations (`BUY` / standard `SELL`), freezing execution state transitions for duplicate crossover spam.
+**`should_allow_crossover_signals()` Integration:** Crossover `BUY`/`SELL` requires **`regular_market_hours=True`** (09:30–16:00 ET) **and** a new daily bar (`current_bar_date != last_processed_date`). Pre-market and post-market force crossover off.
 
-**Continuous Intraday Risk Scan:** The system bypasses this lock for Priority 1 `DYNAMIC_ATR_SELL` checks, maintaining a continuous 60-second intraday scan over the active bar's low sequence:
+**`last_processed_date` Persistence Rule:** Updated exclusively inside `apply_post_order_transition()` after a confirmed KIS order for `BUY`, `SELL`, or `DYNAMIC_ATR_SELL`. The removed `mark_crossover_processed()` path no longer locks the date on `HOLD` — preventing regular-session signals from being swallowed after a pre-market evaluation cycle.
+
+**Continuous Intraday Risk Scan:** Priority 1 `DYNAMIC_ATR_SELL` runs only when `_has_active_position()` (`in_position` or `held_quantity > 0`):
 
 $$
 \text{Low}_t \le \text{Trigger Floor}_{t-1}
@@ -507,9 +543,10 @@ $$
 
 | Condition | Crossover BUY/SELL | DYNAMIC_ATR_SELL |
 |---|---|---|
-| New daily bar + open session | **Allowed** | **Active** |
+| Regular hours + new daily bar | **Allowed** | **Active** (if positioned) |
 | Same daily bar | **Suppressed** | **Active** (`session_low`) |
-| Weekend or NYSE holiday | **Suppressed** | Cycle skipped entirely |
+| Pre-market / post-market (weekday) | **Suppressed** → `HOLD` | **Active** (if positioned) |
+| Weekend or NYSE holiday | **Suppressed** | Full cycle skipped |
 | `pending_order == True` | **Locked** | **Locked** |
 
 ### E. Liquidity Gate Calibration
@@ -600,6 +637,7 @@ matplotlib
 numpy
 pandas
 python-dotenv
+pytz
 requests
 yfinance
 ```
@@ -626,6 +664,8 @@ Expected runtime log markers:
 Order pipeline: KIS dispatch -> rt_cd verify -> state transition -> persist
 --- Cycle 12 skipped at 2026-12-25 09:00:00 ---
 [GATE] US market closed (Christmas). Sleeping 3600 seconds...
+[GATE] Outside NY regular hours (09:30–16:00 ET) — crossover suppressed; ATR stop active for open positions
+[GATE] NVDA outside NY regular session (09:30–16:00 ET) — BUY blocked, holding
 [LOCK] NVDA pending_order=True — signal suppressed
 [SKIP] PLTR liquidation skipped — no held quantity tracked
   -> 756 bars in memory (intraday refresh)
@@ -660,7 +700,8 @@ Extended per-cycle telemetry fields:
 ```
 Bar Date             : 2026-06-05
 Session Low          : 138.4200
-Market Open Gate     : True
+Calendar Open        : True
+Regular Market Hours : False
 Crossover Allowed    : False
 Signal               : HOLD
 Position Size (shares): 40
@@ -906,9 +947,9 @@ Signal evaluation runs independently per ticker according to strict descending c
 
 | Priority | Signal Code | Terminal Banner | Trigger Condition |
 |---|---|---|---|
-| **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{Low}_t \le \text{Trigger Floor}_{t-1}$ (or `session_low` live) |
-| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 3: Death Cross OR RSI crossdown ($\text{RSI}_{t-1} \ge 70$ AND $\text{RSI}_t < 70$) — new daily bar only |
-| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross AND $\text{RSI}_{14} \ge 50$ AND Volume Gate PASS — new daily bar only |
+| **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{Low}_t \le \text{Trigger Floor}_{t-1}$ — **any hour if positioned** |
+| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 3: Death Cross OR RSI crossdown — **regular hours (09:30–16:00 ET) + new bar** |
+| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross AND RSI ≥ 50 AND Volume Gate — **regular hours + new bar** |
 | **4** | `HOLD` | `[METRICS] ... Signal: HOLD` | Default; BUY blocked on liquidity fail or crossover suppression |
 
 ### Dynamic ATR Stop Formula
@@ -982,7 +1023,7 @@ Post-Survival (Step 2)  = Peak_t = max(Peak_{t-1}, Close_t); recalculate floor
 ```
 Toss Trading Bot/
 ├── main.py                 # KIS orchestrator, MarketDataCache, holiday gate, state-gated orders, [METRICS]
-├── analytics.py            # LiveSignalEngine, dual-clamp sizing, NYSE calendar, 3-step bar eval
+├── analytics.py            # LiveSignalEngine, dual-clamp sizing, NY calendar, regular-hours gate, 3-step bar eval
 ├── strategy.py             # Backtrader SmaCross — look-ahead-free trailing + RSI crossdown parity
 ├── test_analytics.py       # Engine verification suite (3-step transition tests)
 ├── requirements.txt        # Python dependencies

@@ -35,6 +35,7 @@ from analytics import (
     StrategyConfig,
     describe_us_market_closure,
     is_us_equity_session,
+    is_us_regular_market_hours,
 )
 
 load_dotenv(override=True)
@@ -758,7 +759,8 @@ def print_session_telemetry(
     print(f"Session Date         : {metrics['date']}")
     print(f"Bar Date             : {cycle['current_bar_date']}")
     print(f"Session Low          : {cycle['session_low']:.4f}")
-    print(f"Market Open Gate     : {cycle['market_open']}")
+    print(f"Calendar Open        : {cycle.get('calendar_open', cycle.get('market_open'))}")
+    print(f"Regular Market Hours : {cycle.get('regular_market_hours', cycle.get('market_open'))}")
     print(f"Crossover Allowed    : {cycle['allow_crossover']}")
     print(f"Signal               : {signal}")
     print(f"Position Size (shares): {cycle['position_size']}")
@@ -816,6 +818,15 @@ def process_ticker(
         save_persisted_states(states)
         return "LOCKED"
 
+    if signal in {"BUY", "SELL"} and not cycle.get("regular_market_hours", False):
+        print(
+            f"[GATE] {ticker} outside NY regular session (09:30–16:00 ET) — "
+            f"{signal} blocked, holding"
+        )
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        return "HOLD"
+
     if signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
         final_signal = dispatch_order_with_state_machine(
             client,
@@ -830,12 +841,6 @@ def process_ticker(
         )
     else:
         final_signal = signal
-        engine.mark_crossover_processed(
-            runtime,
-            cycle["current_bar_date"],
-            cycle["allow_crossover"],
-            signal,
-        )
         states[ticker] = engine.dump_state(runtime)
         save_persisted_states(states)
 
@@ -854,8 +859,13 @@ def run_watchlist_cycle(
     if not is_us_equity_session():
         closure_reason = describe_us_market_closure() or "market closed"
         print(
-            f"[GATE] US equity session closed ({closure_reason}) — "
-            "crossover signals suppressed"
+            f"[GATE] US calendar session closed ({closure_reason}) — "
+            "crossover suppressed; ATR stop still active for open positions"
+        )
+    elif not is_us_regular_market_hours():
+        print(
+            "[GATE] Outside NY regular hours (09:30–16:00 ET) — "
+            "crossover suppressed; ATR stop active for open positions"
         )
 
     for index, ticker in enumerate(WATCHLIST):
