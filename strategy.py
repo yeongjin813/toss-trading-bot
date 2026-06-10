@@ -166,3 +166,46 @@ class SmaCross(bt.Strategy):
 
 def default_capital_at_risk() -> float:
     return float(os.getenv("CAPITAL_AT_RISK", "10000"))
+
+
+DEFAULT_COMMISSION_RATE = 0.001
+
+
+def configure_backtest_broker(
+    cerebro: bt.Cerebro,
+    commission_rate: float = DEFAULT_COMMISSION_RATE,
+) -> bt.Cerebro:
+    """
+    Apply broker settings aligned with the live EOD close execution model.
+
+    Cheat-on-Close forces fills at the current bar's close (Close_t), matching
+    analytics.py / main.py rather than Backtrader's default next-bar open.
+    """
+    cerebro.broker.setcommission(commission=commission_rate)
+    cerebro.broker.set_coc(True)
+    return cerebro
+
+
+def create_backtest_cerebro(
+    config: StrategyConfig | None = None,
+    initial_cash: float | None = None,
+    commission_rate: float = DEFAULT_COMMISSION_RATE,
+) -> bt.Cerebro:
+    """
+    Initialize and orchestrate a Backtrader engine for SmaCross backtests.
+
+    Usage:
+        cerebro = create_backtest_cerebro()
+        cerebro.adddata(data_feed)
+        cerebro.run()
+    """
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(
+        initial_cash if initial_cash is not None else default_capital_at_risk()
+    )
+    configure_backtest_broker(cerebro, commission_rate=commission_rate)
+
+    cfg = config or load_backtest_config()
+    strategy_params = dict(SmaCross.params_from_config(cfg))
+    cerebro.addstrategy(SmaCross, **strategy_params)
+    return cerebro

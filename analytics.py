@@ -216,10 +216,10 @@ def calculate_position_size(
     available_capital: float | None = None,
 ) -> int:
     """
-    Dual-clamp position sizing: risk budget and deployable capital.
+    Dual-clamp position sizing with a 5% deployable capital friction buffer.
 
     shares_by_risk = int(dollar_risk / stop_distance)
-    shares_by_capital = int(available_capital / entry_price)
+    shares_by_capital = int((deployable * 0.95) / entry_price)
     final_shares = max(1, min(shares_by_risk, shares_by_capital))
     """
     if entry_price <= 0 or stop_distance <= 0 or risk_per_trade <= 0:
@@ -233,7 +233,7 @@ def calculate_position_size(
 
     dollar_risk = capital_at_risk * risk_per_trade
     shares_by_risk = int(dollar_risk / stop_distance)
-    shares_by_capital = int(deployable / entry_price)
+    shares_by_capital = int((deployable * 0.95) / entry_price)
 
     if shares_by_risk <= 0 or shares_by_capital <= 0:
         return 0

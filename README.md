@@ -12,6 +12,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Data Architecture** | Bootstrap 756 bars once → 1-bar micro-fetch per open-session cycle |
 | **Session Gate** | NYSE holiday registry + weekday filter (`is_us_equity_session()`) |
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
+| **Risk Posture** | Documented in Sections 11–14 — backtest/live parity gaps, reconciliation vectors, monitoring telemetry |
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
@@ -29,6 +30,10 @@ An automated, production-grade quantitative trading infrastructure and empirical
 8. [Strategy Configurations & Parameters](#8-strategy-configurations--parameters)
 9. [Operational Guidelines & Verification Suite](#9-operational-guidelines--verification-suite)
 10. [KIS OpenAPI Interface Gateway Reference Mapping](#10-kis-openapi-interface-gateway-reference-mapping)
+11. [Core Risks & Worst-Case Operational Scenarios](#11-core-risks--worst-case-operational-scenarios)
+12. [Pre-Deployment Critical Architectural Flaws & Hardening Vectors](#12-pre-deployment-critical-architectural-flaws--hardening-vectors)
+13. [High-Priority Telemetry Channels (Live Monitoring Matrix)](#13-high-priority-telemetry-channels-live-monitoring-matrix)
+14. [Final Operational Directives & Action Plan](#14-final-operational-directives--action-plan)
 
 **Appendices**
 
@@ -697,6 +702,180 @@ To halt the continuous polling routine safely, dispatch a SIGINT termination sig
 **Deprecated / Invalid on VTS:** `VTTT3402R` (balance inquiry) — returns `OPSQ0002`. Use `VTRP6504R`.
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
+
+---
+
+## 11. Core Risks & Worst-Case Operational Scenarios
+
+This section documents **residual production risks** that persist even after Phase 4 mathematical corrections (Sections 2–5). These scenarios define the boundary conditions under which backtested performance diverges from live realized returns.
+
+### A. Intraday Flash Crash Tracking Error (Backtest vs. Live Parity Failure)
+
+- **The Core Risk**: In the event of an intraday flash crash under elevated volatility regimes, the live simulation engine (`analytics.py`) tracks the continuous session low sequence via `update_session_low()` and fires an immediate `DYNAMIC_ATR_SELL` signal to liquidate assets at market price. However, the historical backtesting twin (`strategy.py`) evaluates price bounds exclusively on an End-of-Day (EOD) daily candle vector ($\text{Low}_t$).
+- **Worst-Case Scenario**: Intraday stop liquidations will trigger immediately in real-world trading, whereas the backtest remains completely blind to intra-candle volatility path-dependency. This divergence creates massive **Slippage** and structural **Tracking Error**, yielding actual historical returns that may deviate by over **20%** from the backtested baseline.
+
+| Dimension | Live Engine (`analytics.py`) | Backtest Twin (`strategy.py`) |
+|---|---|---|
+| Stop price path | Running `session_low` (60s polling) | Static daily `Low_t` only |
+| Trigger timing | Intraday, potentially mid-bar | End-of-bar EOD evaluation |
+| Parity status | **Asymmetric** — live is strictly more reactive |
+
+### B. Execution Timing Mismatch (The One-Day Latency Trap)
+
+- **The Core Risk**: By default, Backtrader's execution engine dispatches market actions (`self.close()`) to execute on the **Next Day's Open (Next Open)** price. Conversely, the live orchestration architecture (`analytics.py`) calculates portfolio net asset value (NAV) assuming immediate execution at the **Current Day's Close (EOD Close)**:
+
+$$
+\text{Backtest Execution Price} = \text{Open}_{t+1}
+$$
+
+$$
+\text{Live Engine Execution Price} = \text{Close}_t
+$$
+
+- **Operational Malfunction**: This structural 24-hour execution delta guarantees that live execution will drift into immediate anti-alignment (off-beat entries and exits), severely degrading actual realized performance compared to optimized backtests.
+
+| Execution Assumption | Module | Price Anchor |
+|---|---|---|
+| Next-bar open fill | `strategy.py` (Backtrader default) | $\text{Open}_{t+1}$ |
+| Same-bar close fill | `analytics.py` / `main.py` live loop | $\text{Close}_t$ |
+| Recommended alignment | Backtrader `set_coc(True)` | Cheat-on-Close → $\text{Close}_t$ (see Section 14) |
+
+---
+
+## 12. Pre-Deployment Critical Architectural Flaws & Hardening Vectors
+
+The following items represent **known structural vulnerabilities** in the current codebase. Sections 2–7 document implemented safeguards; this section defines the **remaining hardening vectors** required before real-capital deployment.
+
+### ① Virtual Position State Desynchronization (Reconciliation Vulnerability)
+
+- **The Defect**: The `LiveSignalEngine` relies entirely on a localized virtual memory registry (`PositionState` in `trading_state.json`) to determine position ownership limits (`in_position`, `held_quantity`). If a live order transmission encounters an API rate-limit breach, connection timeout, or partial execution failure at the broker level, the local file will desynchronize from reality.
+- **The Hardening Patches**: Incorporate a strict **Portfolio Reconciliation Layer** prior to cycle execution. The engine must query broker account states directly via the KIS API to cross-examine actual held share volume against local registries:
+
+$$
+\Delta \text{Shares} = \text{Broker Held Quantity} - \text{Local Persisted Quantity}
+$$
+
+If $\Delta \text{Shares} \neq 0$, the machine must freeze order execution threads, force-reconcile the local state matrix to match the broker asset registry, and issue an emergency log warning.
+
+| Reconciliation Source | KIS Interface | TR ID |
+|---|---|---|
+| Broker held quantity | Inquire present balance / holdings | `VTRP6504R` |
+| Local persisted quantity | `trading_state.json` → `held_quantity` | — |
+
+### ② All-In Leverage Capital Erosion Buffer (Fee & Slippage Leakage)
+
+- **The Defect**: The asset calculation string `shares_by_capital = int(deployable / entry_price)` inside `calculate_position_size()` assumes absolute zero-friction transactions. When deploying an aggressive 100% "all-in" capital allocation model, the omission of exchange fees, local broker taxes, and real-time execution slippage will cause order volumes to calculate slightly above available liquidation thresholds.
+- **The Hardening Patches**: Implement a strict **Capital Allocation Safety Buffer** inside `calculate_position_size()`. Force an operational haircut to restrict total immediate deployment capital to exactly 95%–98% of liquid buying power, or dynamically compute transaction fees prior to rounding down integer components:
+
+$$
+\text{Adjusted Available Capital} = \text{Liquid Capital} \times 0.95
+$$
+
+| Current Behavior | Proposed Hardening |
+|---|---|
+| `deployable = capital_at_risk` (100%) | `deployable = capital_at_risk × CAPITAL_DEPLOY_BUFFER` (0.95–0.98) |
+| No fee deduction in sizing | Pre-deduct estimated commission + slippage reserve |
+
+### ③ Intraday vs. EOD Timeframe Non-Invertibility
+
+- **The Defect**: The live script logs real-time macro-ticks through `update_session_low()`, while the backtester utilizes uniform flat daily candles. Evaluating real-time intraday tick feeds against an EOD daily bar backtest is mathematically invalid for path-dependent stop logic.
+- **The Hardening Patches**: Establish absolute structural clarity. If the system executes as a true real-time engine, the backtesting infrastructure inside `strategy.py` must be entirely refactored to ingest high-frequency 1-minute or 5-minute intraday bars instead of daily vectors to preserve structural consistency — **or** the live engine must downgrade to pure EOD evaluation (eliminating `session_low` intraday scanning).
+
+| Mode | Data Granularity | Stop Path Fidelity |
+|---|---|---|
+| Current live | Daily bar + `session_low` overlay | Intraday reactive |
+| Current backtest | Daily OHLCV only | EOD reactive |
+| Target parity | Matched granularity (1m/5m or pure EOD) | Invertible |
+
+### ④ Hardcoded Holiday Computation Risk
+
+- **The Defect**: While mathematical calculation helpers like `_memorial_day()` and `_thanksgiving_day()` resolve floating holiday offsets dynamically, they cannot catch emergency market adjustments (e.g., unexpected national mourning closures) or volatile lunisolar dates like **Good Friday**.
+- **The Hardening Patches**: Integrate Python's `holidays` library mapped to the `NYSE` market definition, forcing a multi-layer cross-check against the internal arithmetic calendar to shield the network interface from processing payloads on closure dates:
+
+```python
+import holidays
+nyse_calendar = holidays.NYSE(years=range(current_year - 1, current_year + 2))
+# Cross-check: if date in nyse_calendar AND is_us_market_holiday(date) → sleep
+# If nyse_calendar marks closed but internal registry misses → log CRITICAL + sleep
+```
+
+---
+
+## 13. High-Priority Telemetry Channels (Live Monitoring Matrix)
+
+To prevent catastrophic pipeline failure, the monitoring terminal must visualize and audit the following pipe-delimited diagnostic variables across every cycle. These channels extend the existing `[METRICS]` stream (Section 9) with **production-grade failure detection**.
+
+| # | Telemetry Channel | Computation / Source | Failure Threshold | Required Action |
+|---|---|---|---|---|
+| **1** | `real_vs_local_position_mismatch` | $\Delta \text{Shares} = \text{Broker Qty} - \text{Local held\_quantity}$ | $\Delta \neq 0$ | Auto-terminate cron schedule; freeze order threads; force reconcile |
+| **2** | `api_response_time` | Round-trip latency per KIS HTTP call (ms) | $> 3000\text{ ms}$ | Trigger timeout exemption; append payload to Retry Queue |
+| **3** | `trigger_floor_distance` | $\text{Close}_t - \text{Trigger Floor}_t$ | Approaching $\leq 0$ | Elevated liquidation proximity alert; log ATR regime shift |
+
+### Sample Extended `[METRICS]` Line (Target Schema)
+
+```
+[METRICS] NVDA | 2026-06-10 15:45:02 | Close=142.50 | trigger_floor_distance=5.13 |
+real_vs_local_position_mismatch=0 | api_response_time=842ms | Signal=HOLD
+```
+
+### Integration Points
+
+| Channel | Inject Location | Status |
+|---|---|---|
+| `real_vs_local_position_mismatch` | Pre-cycle reconciliation in `main.py` | **Planned** (Section 14) |
+| `api_response_time` | `KISApiClient` request wrapper | **Planned** |
+| `trigger_floor_distance` | `print_session_telemetry()` in `main.py` | Partially available via ATR Stop Telemetry block |
+
+Existing per-cycle fields already emitted (Section 9):
+
+```
+ATR Stop Telemetry   : peak=$145.80 | floor=$137.37 | session_low=$138.42
+Runtime Registry     : pending=False | held_qty=12 | last_processed=2026-06-05
+```
+
+Derive `trigger_floor_distance` as:
+
+$$
+\text{trigger\_floor\_distance} = \text{Close}_t - \text{Trigger Floor}_t
+$$
+
+---
+
+## 14. Final Operational Directives & Action Plan
+
+> **Structural Verdict**: The mathematical logic has achieved **structural integrity** (Sections 2–5), but deploying real capital without aligning execution timing boundaries and hard infrastructure failure walls will result in rapid capital degradation.
+
+### Immediate Execution Priority Tasks
+
+| Priority | Task | Target Module | Implementation Directive |
+|---|---|---|---|
+| **P0** | Backtest Timing Alignment | `strategy.py` / Backtrader init | Inject `self.cerebro.broker.set_coc(True)` (Cheat-on-Close) into the Backtrader initialization block. Forces backtester to execute transactions on the current bar's close price, synchronizing mathematical alignment with `analytics.py` ($\text{Close}_t$). |
+| **P0** | Portfolio Reconciliation Layer | `main.py` | Query KIS held quantity via `VTRP6504R` before each cycle; compute $\Delta \text{Shares}$; freeze on mismatch (Section 12①). |
+| **P1** | Capital Deploy Buffer | `analytics.py` | Apply $\text{Adjusted Capital} = \text{Liquid Capital} \times 0.95$ in `calculate_position_size()` (Section 12②). |
+| **P1** | NYSE Calendar Cross-Check | `analytics.py` | Integrate `holidays.NYSE` multi-layer validation (Section 12④). |
+| **P2** | API Exception Handling Queue | `main.py` | Build standardized asynchronous retry queue for failed order transmissions. |
+| **P2** | Telegram Alert Webhook | `main.py` | Automated alert infrastructure for unmapped broker failures, $\Delta \text{Shares} \neq 0$, and `api_response_time > 3.0s`. |
+| **P3** | Intraday Backtest Parity | `strategy.py` | Refactor to 1-minute / 5-minute bars **or** downgrade live to pure EOD (Section 12③). |
+
+### Cheat-on-Close Reference Implementation
+
+```python
+import backtrader as bt
+
+cerebro = bt.Cerebro()
+cerebro.broker.set_coc(True)   # Execute at current bar close — aligns with analytics.py EOD assumption
+# cerebro.broker.setcommission(commission=0.001)  # 0.1% friction — match Section 8
+```
+
+### Pre-Deployment Checklist
+
+- [ ] Backtrader `set_coc(True)` verified — backtest fills at $\text{Close}_t$, not $\text{Open}_{t+1}$
+- [ ] $\Delta \text{Shares}$ reconciliation active — local `held_quantity` matches broker registry
+- [ ] Capital deploy buffer (95%) applied in `calculate_position_size()`
+- [ ] `holidays.NYSE` cross-check integrated alongside internal calendar
+- [ ] `api_response_time` logged; Retry Queue wired for timeout events
+- [ ] Telegram / alert webhook configured for CRITICAL reconciliation failures
+- [ ] Backtest vs. live granularity decision documented (EOD-only or intraday bars)
 
 ---
 
