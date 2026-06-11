@@ -53,7 +53,7 @@ class PortfolioLedger:
 
 class RegularHoursGate:
     """
-    Regular Trading Hours (RTH) enforcement — 09:30-16:00 America/New_York.
+    Regular Trading Hours (RTH) enforcement - 09:30-16:00 America/New_York.
 
     Matches daily backtest assumptions: no entries, crossover exits, or ATR
     stop dispatches outside RTH.
@@ -73,7 +73,7 @@ class RegularHoursGate:
     @staticmethod
     def gate_message(signal: str, ticker: str) -> str:
         return (
-            f"[GATE/RTH] {ticker} — {signal} blocked outside NY regular session "
+            f"[GATE/RTH] {ticker} - {signal} blocked outside NY regular session "
             f"(09:30-16:00 ET). Matching daily backtest session boundary."
         )
 
@@ -301,7 +301,7 @@ class PortfolioReconciliationEngine:
                     )
                     print(
                         f"[RECONCILE/MISMATCH] {ticker} local={local_qty} "
-                        f"broker={broker_qty} delta={delta:+d} — overriding local ledger"
+                        f"broker={broker_qty} delta={delta:+d} - overriding local ledger"
                     )
                     ticker_state["held_quantity"] = broker_qty
                     ticker_state["in_position"] = broker_qty > 0
@@ -316,11 +316,11 @@ class PortfolioReconciliationEngine:
 
             if mismatches:
                 print(
-                    f"[RECONCILE] {len(mismatches)} mismatch(es) corrected — "
+                    f"[RECONCILE] {len(mismatches)} mismatch(es) corrected - "
                     "local state aligned to broker registry"
                 )
             else:
-                print("[RECONCILE] Broker holdings match local ledger — no override required")
+                print("[RECONCILE] Broker holdings match local ledger - no override required")
 
             print(
                 f"[RECONCILE] Broker cash USD={broker_cash:,.2f} | "

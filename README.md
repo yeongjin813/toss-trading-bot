@@ -73,7 +73,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 ### Phase 4: Dynamic ATR Risk Engine & Mathematical Integrity Corrections
 
-- **Architecture**: Expanded from single-asset to a parallel multi-ticker watchlist (`NVDA`, `PLTR`, `AAPL`) executing live routines through the KIS sandbox server (`openapivts.koreainvestment.com:29443`).
+- **Architecture**: Expanded to a **15-ticker** parallel watchlist (default in `market_registry.py`: AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) executing live routines through the KIS sandbox server (`openapivts.koreainvestment.com:29443`). Optional **SPY > 200MA** market filter blocks new BUY entries in bear regimes (`USE_SPY_MARKET_FILTER=true`).
 - **Core Engineering Patches**: Mitigated critical production failures by implementing a localized memory bar caching engine (`MarketDataCache`), a state-gated concurrency lock to eliminate duplicate order flooding, an institutional volume liquidity surge gate, and a rigorous series of financial logic patches to eliminate same-bar look-ahead bias, capital over-leverage rejections, and weekend/holiday runtime crashes.
 
 ### Phase 5: Ticker-Specific Configuration & Macro Regime Filtering *(Current)*
@@ -199,7 +199,7 @@ enriched["SMA_SHORT"] = calculate_sma(enriched, config.sma_period)      # ticker
 enriched["SMA_LONG"]  = calculate_sma(enriched, config.sma_long_period)  # fixed 50-day
 ```
 
-The short SMA window adapts per ticker (10 for NVDA/PLTR, 20 for AAPL). The long SMA is always 50 days — the macro regime anchor.
+The short SMA window adapts per ticker via `StrategyConfigMapper` (e.g. 10 for NVDA/high-beta regimes, 20 for DEFAULT large-cap). The long SMA is always 50 days - the macro regime anchor.
 
 ### D. Asymmetric Entry / Exit Mechanics
 
@@ -894,21 +894,24 @@ During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **wee
 
 ```
                          ┌─────────────────────────────────────────────┐
-                         │             main.py — Orchestrator          │
-                         │         Watchlist: [NVDA, PLTR, AAPL]       │
+                         │             main.py - Orchestrator          │
+                         │  WATCHLIST (15, .env / market_registry.py)  │
+                         │  SPY filter: BUY only when SPY > 200MA      │
                          └─────────────────────┬───────────────────────┘
+                                               │
+                         for ticker in WATCHLIST (sequential per cycle)
                                                │
               ┌────────────────────────────────┼────────────────────────────────┐
               │                                │                                │
               ▼                                ▼                                ▼
      ┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
-     │  NVDA Pipeline  │              │  PLTR Pipeline  │              │  AAPL Pipeline  │
+     │ Ticker Pipeline │              │ Ticker Pipeline │              │ Ticker Pipeline │
+     │   (e.g. NVDA)   │              │   (e.g. PLTR)   │              │   (e.g. AAPL)   │
      ├─────────────────┤              ├─────────────────┤              ├─────────────────┤
-     │  KIS API Fetch  │              │ KIS API Proxy   │              │  KIS API Fetch  │
-     │ → nvda_daily.csv│              │ (NYS → NASD)    │              │ → aapl_daily.csv│
-     │  analytics.py   │              │ analytics.py    │              │  analytics.py   │
-     │  Live Signal    │              │ Live Signal     │              │  Live Signal    │
-     │  Backtrader BT  │              │ Backtrader BT   │              │  Backtrader BT  │
+     │  KIS API Fetch  │              │  KIS API Fetch  │              │  KIS API Fetch  │
+     │ → {ticker}_csv  │              │ → {ticker}_csv  │              │ → {ticker}_csv  │
+     │  analytics.py   │              │  analytics.py   │              │  analytics.py   │
+     │  Live Signal    │              │  Live Signal    │              │  Live Signal    │
      └─────────────────┘              └─────────────────┘              └─────────────────┘
               │                                │                                │
               └────────────────────────────────┼────────────────────────────────┘
@@ -930,7 +933,7 @@ During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **wee
 
 ### Strategic Parameter Telemetry Disconnect
 
-- **Execution Signal Engine**: Evaluates entries using ticker-isolated $\text{SMA\_SHORT}$ via `StrategyConfigMapper` (10 for NVDA/PLTR, 20 for AAPL).
+- **Execution Signal Engine**: Evaluates entries using ticker-isolated $\text{SMA\_SHORT}$ via `StrategyConfigMapper`. New BUY entries are optionally gated by **SPY > 200-day SMA** when `USE_SPY_MARKET_FILTER=true` (SELL / ATR stops are not gated).
 - **Regime Filter**: Fixed $\text{SMA\_LONG}$ (50-day) gates entries and conditionally suppresses RSI exits during bull regimes.
 - **Telemetry Logging Layer**: Independent extraction of $\text{SMA}_{20}$ (`ANALYTICS_SMA_PERIOD = 20` in `main.py`) for external regression — intentional disconnect from execution SMA.
 
@@ -1018,10 +1021,10 @@ To prevent the system from getting flagged or blacklisted by the broker's rate l
 | `TARGET_BARS` | 756 | Rolling window cap |
 | `MIN_DATA_BARS` | 22 | Minimum before analytics run |
 
-| Mode | API Calls per Cycle (3 tickers) | Bars Transferred (approx.) |
+| Mode | API Calls per Cycle (15 tickers + SPY) | Bars Transferred (approx.) |
 |---|---|---|
-| **Pre-Phase-4** | 3 × ~15 paginated requests | ~2,268 bars |
-| **Phase-4** | 3 × 1 request | ~3 bars |
+| **Pre-Phase-4** | N × ~15 paginated requests | ~N × 756 bars |
+| **Phase-4** | N × 1 request (+ SPY if filter on) | ~N intraday refreshes |
 
 ### B. State-Gated Synchronous Order Lifecycle Chain
 
