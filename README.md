@@ -4,7 +4,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 5 Active — Ticker-Specific Configuration & Macro Regime Filtering |
+| **System Status** | P3 Active — Infrastructure Hardening & Live Parity (RTH Gate + Reconciliation) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | `NVDA` (High-Vol leader), `PLTR` (Breakout growth), `AAPL` (Low-Vol control) — configurable via `.env` `WATCHLIST` |
@@ -14,7 +14,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Data Architecture** | Bootstrap 756 bars once → 1-bar micro-fetch per open-session cycle |
 | **Session Gate** | NYSE holiday registry + **`is_us_regular_market_hours()`** (09:30–16:00 ET via `pytz`) |
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
-| **Timeline Alignment** | Pre/post-market crossover blocked; ATR stop bypasses hours gate when positioned |
+| **Timeline Alignment** | All dispatchable signals (`BUY`/`SELL`/`DYNAMIC_ATR_SELL`) bound to NY RTH 09:30–16:00 ET |
+| **Reconciliation** | `PortfolioReconciliationEngine` — KIS `VTRP6504R` broker-vs-local sync at startup + daily RTH |
 | **Risk Posture** | Documented in Sections 11–14 — backtest/live parity gaps, reconciliation vectors, monitoring telemetry |
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
@@ -25,6 +26,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 1. [Project Evolution & Development Chronology](#1-project-evolution--development-chronology)
 1A. [Phase 3 Architecture: Ticker-Specific Configuration & Macro Regime Filtering](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)
+1B. [Phase 3: Infrastructure Hardening & Live Parity Architecture](#phase-3-infrastructure-hardening--live-parity-architecture)
 2. [Dedicated Section: Same-Bar Look-Ahead Bias Eradication](#2-dedicated-section-same-bar-look-ahead-bias-eradication)
 3. [Dedicated Section: RSI Crossdown Exit Engine](#3-dedicated-section-rsi-crossdown-exit-engine)
 4. [Dedicated Section: Dual-Clamp Position Sizing](#4-dedicated-section-dual-clamp-position-sizing)
@@ -102,13 +104,16 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Liquidity Gate** | `analytics.py` + `strategy.py` | `Volume_t > Volume_SMA_20 × 1.2` for BUY |
 | **Configuration Externalization** | `config.py` → `StrategyConfigMapper` | Ticker-isolated signal params; `.env` for credentials/capital only |
 | **Ticker Regime Isolation** | `config.py` + `analytics.py` + `strategy.py` | NVDA / PLTR / DEFAULT matrix; dual MA; asymmetric RSI exit |
+| **P3 RTH Execution Gate** | `session_manager.py` + `main.py` | Zero-leakage block on all dispatchable signals outside 09:30–16:00 ET |
+| **P3 Intraday Session Low** | `session_manager.py` + `analytics.py` | Real-time `session_low` ATR stop parity with daily backtest `Low` trigger |
+| **P3 Portfolio Reconciliation** | `session_manager.py` + `main.py` | KIS `VTRP6504R` broker override + deployable cash refresh |
 
 Additional Phase 4 safeguards preserved from prior milestones:
 
 - **Exact liquidation quantity synchronization**: SELL orders clamp to `held_quantity` — never sell more than locally tracked holdings.
 - **Non-blocking balance inquiry**: `try_print_mock_account_balance()` via TR `VTRP6504R` — failures logged as `[INFO]`, never block the loop.
 - **PLTR NASDAQ VTS proxy**: `excd: NAS`, `ovrs_excg_cd: NASD` — bypasses 0-bar NYS truncation.
-- **NY regular-hours gate**: `is_us_regular_market_hours()` blocks pre/post-market crossover; `DYNAMIC_ATR_SELL` remains active for open positions outside regular hours.
+- **NY regular-hours gate (P3 hardened)**: `RegularHoursGate` blocks **all** dispatchable signals (`BUY`, `SELL`, `DYNAMIC_ATR_SELL`) outside 09:30–16:00 ET — matching daily backtest session boundaries.
 - **State persistence fix**: `last_processed_date` updates only after `BUY` / `SELL` / `DYNAMIC_ATR_SELL` order transitions — never on `HOLD`.
 - **Backtest/live parity**: `TrendTradingStrategy` and `LiveSignalEngine` share identical regime gates, 3-step trailing sequence, and Backtrader `set_coc(True)`.
 
@@ -291,6 +296,319 @@ This is **variance reduction through regime conditioning**, not **bias reduction
 | `analytics.py` | `LiveSignalEngine(ticker)` | Live signal evaluation with asymmetric gates |
 | `strategy.py` | `TrendTradingStrategy(ticker=...)` | Backtrader twin with identical entry/exit mathematics |
 | `run_backtest.py` | `create_backtest_cerebro(ticker)` | Historical validation per isolated regime |
+
+---
+
+## Phase 3: Infrastructure Hardening & Live Parity Architecture
+
+This section documents **Production Phase P3** — the infrastructure layer that closes the structural gap between daily-bar backtesting and real-time intraday execution. P3 delivers three hardened subsystems in `session_manager.py`, integrated into `main.py` and `analytics.py`, to prevent metric drift when the P2 consolidated portfolio backtest (Sharpe 1.25, MaxDD 2.61%) is deployed to the KIS VTS live loop.
+
+### A. Regular-Hours Trading Gate (RTH Enforcer)
+
+#### Design Objective
+
+Daily backtests evaluate signals on completed NYSE session bars (09:30–16:00 ET). Pre-market and after-hours price action must not generate entries, crossover exits, or ATR stop dispatches — otherwise live performance diverges from backtest assumptions.
+
+#### `RegularHoursGate` Mechanics
+
+`RegularHoursGate` in `session_manager.py` delegates clock authority to `is_us_regular_market_hours()` in `analytics.py` (DST-safe via `pytz`, America/New_York). The gate exposes two static methods:
+
+| Method | Purpose |
+|---|---|
+| `is_rth(now)` | Returns `True` when NY calendar is open **and** `09:30 ≤ time < 16:00` ET |
+| `block_signal_for_session(signal, regular_market_hours)` | Returns `True` when `signal ∈ {BUY, SELL, DYNAMIC_ATR_SELL}` and `regular_market_hours=False` |
+| `gate_message(signal, ticker)` | Emits standardized `[GATE/RTH]` console telemetry |
+
+```python
+@staticmethod
+def block_signal_for_session(signal: str, regular_market_hours: bool) -> bool:
+    if regular_market_hours:
+        return False
+    return signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}
+```
+
+#### Dual-Layer Integration (Zero-Leakage Enforcement)
+
+RTH blocking is applied at **two independent checkpoints** so no dispatchable signal can leak outside regular hours:
+
+**Layer 1 — `LiveExecutionGatekeeper.evaluate_live_signals()`**
+
+After `evaluate_trading_cycle()` produces a base signal, the gatekeeper runs the intraday ATR scan first (Section B), then converts any remaining dispatchable signal to `HOLD` with metadata:
+
+```python
+if self.rth_gate.block_signal_for_session(base_signal, regular_market_hours):
+    signal_result = {
+        "signal": "HOLD",
+        "crossover_suppressed": True,
+        "outside_regular_hours": True,
+        "blocked_signal": base_signal,
+    }
+```
+
+**Layer 2 — `process_ticker()` final dispatch guard**
+
+Before KIS order transmission, `main.py` re-validates through `_rth_gate.block_signal_for_session()` and prints `gate_message()`. If blocked, state is persisted and the function returns `"HOLD"` without broker contact.
+
+**Layer 3 — `LiveSignalEngine.evaluate_trading_cycle()`**
+
+Inside `analytics.py`, any signal promoted to `BUY`, `SELL`, or `DYNAMIC_ATR_SELL` outside RTH is forcibly demoted to `HOLD` with `outside_regular_hours=True` before sizing is computed.
+
+```
+evaluate_trading_cycle()          LiveExecutionGatekeeper          process_ticker()
+        │                                  │                              │
+        ├─ RTH demote (analytics)          ├─ Intraday ATR scan first     ├─ RTH final guard
+        └─ signal_result                   ├─ RTH block → HOLD            └─ KIS dispatch (RTH only)
+                                           └─ crossover re-eval (RTH)
+```
+
+#### Pre/Post-Market Cycle Behavior
+
+| Phase | Loop Runs? | Reconciliation? | Signals Dispatched? |
+|---|---|---|---|
+| Weekend / NYSE holiday | Skipped (extended sleep) | No | No |
+| Weekday pre-market | Yes (telemetry) | No | **No** — all blocked |
+| Regular hours (RTH) | Yes | Yes (once per session day) | Yes |
+| Weekday after-hours | Yes (telemetry) | No | **No** — all blocked |
+
+Console markers:
+
+```
+[GATE/RTH] Outside NY regular hours (09:30-16:00 ET) — all signals blocked until RTH open
+[GATE/RTH] NVDA — BUY blocked outside NY regular session (09:30-16:00 ET). Matching daily backtest session boundary.
+RTH Blocked Signal   : BUY (pre/post-market gate)
+```
+
+---
+
+### B. Intraday Session Low Stop Engine
+
+#### Design Objective
+
+In the daily backtest, the ATR trailing stop triggers when the bar's **Low** breaches the prior `trigger_floor`:
+
+$$
+\text{DYNAMIC\_ATR\_SELL} \iff \text{Low}_t \le \text{Trigger Floor}_{t-1}
+$$
+
+Live execution polling every 60 seconds cannot wait for bar close — checking only interim `Close` introduces severe lag. P3 tracks a running **intraday session low** that incorporates both the daily bar low and the current mark price.
+
+#### `IntradaySessionTracker` Mathematical Implementation
+
+During regular trading hours, on each poll cycle:
+
+$$
+\text{session\_low} = \min(\text{bar.low},\; \text{current\_price})
+$$
+
+The running minimum accumulates across polls within the same daily bar:
+
+$$
+\text{session\_low}_t = \min(\text{session\_low}_{t-1},\; \text{bar.low},\; \text{current\_price})
+$$
+
+On a new daily bar (date rollover), `session_low` resets to the first tick observation. **Outside RTH**, `session_low` is frozen — pre/post-market prints do not update or trigger stops.
+
+```python
+# session_manager.py — IntradaySessionTracker.update_session_low()
+tick_candidates = [float(bar.low)]
+if current_price is not None and current_price > 0:
+    tick_candidates.append(float(current_price))
+session_tick_low = min(tick_candidates)
+
+if runtime.latest_bar_date != bar_date_str:
+    runtime.session_low = session_tick_low          # new bar reset
+else:
+    runtime.session_low = min(runtime.session_low, session_tick_low)  # accumulate
+```
+
+The same logic is mirrored in `LiveSignalEngine.evaluate_trading_cycle()` when `regular_market_hours=True`.
+
+#### Immediate ATR Stop Dispatch
+
+`IntradaySessionTracker.evaluate_intraday_atr_stop()` runs as **Priority 1** inside `LiveExecutionGatekeeper` — before crossover re-evaluation and before RTH demotion of other signals:
+
+$$
+\text{Emergency Exit} \iff \text{session\_low} \le \text{trigger\_floor}
+$$
+
+When the condition holds during RTH:
+
+1. `LiveSignalEngine.evaluate_intraday_atr_stop()` returns `DYNAMIC_ATR_SELL` with `mutate_state=False` (state mutation deferred to order dispatch).
+2. The gatekeeper tags `intraday_atr_scan=True` on the signal payload.
+3. `process_ticker()` passes through the RTH gate (stop is RTH-only by construction) and dispatches a market SELL via KIS.
+
+This achieves **exact parity** with the backtest Step 1 prior-floor check (Section 2), substituting `Low_t` with the live running `session_low`.
+
+```
+Positioned + RTH + session_low ≤ trigger_floor
+    │
+    ▼
+DYNAMIC_ATR_SELL (intraday_atr_scan=True)
+    │
+    ▼
+_resolve_execution_quantity() → held_quantity clamp
+    │
+    ▼
+KIS market SELL (VTTT1006U)
+```
+
+Telemetry:
+
+```
+Session Low          : 138.4200
+Intraday ATR Scan    : ACTIVE (session_low vs prior trigger_floor)
+ATR Stop Telemetry   : peak=$145.80 | floor=$137.37 | session_low=$138.42
+```
+
+---
+
+### C. Portfolio Reconciliation Layer
+
+#### Design Objective
+
+Local state in `trading_state.json` can drift from broker reality due to partial fills, manual interventions, API timeouts, or split executions. P3 synchronizes broker-held quantities and deployable cash **before** any entry signal or dual-clamp sizing evaluation.
+
+#### KIS VTS API — `VTRP6504R` Synchronization Routine
+
+| Property | Value |
+|---|---|
+| **TR ID** | `VTRP6504R` |
+| **Endpoint** | `GET /uapi/overseas-stock/v1/trading/inquire-present-balance` |
+| **Client Method** | `KISApiClient.fetch_overseas_present_balance(natn_cd="840")` |
+| **Engine Class** | `PortfolioReconciliationEngine` in `session_manager.py` |
+
+**Execution schedule:**
+
+| Trigger | Function | Condition |
+|---|---|---|
+| **Startup** | `run_session_reconciliation(..., force=True)` | Always — first action after bootstrap in `main()` |
+| **Daily RTH open** | `run_session_reconciliation()` inside `run_watchlist_cycle()` | Once per calendar day when `last_reconcile_session_date ≠ today` and RTH active |
+| **Cached fallback** | Returns prior `_portfolio` ledger | Same-day subsequent cycles skip broker query |
+
+```
+main() startup
+    │
+    ├─ force=True → VTRP6504R query
+    │
+    └─ while True:
+           run_watchlist_cycle()
+               │
+               ├─ IF RTH AND new session day → reconcile
+               └─ FOR each ticker → process_ticker(ledger)
+```
+
+#### Payload Parsing
+
+| KIS Response Block | Extracted Field | Purpose |
+|---|---|---|
+| `output1[]` | `ovrs_pdno` / `pdno` + `ovrs_stck_tot_qty` / `hldg_qty` | Per-ticker `broker_quantity` |
+| `output2[]` (USD row) | `frcr_dncl_amt_2`, `frcr_drwg_psbl_amt_1` | Broker deposit / withdrawable USD |
+| `output3` | `frcr_use_psbl_amt` | Usable foreign cash (max with output2) |
+
+Watchlist symbols not present in `output1` default to `broker_quantity = 0`.
+
+#### Mismatch Resolution Handler
+
+For each ticker in `WATCHLIST`:
+
+$$
+\Delta = \text{broker\_quantity} - \text{local held\_quantity}
+$$
+
+| Condition | Action |
+|---|---|
+| $\Delta = 0$ | No override; log `[RECONCILE] Broker holdings match local ledger` |
+| $\Delta \neq 0$ | Log `[RECONCILE/MISMATCH]`, override local state, recalculate deployable cash |
+
+**Override sequence on mismatch:**
+
+1. **Log** — `[RECONCILE/MISMATCH] {ticker} local={n} broker={m} delta={±d} — overriding local ledger`
+2. **Override `held_quantity`** — set to `broker_quantity`
+3. **Sync `in_position`** — `True` if `broker_quantity > 0`, else `False`
+4. **Reset ATR metrics if flat** — when `broker_quantity ≤ 0`, clear `highest_price_achieved`, `current_atr`, `dynamic_stop_distance`, `trigger_floor`, `session_low`
+5. **Persist `_portfolio` meta** — write `broker_cash_usd`, `available_cash_usd`, `broker_holdings`, `last_reconciled_at` to `trading_state.json`
+
+On API failure, the engine logs `[RECONCILE/ERROR]`, falls back to cached `_portfolio` values, and sets `report.reconciled=False` without halting the loop.
+
+#### Deployable Cash Funnel (Dual-Clamp Drift Prevention)
+
+Reconciled `available_cash_usd` flows into position sizing to prevent dual-clamp drift:
+
+```python
+cycle = engine.evaluate_trading_cycle(
+    df,
+    available_capital=ledger.available_cash_usd,   # broker-aligned deployable cash
+    portfolio_equity=portfolio_equity,              # cash + mark-to-market holdings
+    current_price=current_price,
+)
+```
+
+Inside `calculate_position_size()`:
+
+$$
+\text{shares\_by\_capital} = \left\lfloor \frac{\text{available\_capital}}{\text{entry\_price}} \right\rfloor
+$$
+
+$$
+\text{shares\_by\_risk} = \left\lfloor \frac{\text{portfolio\_equity} \times \text{risk\_per\_trade}}{\text{ATR} \times \text{multiplier}} \right\rfloor
+$$
+
+After order fills, `main.py` adjusts `ledger.available_cash_usd` locally (with `DEFAULT_COMMISSION_RATE`) and persists to `_portfolio.available_cash_usd` until the next broker reconciliation.
+
+#### `trading_state.json` — `_portfolio` Meta Block
+
+```json
+{
+  "_portfolio": {
+    "broker_cash_usd": 9842.50,
+    "available_cash_usd": 9750.00,
+    "last_reconciled_at": "2026-06-05 09:31:02",
+    "last_reconcile_session_date": "2026-06-05",
+    "broker_holdings": {
+      "NVDA": 12,
+      "PLTR": 0,
+      "AAPL": 0
+    }
+  },
+  "NVDA": { "...": "..." }
+}
+```
+
+---
+
+### D. P3 Module Reference & Execution Pipeline
+
+| Module | Class / Function | Responsibility |
+|---|---|---|
+| `session_manager.py` | `RegularHoursGate` | RTH signal blocking policy |
+| `session_manager.py` | `IntradaySessionTracker` | Running session low + intraday ATR stop evaluation |
+| `session_manager.py` | `PortfolioReconciliationEngine` | KIS `VTRP6504R` broker-vs-local sync |
+| `session_manager.py` | `LiveExecutionGatekeeper` | Orchestrates ATR scan → RTH gate → crossover re-eval |
+| `session_manager.py` | `PortfolioLedger` | Broker-aligned cash ledger dataclass |
+| `main.py` | `run_session_reconciliation()` | Startup + daily RTH reconciliation scheduler |
+| `main.py` | `process_ticker()` | Gatekeeper integration + final RTH dispatch guard |
+| `main.py` | `_estimate_portfolio_equity()` | Mark-to-market equity for risk-based sizing |
+| `analytics.py` | `evaluate_trading_cycle()` | Session low update, RTH demotion, reconciled-capital sizing |
+
+**Full production order pipeline:**
+
+```
+reconcile (VTRP6504R)
+    → refresh ledger.available_cash_usd
+    → FOR each ticker:
+          fetch/refresh OHLCV
+          → evaluate_trading_cycle(reconciled capital)
+          → LiveExecutionGatekeeper (session_low ATR → RTH block)
+          → process_ticker RTH final guard
+          → KIS dispatch → state persist
+```
+
+**Verification:**
+
+```powershell
+python test_analytics.py
+python -m py_compile main.py session_manager.py analytics.py
+```
 
 ---
 
@@ -545,11 +863,11 @@ def is_us_regular_market_hours(current_dt=None) -> bool:
     return time(9, 30) <= ny_dt.time() < time(16, 0)
 ```
 
-**Pre-market / post-market behavior:**
+**Pre-market / post-market behavior (P3 hardened):**
 
 - `should_allow_crossover_signals(..., regular_market_hours=False)` → **Crossover Allowed = False**
-- Default signal outside regular hours (no position): **`HOLD`** — `BUY`/`SELL` blocked in `main.py`
-- **`DYNAMIC_ATR_SELL`**: Still evaluated when `_has_active_position()` is true — **bypasses** the regular-hours gate for flash-crash protection
+- **All dispatchable signals** (`BUY`, `SELL`, `DYNAMIC_ATR_SELL`) → **`HOLD`** — blocked in `LiveExecutionGatekeeper`, `evaluate_trading_cycle()`, and `process_ticker()`
+- Telemetry and state persistence continue; no KIS orders are transmitted outside RTH
 
 ### E. Extended Sleep Logic Behavior
 
@@ -564,7 +882,7 @@ When `is_us_market_holiday()` or weekend validations return `True`, the orchestr
 [GATE] US market closed (Christmas). Sleeping 3600 seconds...
 ```
 
-During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **weekends and holidays**, the full cycle skip prevents all broker queries. On **weekday pre/post-market**, the loop still runs for **positioned ATR stop** monitoring while crossover remains suppressed.
+During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **weekends and holidays**, the full cycle skip prevents all broker queries. On **weekday pre/post-market**, the loop runs for telemetry only — **all dispatchable signals remain blocked** until RTH.
 
 ---
 
@@ -602,7 +920,8 @@ During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **wee
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| **Orchestration** | `main.py` | Secure environment loading, KIS authentication token provisioning (`kis_token_cache.json`), 60s watchlist sequencing, NYSE holiday gate, order transmission execution, graceful crash state serialization |
+| **Orchestration** | `main.py` | Secure environment loading, KIS authentication token provisioning (`kis_token_cache.json`), 60s watchlist sequencing, NYSE holiday gate, P3 reconciliation + RTH gate, order transmission execution, graceful crash state serialization |
+| **P3 Session Layer** | `session_manager.py` | `RegularHoursGate`, `IntradaySessionTracker`, `PortfolioReconciliationEngine`, `LiveExecutionGatekeeper` |
 | **Indicators & Logic** | `analytics.py` | Houses `LiveSignalEngine` — rolling historical buffers, Wilder-smoothed metrics, dual-clamp sizing, 3-step bar evaluation, NYSE calendar, `PositionState` lifecycle |
 | **Strategy Sandbox** | `strategy.py` | Identical backtesting twin utilizing Backtrader; annualized daily Sharpe analyzers; transaction friction rules; look-ahead-free trailing stop parity |
 | **Persistence Layer** | `data/{ticker}_daily.csv`, `trading_state.json` | Local cache boundaries and active holding state registry |
@@ -668,11 +987,12 @@ validate_environment()
   → load trading_state.json
   → try_print_mock_account_balance()     # VTRP6504R — non-blocking
   → log_configured_capital_model()
+  → run_session_reconciliation(force=True)  # P3 startup broker sync
   → while True:
         IF describe_us_market_closure() != None:
             sleep(MARKET_CLOSED_SLEEP_SECONDS)   # 3600 default
             continue
-        run_watchlist_cycle()
+        run_watchlist_cycle()                    # reconcile (daily RTH) → gatekeeper → dispatch
         sleep(LOOP_COOLDOWN_SECONDS)             # 60 default
 ```
 
@@ -742,9 +1062,9 @@ $$
 
 | Condition | Crossover BUY/SELL | DYNAMIC_ATR_SELL |
 |---|---|---|
-| Regular hours + new daily bar | **Allowed** | **Active** (if positioned) |
-| Same daily bar | **Suppressed** | **Active** (`session_low`) |
-| Pre-market / post-market (weekday) | **Suppressed** → `HOLD` | **Active** (if positioned) |
+| Regular hours + new daily bar | **Allowed** | **Active** (if positioned, `session_low` scan) |
+| Same daily bar (RTH) | **Suppressed** | **Active** (`session_low` accumulates) |
+| Pre-market / post-market (weekday) | **Suppressed** → `HOLD` | **Suppressed** → `HOLD` (P3 RTH gate) |
 | Weekend or NYSE holiday | **Suppressed** | Full cycle skipped |
 | `pending_order == True` | **Locked** | **Locked** |
 
@@ -864,20 +1184,25 @@ Expected startup sequence:
 4. Load `trading_state.json`
 5. `try_print_mock_account_balance()` — optional, non-blocking
 6. `log_configured_capital_model()` — confirms `CAPITAL_AT_RISK`
-7. Infinite watchlist loop with `[METRICS]` emission
+7. `run_session_reconciliation(force=True)` — P3 startup broker sync
+8. Infinite watchlist loop with `[METRICS]` emission
 
 Expected runtime log markers:
 
 ```
-Order pipeline: KIS dispatch -> rt_cd verify -> state transition -> persist
+Order pipeline: reconcile -> RTH gate -> intraday ATR scan -> dispatch -> persist
+[P3] Running startup portfolio reconciliation...
+[RECONCILE] Starting broker portfolio synchronization...
+[RECONCILE] Broker holdings match local ledger — no override required
+[RECONCILE/MISMATCH] NVDA local=10 broker=12 delta=+2 — overriding local ledger
 --- Cycle 12 skipped at 2026-12-25 09:00:00 ---
 [GATE] US market closed (Christmas). Sleeping 3600 seconds...
-[GATE] Outside NY regular hours (09:30–16:00 ET) — crossover suppressed; ATR stop active for open positions
-[GATE] NVDA outside NY regular session (09:30–16:00 ET) — BUY blocked, holding
+[GATE/RTH] Outside NY regular hours (09:30-16:00 ET) — all signals blocked until RTH open
+[GATE/RTH] NVDA — BUY blocked outside NY regular session (09:30-16:00 ET). Matching daily backtest session boundary.
+Intraday ATR Scan    : ACTIVE (session_low vs prior trigger_floor)
+Deployable Cash      : $9,750.00
+Portfolio Equity     : $11,234.50
 [LOCK] NVDA pending_order=True — signal suppressed
-[SKIP] PLTR liquidation skipped — no held quantity tracked
-  -> 756 bars in memory (intraday refresh)
-  -> Order accepted (rt_cd=0). State transition applied for NVDA: has_position=True, held_qty=12
 ```
 
 ### D. Empirical Log Redirection Command
@@ -941,7 +1266,7 @@ To halt the continuous polling routine safely, dispatch a SIGINT termination sig
 | Interface Operational Name | Broker Target TR ID | Resource HTTP Routing Path | Core System Dependency Bind |
 |---|---|---|---|
 | OAuth Token Issuance | — | `POST /oauth2/tokenP` | Cached in `kis_token_cache.json` |
-| Inquire Present Balance | `VTRP6504R` | `/uapi/overseas-stock/v1/trading/inquire-present-balance` | `try_print_mock_account_balance()` [Optional/Non-blocking] |
+| Inquire Present Balance | `VTRP6504R` | `/uapi/overseas-stock/v1/trading/inquire-present-balance` | `PortfolioReconciliationEngine.reconcile()` [P3 — startup + daily RTH]; `try_print_mock_account_balance()` [optional/non-blocking] |
 | US Daily Price Quotations (full) | `HHDFS76240000` | `/uapi/overseas-price/v1/quotations/dailyprice` | `MarketDataCache` bootstrap (~756 bars) |
 | US Daily Price Quotations (latest) | `HHDFS76240000` | `/uapi/overseas-price/v1/quotations/dailyprice` | `MarketDataCache.refresh_latest()` (1 page/cycle) |
 | Overseas Order Placement (Buy) | `VTTT1002U` | `/uapi/overseas-stock/v1/trading/order` | Execution signal routing — BUY |
@@ -995,16 +1320,10 @@ $$
 
 The following items represent **known structural vulnerabilities** in the current codebase. Sections 2–7 document implemented safeguards; this section defines the **remaining hardening vectors** required before real-capital deployment.
 
-### ① Virtual Position State Desynchronization (Reconciliation Vulnerability)
+### ① Virtual Position State Desynchronization (Reconciliation Vulnerability) — **RESOLVED (P3)**
 
-- **The Defect**: The `LiveSignalEngine` relies entirely on a localized virtual memory registry (`PositionState` in `trading_state.json`) to determine position ownership limits (`in_position`, `held_quantity`). If a live order transmission encounters an API rate-limit breach, connection timeout, or partial execution failure at the broker level, the local file will desynchronize from reality.
-- **The Hardening Patches**: Incorporate a strict **Portfolio Reconciliation Layer** prior to cycle execution. The engine must query broker account states directly via the KIS API to cross-examine actual held share volume against local registries:
-
-$$
-\Delta \text{Shares} = \text{Broker Held Quantity} - \text{Local Persisted Quantity}
-$$
-
-If $\Delta \text{Shares} \neq 0$, the machine must freeze order execution threads, force-reconcile the local state matrix to match the broker asset registry, and issue an emergency log warning.
+- **The Defect**: The `LiveSignalEngine` relies on a localized virtual memory registry (`PositionState` in `trading_state.json`) to determine position ownership limits (`in_position`, `held_quantity`). Partial fills, manual trades, or API desync could drift local state from broker reality.
+- **P3 Implementation**: `PortfolioReconciliationEngine` in `session_manager.py` queries KIS `VTRP6504R` at startup and once per RTH session day. On mismatch ($\Delta \text{Shares} \neq 0$), local `held_quantity` is overridden, ATR fields reset if flat, and `available_cash_usd` is refreshed for dual-clamp sizing. See [Phase 3: Infrastructure Hardening](#phase-3-infrastructure-hardening--live-parity-architecture).
 
 | Reconciliation Source | KIS Interface | TR ID |
 |---|---|---|
@@ -1071,7 +1390,7 @@ real_vs_local_position_mismatch=0 | api_response_time=842ms | Signal=HOLD
 
 | Channel | Inject Location | Status |
 |---|---|---|
-| `real_vs_local_position_mismatch` | Pre-cycle reconciliation in `main.py` | **Planned** (Section 14) |
+| `real_vs_local_position_mismatch` | Pre-cycle reconciliation in `main.py` | **Implemented (P3)** — `[RECONCILE/MISMATCH]` auto-override |
 | `api_response_time` | `KISApiClient` request wrapper | **Planned** |
 | `trigger_floor_distance` | `print_session_telemetry()` in `main.py` | Partially available via ATR Stop Telemetry block |
 
@@ -1098,8 +1417,8 @@ $$
 
 | Priority | Task | Target Module | Implementation Directive |
 |---|---|---|---|
+| **P0** | Portfolio Reconciliation Layer | `session_manager.py` + `main.py` | **Done (P3)** — `VTRP6504R` sync at startup + daily RTH; auto-override on $\Delta \text{Shares} \neq 0$ |
 | **P0** | Backtest Timing Alignment | `strategy.py` / Backtrader init | Inject `self.cerebro.broker.set_coc(True)` (Cheat-on-Close) into the Backtrader initialization block. Forces backtester to execute transactions on the current bar's close price, synchronizing mathematical alignment with `analytics.py` ($\text{Close}_t$). |
-| **P0** | Portfolio Reconciliation Layer | `main.py` | Query KIS held quantity via `VTRP6504R` before each cycle; compute $\Delta \text{Shares}$; freeze on mismatch (Section 12①). |
 | **P1** | Capital Deploy Buffer | `analytics.py` | Apply $\text{Adjusted Capital} = \text{Liquid Capital} \times 0.95$ in `calculate_position_size()` (Section 12②). |
 | **P1** | NYSE Calendar Cross-Check | `analytics.py` | Integrate `holidays.NYSE` multi-layer validation (Section 12④). |
 | **P2** | API Exception Handling Queue | `main.py` | Build standardized asynchronous retry queue for failed order transmissions. |
@@ -1119,7 +1438,7 @@ cerebro.broker.set_coc(True)   # Execute at current bar close — aligns with an
 ### Pre-Deployment Checklist
 
 - [ ] Backtrader `set_coc(True)` verified — backtest fills at $\text{Close}_t$, not $\text{Open}_{t+1}$
-- [ ] $\Delta \text{Shares}$ reconciliation active — local `held_quantity` matches broker registry
+- [x] $\Delta \text{Shares}$ reconciliation active — local `held_quantity` overridden to match broker registry (P3)
 - [ ] Capital deploy buffer (95%) applied in `calculate_position_size()`
 - [ ] `holidays.NYSE` cross-check integrated alongside internal calendar
 - [ ] `api_response_time` logged; Retry Queue wired for timeout events
@@ -1155,7 +1474,7 @@ Signal evaluation runs independently per ticker according to strict descending c
 
 | Priority | Signal Code | Terminal Banner | Trigger Condition |
 |---|---|---|---|
-| **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{Low}_t \le \text{Trigger Floor}_{t-1}$ — **any hour if positioned** |
+| **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{session\_low} \le \text{Trigger Floor}_{t-1}$ — **RTH only if positioned** |
 | **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Death Cross (unconditional) OR RSI crossdown (< 50, regime-conditional) — **regular hours + new bar** |
 | **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross + RSI gate + Volume gate + Trend filter (`Close > SMA_LONG` OR `SMA_SHORT > SMA_LONG` when enabled) — **regular hours + new bar** |
 | **4** | `HOLD` | `[METRICS] ... Signal: HOLD` | Default; BUY blocked on liquidity fail or crossover suppression |
@@ -1226,7 +1545,8 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 
 ```
 Toss Trading Bot/
-├── main.py                 # KIS orchestrator, per-ticker LiveSignalEngine, state-gated orders, [METRICS]
+├── main.py                 # KIS orchestrator, reconciliation, RTH gate, state-gated orders, [METRICS]
+├── session_manager.py      # P3: RegularHoursGate, IntradaySessionTracker, PortfolioReconciliationEngine
 ├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
 ├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing
 ├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates

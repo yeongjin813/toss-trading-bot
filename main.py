@@ -37,6 +37,13 @@ from analytics import (
     is_us_regular_market_hours,
 )
 from config import StrategyConfigMapper
+from strategy import DEFAULT_COMMISSION_RATE
+from session_manager import (
+    LiveExecutionGatekeeper,
+    PortfolioLedger,
+    PortfolioReconciliationEngine,
+    RegularHoursGate,
+)
 
 load_dotenv(override=True)
 
@@ -89,6 +96,11 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
+
+_reconciliation_engine = PortfolioReconciliationEngine(WATCHLIST)
+_execution_gatekeeper = LiveExecutionGatekeeper()
+_rth_gate = RegularHoursGate()
+
 
 def validate_environment() -> None:
     """Ensure all required KIS credentials are present in the environment."""
@@ -785,6 +797,81 @@ def print_session_telemetry(
             f"floor=${stop.get('trigger_floor', 0):.2f} | "
             f"session_low=${stop.get('session_low', cycle['session_low']):.2f}"
         )
+    if cycle["signal_result"].get("intraday_atr_scan"):
+        print("Intraday ATR Scan    : ACTIVE (session_low vs prior trigger_floor)")
+    if cycle["signal_result"].get("blocked_signal"):
+        print(
+            f"RTH Blocked Signal   : {cycle['signal_result'].get('blocked_signal')} "
+            f"(pre/post-market gate)"
+        )
+    if cycle.get("available_capital") is not None:
+        print(f"Deployable Cash      : ${cycle['available_capital']:,.2f}")
+    if cycle.get("portfolio_equity") is not None:
+        print(f"Portfolio Equity     : ${cycle['portfolio_equity']:,.2f}")
+
+
+def _estimate_portfolio_equity(
+    ledger: PortfolioLedger,
+    states: dict[str, Any],
+    cache: MarketDataCache,
+) -> float:
+    """Mark-to-market equity: broker cash + open position notionals."""
+    equity = ledger.available_cash_usd
+    for ticker in WATCHLIST:
+        ticker_state = states.get(ticker, {})
+        shares = int(ticker_state.get("held_quantity", 0) or 0)
+        if shares <= 0:
+            continue
+        try:
+            frame = cache.get_frame(ticker)
+            mark = float(frame.iloc[-1]["Close"])
+            equity += shares * mark
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return max(equity, ledger.available_cash_usd)
+
+
+def _should_run_session_reconciliation(states: dict[str, Any], now: datetime) -> bool:
+    """Reconcile once per calendar day at the first RTH cycle."""
+    if not is_us_regular_market_hours(now):
+        return False
+    portfolio_meta = states.get("_portfolio", {})
+    last_session_date = portfolio_meta.get("last_reconcile_session_date")
+    today = now.strftime("%Y-%m-%d")
+    return last_session_date != today
+
+
+def run_session_reconciliation(
+    client: KISApiClient,
+    states: dict[str, Any],
+    *,
+    force: bool = False,
+) -> tuple[dict[str, Any], PortfolioLedger]:
+    """Broker-vs-local sync with automatic override on quantity mismatch."""
+    now = datetime.now()
+    if not force and not _should_run_session_reconciliation(states, now):
+        cached = states.get("_portfolio", {})
+        ledger = PortfolioLedger(
+            broker_cash_usd=float(cached.get("broker_cash_usd", 0.0) or 0.0),
+            available_cash_usd=float(
+                cached.get("available_cash_usd", CAPITAL_AT_RISK) or CAPITAL_AT_RISK
+            ),
+            last_reconciled_at=cached.get("last_reconciled_at"),
+        )
+        return states, ledger
+
+    print("[RECONCILE] Starting broker portfolio synchronization...")
+    states, ledger, report = _reconciliation_engine.reconcile(
+        client,
+        states,
+        fallback_cash=CAPITAL_AT_RISK,
+    )
+    if report.reconciled and is_us_regular_market_hours(now):
+        states.setdefault("_portfolio", {})["last_reconcile_session_date"] = now.strftime(
+            "%Y-%m-%d"
+        )
+    save_persisted_states(states)
+    return states, ledger
 
 
 def process_ticker(
@@ -792,6 +879,7 @@ def process_ticker(
     cache: MarketDataCache,
     ticker: str,
     states: dict[str, Any],
+    ledger: PortfolioLedger,
 ) -> str:
     """Run fetch-evaluate-execute-persist cycle for one ticker with state machine gates."""
     engine = LiveSignalEngine(ticker)
@@ -805,12 +893,33 @@ def process_ticker(
     )
 
     ticker_state = states.get(ticker, {})
+    if not isinstance(ticker_state, dict):
+        ticker_state = {}
+
+    portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
+    current_price = float(df.iloc[-1]["Close"])
+
     cycle = engine.evaluate_trading_cycle(
         df,
-        runtime_state=ticker_state,
+        runtime_state=ticker_state if isinstance(ticker_state, dict) else {},
         capital_at_risk=CAPITAL_AT_RISK,
         risk_per_trade=RISK_PER_TRADE,
+        now=datetime.now(),
+        available_capital=ledger.available_cash_usd,
+        portfolio_equity=portfolio_equity,
+        current_price=current_price,
     )
+    cycle["available_capital"] = ledger.available_cash_usd
+    cycle["portfolio_equity"] = portfolio_equity
+
+    runtime = engine.load_state(cycle["runtime_state"])
+    _execution_gatekeeper.evaluate_live_signals(
+        engine,
+        runtime,
+        cycle,
+        current_price=current_price,
+    )
+    cycle["runtime_state"] = runtime.to_dict()
 
     print_session_telemetry(ticker, cycle, df)
 
@@ -824,16 +933,17 @@ def process_ticker(
         save_persisted_states(states)
         return "LOCKED"
 
-    if signal in {"BUY", "SELL"} and not cycle.get("regular_market_hours", False):
-        print(
-            f"[GATE] {ticker} outside NY regular session (09:30–16:00 ET) — "
-            f"{signal} blocked, holding"
-        )
+    regular_market_hours = bool(
+        cycle.get("regular_market_hours", cycle.get("market_open", False))
+    )
+    if _rth_gate.block_signal_for_session(signal, regular_market_hours):
+        print(_rth_gate.gate_message(signal, ticker))
         states[ticker] = engine.dump_state(runtime)
         save_persisted_states(states)
         return "HOLD"
 
     if signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
+        execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
         final_signal = dispatch_order_with_state_machine(
             client,
             engine,
@@ -845,6 +955,13 @@ def process_ticker(
             cycle["allow_crossover"],
             states,
         )
+        if final_signal == "BUY" and execution_qty > 0:
+            cost = execution_qty * current_price * (1.0 + DEFAULT_COMMISSION_RATE)
+            ledger.available_cash_usd = max(0.0, ledger.available_cash_usd - cost)
+        elif final_signal in {"SELL", "DYNAMIC_ATR_SELL"} and execution_qty > 0:
+            proceeds = execution_qty * current_price * (1.0 - DEFAULT_COMMISSION_RATE)
+            ledger.available_cash_usd += proceeds
+        states.setdefault("_portfolio", {})["available_cash_usd"] = ledger.available_cash_usd
     else:
         final_signal = signal
         states[ticker] = engine.dump_state(runtime)
@@ -858,24 +975,27 @@ def run_watchlist_cycle(
     client: KISApiClient,
     cache: MarketDataCache,
     states: dict[str, Any],
-) -> dict[str, Any]:
+    ledger: PortfolioLedger,
+) -> tuple[dict[str, Any], PortfolioLedger]:
     summary: list[tuple[str, str]] = []
 
     if not is_us_equity_session():
         closure_reason = describe_us_market_closure() or "market closed"
         print(
             f"[GATE] US calendar session closed ({closure_reason}) — "
-            "crossover suppressed; ATR stop still active for open positions"
+            "no live execution; sleeping"
         )
     elif not is_us_regular_market_hours():
         print(
-            "[GATE] Outside NY regular hours (09:30–16:00 ET) — "
-            "crossover suppressed; ATR stop active for open positions"
+            "[GATE/RTH] Outside NY regular hours (09:30-16:00 ET) — "
+            "all signals blocked until RTH open"
         )
+    else:
+        states, ledger = run_session_reconciliation(client, states)
 
     for index, ticker in enumerate(WATCHLIST):
         try:
-            signal = process_ticker(client, cache, ticker, states)
+            signal = process_ticker(client, cache, ticker, states, ledger)
             summary.append((ticker, signal))
         except requests.Timeout as exc:
             print(f"[ERROR] Timeout for {ticker}: {exc}")
@@ -899,7 +1019,7 @@ def run_watchlist_cycle(
         print(f"  {ticker:<6} -> {status}")
     print("=" * 88)
 
-    return states
+    return states, ledger
 
 
 def main() -> None:
@@ -933,8 +1053,11 @@ def main() -> None:
     try_print_mock_account_balance(client)
     log_configured_capital_model()
 
+    print("[P3] Running startup portfolio reconciliation...")
+    states, ledger = run_session_reconciliation(client, states, force=True)
+
     print("Starting production monitoring loop. Press Ctrl+C to stop.")
-    print("Order pipeline: KIS dispatch -> rt_cd verify -> state transition -> persist")
+    print("Order pipeline: reconcile -> RTH gate -> intraday ATR scan -> dispatch -> persist")
     print("=" * 88)
 
     cycle_count = 0
@@ -964,7 +1087,7 @@ def main() -> None:
                 f"{cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---"
             )
 
-            states = run_watchlist_cycle(client, cache, states)
+            states, ledger = run_watchlist_cycle(client, cache, states, ledger)
 
             print(
                 f"Cycle {cycle_count} complete. "

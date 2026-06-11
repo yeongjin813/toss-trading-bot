@@ -716,11 +716,17 @@ class LiveSignalEngine:
         risk_per_trade: float,
         *,
         now: datetime | None = None,
+        available_capital: float | None = None,
+        portfolio_equity: float | None = None,
+        current_price: float | None = None,
     ) -> dict[str, Any]:
         """
         Evaluate one live monitoring cycle with bar-trailing and session gates.
 
         Returns signal_result, metrics, sizing, and the non-mutated replay snapshot.
+
+        When available_capital / portfolio_equity are supplied (post-reconciliation),
+        position sizing uses broker-aligned deployable cash and total equity.
         """
         enriched = self.enrich(df)
         replay_end = len(enriched) - 2
@@ -762,10 +768,22 @@ class LiveSignalEngine:
         today = BarSnapshot.from_row(enriched.iloc[-1])
         yesterday = BarSnapshot.from_row(enriched.iloc[-2])
         current_bar_date = _format_bar_date(today.date)
-        session_low = self.update_session_low(runtime, today)
 
         calendar_open = is_us_equity_session(now)
         regular_market_hours = is_us_regular_market_hours(now)
+
+        mark_price = current_price if current_price is not None else today.close
+        if regular_market_hours:
+            bar_date_str = current_bar_date
+            tick_low = min(float(today.low), float(mark_price))
+            if runtime.latest_bar_date != bar_date_str:
+                runtime.latest_bar_date = bar_date_str
+                runtime.session_low = tick_low
+            elif runtime.session_low is None:
+                runtime.session_low = tick_low
+            else:
+                runtime.session_low = min(float(runtime.session_low), tick_low)
+        session_low = float(runtime.session_low if runtime.session_low is not None else today.low)
         allow_crossover = should_allow_crossover_signals(
             current_bar_date,
             runtime.last_processed_date,
@@ -788,7 +806,7 @@ class LiveSignalEngine:
                 ),
                 "pending_order_locked": True,
             }
-        elif not regular_market_hours and not self._has_active_position(runtime):
+        elif not regular_market_hours:
             signal_result = {
                 "signal": "HOLD",
                 "liquidity_ok": self._passes_volume_filter(
@@ -809,7 +827,7 @@ class LiveSignalEngine:
 
         if (
             not regular_market_hours
-            and signal_result.get("signal") in {"BUY", "SELL"}
+            and signal_result.get("signal") in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}
         ):
             signal_result = {
                 "signal": "HOLD",
@@ -819,12 +837,16 @@ class LiveSignalEngine:
             }
 
         stop_distance = today.atr * self.config.atr_multiplier
+        risk_base = portfolio_equity if portfolio_equity is not None else capital_at_risk
+        deploy_capital = (
+            available_capital if available_capital is not None else capital_at_risk
+        )
         position_size = calculate_position_size(
-            capital_at_risk=capital_at_risk,
+            capital_at_risk=risk_base,
             risk_per_trade=risk_per_trade,
             entry_price=today.close,
             stop_distance=stop_distance,
-            available_capital=capital_at_risk,
+            available_capital=deploy_capital,
         )
 
         return {
