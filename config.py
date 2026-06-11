@@ -7,8 +7,11 @@ Global .env SMA/RSI/ATR overrides are not consulted for signal generation.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar, Mapping
+
+from market_registry import BENCHMARK_SMA_PERIOD, BENCHMARK_TICKER
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,25 @@ class StrategyConfigMapper:
     _EXPLICIT: ClassVar[Mapping[str, TickerConfig]] = {
         "NVDA": _NVDA,
         "PLTR": _PLTR,
+        "TSLA": _PLTR,
+        "AMD": _PLTR,
+        "CRWD": _PLTR,
+        "META": _NVDA,
+        "NFLX": _NVDA,
+        "AVGO": _NVDA,
     }
+
+    MARKET_BENCHMARK_TICKER: ClassVar[str] = BENCHMARK_TICKER
+    MARKET_BENCHMARK_SMA_PERIOD: ClassVar[int] = BENCHMARK_SMA_PERIOD
+
+    @classmethod
+    def use_spy_market_filter(cls) -> bool:
+        return os.getenv("USE_SPY_MARKET_FILTER", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     @classmethod
     def resolve_regime(cls, ticker: str) -> TickerConfig:

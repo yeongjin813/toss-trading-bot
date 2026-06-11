@@ -8,7 +8,8 @@ Setup:
     KIS_APP_SECRET=your_app_secret
     KIS_CANO=your_account_number
     KIS_ACNT_PRDT_CD=01
-    WATCHLIST=NVDA,PLTR,AAPL
+    WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
+    USE_SPY_MARKET_FILTER=true
     CAPITAL_AT_RISK=10000
 
 Run:
@@ -35,8 +36,16 @@ from analytics import (
     describe_us_market_closure,
     is_us_equity_session,
     is_us_regular_market_hours,
+    spy_regime_snapshot,
 )
 from config import StrategyConfigMapper
+from market_registry import (
+    BENCHMARK_SMA_PERIOD,
+    BENCHMARK_TICKER,
+    MARKET_META,
+    parse_watchlist,
+    validate_watchlist_routing,
+)
 from strategy import DEFAULT_COMMISSION_RATE
 from session_manager import (
     LiveExecutionGatekeeper,
@@ -65,23 +74,8 @@ DAILY_PRICE_PATH = "/uapi/overseas-price/v1/quotations/dailyprice"
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 PRESENT_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
 
-DEFAULT_WATCHLIST = ["NVDA", "PLTR", "AAPL"]
-
-
-def _parse_watchlist(raw: str | None) -> list[str]:
-    if not raw:
-        return DEFAULT_WATCHLIST.copy()
-    tickers = [token.strip().upper() for token in raw.split(",") if token.strip()]
-    return tickers or DEFAULT_WATCHLIST.copy()
-
-
-WATCHLIST = _parse_watchlist(os.getenv("WATCHLIST"))
-
-MARKET_META: dict[str, dict[str, str]] = {
-    "NVDA": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
-    "PLTR": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
-    "AAPL": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
-}
+WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
+USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
 
 ANALYTICS_SMA_PERIOD = 20
 MIN_DATA_BARS = 22
@@ -121,10 +115,14 @@ def validate_environment() -> None:
             + ". Create a .env file with these keys before running."
         )
 
-    unknown = [ticker for ticker in WATCHLIST if ticker not in MARKET_META]
+    unknown = validate_watchlist_routing(WATCHLIST)
     if unknown:
         raise RuntimeError(
             f"Watchlist tickers missing MARKET_META routing: {', '.join(unknown)}"
+        )
+    if USE_SPY_MARKET_FILTER and BENCHMARK_TICKER not in MARKET_META:
+        raise RuntimeError(
+            f"SPY market filter enabled but {BENCHMARK_TICKER} is missing MARKET_META routing."
         )
 
 
@@ -780,6 +778,17 @@ def print_session_telemetry(
     print(f"Calendar Open        : {cycle.get('calendar_open', cycle.get('market_open'))}")
     print(f"Regular Market Hours : {cycle.get('regular_market_hours', cycle.get('market_open'))}")
     print(f"Crossover Allowed    : {cycle['allow_crossover']}")
+    print(
+        f"SPY Regime (> {BENCHMARK_SMA_PERIOD}MA): "
+        f"{'BULL' if cycle.get('market_bullish', True) else 'BEAR'}"
+    )
+    if cycle.get("spy_close") is not None:
+        spy_sma = cycle.get("spy_sma")
+        sma_text = f"{spy_sma:.2f}" if spy_sma is not None else "N/A"
+        print(
+            f"SPY Snapshot         : close={cycle['spy_close']:.2f} | "
+            f"{BENCHMARK_SMA_PERIOD}MA={sma_text}"
+        )
     print(f"Signal               : {signal}")
     print(f"Position Size (shares): {cycle['position_size']}")
     print(f"Liquidity OK         : {cycle['signal_result'].get('liquidity_ok', 'N/A')}")
@@ -898,6 +907,21 @@ def process_ticker(
 
     portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
     current_price = float(df.iloc[-1]["Close"])
+    current_bar_date = pd.Timestamp(df.iloc[-1]["Date"]).strftime("%Y-%m-%d")
+
+    market_bullish = True
+    spy_close: float | None = None
+    spy_sma: float | None = None
+    if USE_SPY_MARKET_FILTER:
+        try:
+            spy_df = cache.get_frame(BENCHMARK_TICKER)
+            market_bullish, spy_close, spy_sma = spy_regime_snapshot(
+                spy_df,
+                current_bar_date,
+                StrategyConfigMapper.MARKET_BENCHMARK_SMA_PERIOD,
+            )
+        except KeyError:
+            print(f"[WARN] {BENCHMARK_TICKER} not bootstrapped — market filter skipped")
 
     cycle = engine.evaluate_trading_cycle(
         df,
@@ -908,7 +932,10 @@ def process_ticker(
         available_capital=ledger.available_cash_usd,
         portfolio_equity=portfolio_equity,
         current_price=current_price,
+        market_bullish=market_bullish,
     )
+    cycle["spy_close"] = spy_close
+    cycle["spy_sma"] = spy_sma
     cycle["available_capital"] = ledger.available_cash_usd
     cycle["portfolio_equity"] = portfolio_equity
 
@@ -1030,6 +1057,10 @@ def main() -> None:
     print(f"Base URL            : {BASE_URL}")
     print(f"Account             : {CANO}-{ACNT_PRDT_CD}")
     print(f"Watchlist           : {', '.join(WATCHLIST)}")
+    print(
+        f"SPY Market Filter   : "
+        f"{'ON (BUY only when SPY > 200MA)' if USE_SPY_MARKET_FILTER else 'OFF'}"
+    )
     print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
     print(f"State File          : {STATE_FILE}")
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
@@ -1045,7 +1076,10 @@ def main() -> None:
     print("Access token ready.")
 
     print("Bootstrapping historical market data cache (one-time full fetch)...")
-    cache.bootstrap(WATCHLIST)
+    bootstrap_tickers = list(WATCHLIST)
+    if USE_SPY_MARKET_FILTER and BENCHMARK_TICKER not in bootstrap_tickers:
+        bootstrap_tickers.append(BENCHMARK_TICKER)
+    cache.bootstrap(bootstrap_tickers)
 
     states = load_persisted_states()
     print(f"Loaded state entries: {len(states)}")

@@ -314,6 +314,55 @@ def verify_config_registry() -> None:
     print()
 
 
+def verify_spy_market_filter_blocks_buy() -> None:
+    print("=" * 88)
+    print("TEST 7: SPY MARKET FILTER (BUY GATE)")
+    print("=" * 88)
+
+    engine = LiveSignalEngine("NVDA")
+    state = PositionState()
+    prev_bar = BarSnapshot(
+        date=datetime(2024, 7, 1).date(),
+        open=98.0,
+        high=99.0,
+        low=97.0,
+        close=98.0,
+        volume=2_000_000.0,
+        sma_short=99.0,
+        sma_long=90.0,
+        rsi=55.0,
+        atr=2.0,
+        volume_sma=1_000_000.0,
+    )
+    bar = BarSnapshot(
+        date=datetime(2024, 7, 2).date(),
+        open=101.0,
+        high=103.0,
+        low=100.5,
+        close=102.0,
+        volume=2_000_000.0,
+        sma_short=100.5,
+        sma_long=91.0,
+        rsi=engine.config.rsi_buy_threshold + 1.0,
+        atr=2.0,
+        volume_sma=1_000_000.0,
+    )
+
+    allowed = engine.evaluate_bar(
+        state, bar, prev_bar, mutate_state=False, market_bullish=True
+    )
+    blocked = engine.evaluate_bar(
+        state, bar, prev_bar, mutate_state=False, market_bullish=False
+    )
+
+    assert allowed["signal"] == "BUY"
+    assert blocked["signal"] == "HOLD"
+    assert blocked.get("market_filter_blocked") is True
+    print("BUY allowed in bull regime           : PASS")
+    print("BUY blocked when SPY regime is bear  : PASS")
+    print()
+
+
 def main() -> int:
     engine = LiveSignalEngine("PLTR")
 
@@ -325,6 +374,7 @@ def main() -> int:
     verify_trend_filter_and_conditional_rsi(engine)
     verify_trend_filter_and_conditional_rsi(LiveSignalEngine("NVDA"))
     verify_config_registry()
+    verify_spy_market_filter_blocks_buy()
 
     print("=" * 88)
     print("ALL ANALYTICS TESTS PASSED")

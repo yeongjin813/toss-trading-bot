@@ -7,7 +7,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **System Status** | Phase 5 Active — Ticker Regime Isolation + P3 Live Parity (RTH Gate + Reconciliation) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
-| **Watchlist Matrix** | `NVDA` (High-Vol leader), `PLTR` (Breakout growth), `AAPL` (Low-Vol control) — configurable via `.env` `WATCHLIST` |
+| **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS Sandbox Deployment) |
 | **Anchor Account** | CANO: `50191906` \| ACNT_PRDT_CD: `01` (Unified Portfolio Suffix) — override via `.env` |
 | **Execution Loop** | 60-Second Real-Time Polling Loop with Asymmetric Network Bypass |
@@ -978,7 +978,9 @@ To bypass severe database replication lag on the KIS Virtual Trading Server (VTS
 | `PLTR` | High-Momentum Breakout Validation | `NAS` (Forced NASDAQ Proxy) | `NASD` (Forced NASDAQ Proxy) |
 | `AAPL` | Low-Volatility Large-Cap Control Baseline | `NAS` | `NASD` |
 
-New watchlist tickers must be registered in `MARKET_META` before being added to `WATCHLIST` in `.env`.
+New watchlist tickers must be registered in `market_registry.MARKET_META` before being added to `WATCHLIST` in `.env`.
+
+Default watchlist (15): `AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER`. NYSE names (`TSM`, `SHOP`, `UBER`) use `NYS`/`NYSE`; others use `NAS`/`NASD`.
 
 ### Continuous Monitoring Loop
 
@@ -1126,7 +1128,7 @@ Signal execution parameters are **ticker-isolated** via `config.py` → `Strateg
 |---|---|---|
 | `CAPITAL_AT_RISK` | **10000** | Deployable capital for dual-clamp sizing (USD) |
 | `RISK_PER_TRADE` | **0.01** | Per-trade risk fraction (1%) |
-| `WATCHLIST` | `NVDA,PLTR,AAPL` | Comma-separated ticker list |
+| `WATCHLIST` | `AAPL,MSFT,NVDA,...` (15 defaults) | Comma-separated ticker list; must exist in `market_registry.MARKET_META` |
 | `TARGET_BARS` | **756** | Rolling historical window (3 × 252 trading days) |
 | `LOOP_COOLDOWN_SECONDS` | **60** | Open-session inter-cycle pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | **3600** | Closed-session extended sleep |
@@ -1152,7 +1154,8 @@ KIS_CANO=50191906
 KIS_ACNT_PRDT_CD=01
 
 # Production Strategic Risk Configuration Parameters
-WATCHLIST=NVDA,PLTR,AAPL
+WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
+USE_SPY_MARKET_FILTER=true
 CAPITAL_AT_RISK=10000
 RISK_PER_TRADE=0.01
 LOOP_COOLDOWN_SECONDS=60
@@ -1266,6 +1269,12 @@ python run_backtest.py --random --random-bars 252 --random-seed 42
 
 # Legacy — isolated per-ticker Backtrader (comparison only)
 python run_backtest.py --isolated
+
+# Walk-forward validation (2018-2020 / 2020-2022 / 2022-2024 / 2024-2026, yfinance)
+python run_backtest.py --walk-forward
+
+# Disable SPY > 200MA buy gate for A/B comparison
+python run_backtest.py --no-spy-filter
 ```
 
 ### G. Verification Suite
@@ -1547,7 +1556,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `WATCHLIST` | No | `NVDA,PLTR,AAPL` | Comma-separated tickers |
+| `WATCHLIST` | No | 15-ticker default in `.env.example` | Comma-separated tickers; register new symbols in `market_registry.py` |
 | `CAPITAL_AT_RISK` | No | `10000` | USD capital base |
 | `RISK_PER_TRADE` | No | `0.01` | Per-trade risk fraction |
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
@@ -1575,10 +1584,11 @@ Toss Trading Bot/
 ├── main.py                 # KIS orchestrator, reconciliation, RTH gate, state-gated orders, [METRICS]
 ├── session_manager.py      # P3: RegularHoursGate, IntradaySessionTracker, PortfolioReconciliationEngine
 ├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
+├── market_registry.py      # DEFAULT_WATCHLIST (15) + KIS MARKET_META routing + parse/validate helpers
 ├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing
 ├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates
 ├── portfolio_backtest.py   # Consolidated portfolio backtest (default live-parity path)
-├── run_backtest.py         # CLI: portfolio backtest (default), --isolated legacy, --random smoke test
+├── run_backtest.py         # CLI: portfolio backtest, --walk-forward, --isolated legacy, --random smoke test
 ├── test_analytics.py       # Engine verification (trend filter + conditional RSI tests)
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Configuration template (copy to .env)

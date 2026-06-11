@@ -381,6 +381,71 @@ def should_allow_crossover_signals(
     return current_bar_date != last_processed_date
 
 
+def build_spy_regime_lookup(
+    spy_df: pd.DataFrame,
+    sma_period: int = 200,
+) -> dict[str, bool]:
+    """Map YYYY-MM-DD -> True when SPY close is above its long SMA (bull regime)."""
+    frame = spy_df.copy()
+    if "Date" in frame.columns:
+        frame["Date"] = pd.to_datetime(frame["Date"])
+        frame = frame.sort_values("Date").set_index("Date")
+    elif not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index)
+
+    frame = frame.sort_index()
+    frame["BenchSMA"] = frame["Close"].rolling(window=sma_period, min_periods=sma_period).mean()
+    lookup: dict[str, bool] = {}
+    for ts, row in frame.iterrows():
+        sma_val = row.get("BenchSMA")
+        if pd.isna(sma_val):
+            continue
+        lookup[pd.Timestamp(ts).strftime("%Y-%m-%d")] = float(row["Close"]) > float(sma_val)
+    return lookup
+
+
+def resolve_spy_market_bullish(
+    spy_lookup: dict[str, bool] | None,
+    bar_date: str,
+    *,
+    default: bool = True,
+) -> bool:
+    if not spy_lookup:
+        return default
+    return spy_lookup.get(bar_date, default)
+
+
+def spy_regime_snapshot(
+    spy_df: pd.DataFrame,
+    bar_date: str,
+    sma_period: int = 200,
+) -> tuple[bool, float | None, float | None]:
+    """Return (bullish, spy_close, spy_sma) for telemetry on a given session date."""
+    frame = spy_df.copy()
+    if "Date" in frame.columns:
+        frame["Date"] = pd.to_datetime(frame["Date"])
+        frame = frame.sort_values("Date").set_index("Date")
+    elif not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index)
+    frame = frame.sort_index()
+    frame["BenchSMA"] = frame["Close"].rolling(window=sma_period, min_periods=sma_period).mean()
+
+    target = pd.Timestamp(bar_date)
+    if target not in frame.index:
+        prior = frame.index[frame.index <= target]
+        if len(prior) == 0:
+            return True, None, None
+        target = prior[-1]
+
+    row = frame.loc[target]
+    spy_close = float(row["Close"])
+    spy_sma = row.get("BenchSMA")
+    if pd.isna(spy_sma):
+        return True, spy_close, None
+    spy_sma = float(spy_sma)
+    return spy_close > spy_sma, spy_close, spy_sma
+
+
 class LiveSignalEngine:
     """
     Ticker-bound live signal engine with regime-isolated configuration.
@@ -580,6 +645,7 @@ class LiveSignalEngine:
         allow_crossover: bool = True,
         session_low: float | None = None,
         session_volume_fraction: float = 1.0,
+        market_bullish: bool = True,
     ) -> dict[str, Any]:
         """
         Evaluate one bar using unified priority:
@@ -684,6 +750,7 @@ class LiveSignalEngine:
             and self._rsi_allows_entry(bar.rsi)
             and liquidity_ok
             and trend_ok
+            and market_bullish
         ):
             if mutate_state:
                 state.in_position = True
@@ -705,6 +772,14 @@ class LiveSignalEngine:
             hold_reason["liquidity_blocked"] = True
         elif cross_above and self._rsi_allows_entry(bar.rsi) and not trend_ok:
             hold_reason["trend_filter_blocked"] = True
+        elif (
+            cross_above
+            and self._rsi_allows_entry(bar.rsi)
+            and liquidity_ok
+            and trend_ok
+            and not market_bullish
+        ):
+            hold_reason["market_filter_blocked"] = True
 
         return {
             "signal": "HOLD",
@@ -765,6 +840,7 @@ class LiveSignalEngine:
         available_capital: float | None = None,
         portfolio_equity: float | None = None,
         current_price: float | None = None,
+        market_bullish: bool = True,
     ) -> dict[str, Any]:
         """
         Evaluate one live monitoring cycle with bar-trailing and session gates.
@@ -879,6 +955,7 @@ class LiveSignalEngine:
                 allow_crossover=allow_crossover,
                 session_low=session_low,
                 session_volume_fraction=session_volume_fraction,
+                market_bullish=market_bullish,
             )
 
         if (
@@ -917,6 +994,7 @@ class LiveSignalEngine:
             "current_bar_date": current_bar_date,
             "session_low": session_low,
             "allow_crossover": allow_crossover,
+            "market_bullish": market_bullish,
             "calendar_open": calendar_open,
             "regular_market_hours": regular_market_hours,
             "market_open": regular_market_hours,

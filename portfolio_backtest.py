@@ -17,9 +17,12 @@ from analytics import (
     BarSnapshot,
     LiveSignalEngine,
     PositionState,
+    build_spy_regime_lookup,
     calculate_position_size,
+    resolve_spy_market_bullish,
 )
 from config import StrategyConfig, StrategyConfigMapper
+from market_registry import BENCHMARK_SMA_PERIOD
 
 
 @dataclass
@@ -219,11 +222,21 @@ class PortfolioBacktestEngine:
         initial_cash: float = 10_000.0,
         risk_per_trade: float = 0.01,
         commission_rate: float = 0.001,
+        use_spy_market_filter: bool | None = None,
+        spy_df: pd.DataFrame | None = None,
     ) -> None:
         self.initial_cash = initial_cash
         self.risk_per_trade = risk_per_trade
         self.commission_rate = commission_rate
         self.watchlist = tickers
+        self.use_spy_market_filter = (
+            StrategyConfigMapper.use_spy_market_filter()
+            if use_spy_market_filter is None
+            else use_spy_market_filter
+        )
+        self.spy_lookup: dict[str, bool] | None = None
+        if self.use_spy_market_filter and spy_df is not None and not spy_df.empty:
+            self.spy_lookup = build_spy_regime_lookup(spy_df, BENCHMARK_SMA_PERIOD)
         self.series_map: dict[str, TickerBacktestSeries] = {}
 
         for ticker in tickers:
@@ -296,12 +309,17 @@ class PortfolioBacktestEngine:
                     else:
                         trailing_updates.append((series, bar, prev_bar))
                 else:
+                    market_bullish = resolve_spy_market_bullish(
+                        self.spy_lookup,
+                        bar_date,
+                    )
                     entry_check = series.engine.evaluate_bar(
                         series.state,
                         bar,
                         prev_bar,
                         mutate_state=False,
                         allow_crossover=True,
+                        market_bullish=market_bullish,
                     )
                     if entry_check["signal"] == "BUY":
                         entry_events.append((series, bar))
@@ -452,6 +470,8 @@ def run_portfolio_backtest(
     initial_cash: float = 10_000.0,
     risk_per_trade: float = 0.01,
     commission_rate: float = 0.001,
+    use_spy_market_filter: bool | None = None,
+    spy_df: pd.DataFrame | None = None,
 ) -> PortfolioBacktestResult:
     """Convenience wrapper for consolidated portfolio simulation."""
     engine = PortfolioBacktestEngine(
@@ -460,5 +480,7 @@ def run_portfolio_backtest(
         initial_cash=initial_cash,
         risk_per_trade=risk_per_trade,
         commission_rate=commission_rate,
+        use_spy_market_filter=use_spy_market_filter,
+        spy_df=spy_df,
     )
     return engine.run()
