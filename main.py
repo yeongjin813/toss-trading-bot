@@ -233,6 +233,8 @@ class KISApiClient:
         ticker: str,
         excd: str,
         bymd: str,
+        *,
+        max_retries: int = 3,
     ) -> list[dict[str, Any]]:
         url = f"{BASE_URL}{DAILY_PRICE_PATH}"
         params = {
@@ -243,22 +245,42 @@ class KISApiClient:
             "BYMD": bymd,
             "MODP": "1",
         }
-        response = requests.get(
-            url,
-            headers=self._build_headers(TR_ID_DAILY_PRICE),
-            params=params,
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
 
-        if payload.get("rt_cd") not in (None, "0"):
-            raise RuntimeError(
-                f"Daily price API error for {ticker}: "
-                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
-            )
+        last_error: requests.RequestException | None = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(
+                    url,
+                    headers=self._build_headers(TR_ID_DAILY_PRICE),
+                    params=params,
+                    timeout=15,
+                )
+                response.raise_for_status()
+                payload = response.json()
 
-        return payload.get("output2") or []
+                if payload.get("rt_cd") not in (None, "0"):
+                    raise RuntimeError(
+                        f"Daily price API error for {ticker}: "
+                        f"{payload.get('msg_cd')} | {payload.get('msg1')}"
+                    )
+
+                return payload.get("output2") or []
+            except requests.RequestException as exc:
+                last_error = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status is not None and status >= 500 and attempt < max_retries - 1:
+                    wait_seconds = 1.0 * (attempt + 1)
+                    print(
+                        f"[WARN] KIS dailyprice {status} for {ticker} "
+                        f"(BYMD={bymd}) - retry {attempt + 2}/{max_retries} in {wait_seconds:.0f}s"
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        return []
 
     def fetch_us_daily_bars(
         self,
@@ -271,7 +293,17 @@ class KISApiClient:
         bymd = datetime.now().strftime("%Y%m%d")
 
         while len(collected) < target_bars:
-            batch = self._fetch_daily_price_batch(ticker, excd, bymd)
+            try:
+                batch = self._fetch_daily_price_batch(ticker, excd, bymd)
+            except requests.RequestException as exc:
+                if len(collected) >= MIN_DATA_BARS:
+                    print(
+                        f"[WARN] KIS pagination halted for {ticker} with "
+                        f"{len(collected)} rows ({exc})"
+                    )
+                    break
+                raise
+
             if not batch:
                 break
 
@@ -428,6 +460,7 @@ class MarketDataCache:
         if latest_batch.empty:
             return cached, False
 
+        cached = normalize_market_frame(cached)
         latest_batch = normalize_market_frame(latest_batch)
         latest_row = latest_batch.sort_values("Date").iloc[-1]
         latest_date = latest_row["Date"]
@@ -453,14 +486,73 @@ class MarketDataCache:
     def _load_or_fetch_full_history(self, ticker: str) -> pd.DataFrame:
         path = data_path_for_ticker(ticker)
         if os.path.exists(path):
-            cached = pd.read_csv(path)
-            cached = normalize_market_frame(cached)
-            if len(cached) >= MIN_DATA_BARS:
-                return cached
+            cached = read_market_csv(path)
+            if cached is not None and len(cached) >= MIN_DATA_BARS:
+                try:
+                    return normalize_market_frame(cached)
+                except ValueError as exc:
+                    print(
+                        f"[WARN] Cached CSV for {ticker} failed normalization "
+                        f"({exc}) - refetching from KIS"
+                    )
 
         excd = MARKET_META[ticker]["excd"]
-        df = self._client.fetch_us_daily_bars(ticker=ticker, excd=excd)
-        return normalize_market_frame(df)
+        try:
+            df = self._client.fetch_us_daily_bars(ticker=ticker, excd=excd)
+            return normalize_market_frame(df)
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            print(
+                f"[WARN] KIS history fetch failed for {ticker} ({excd}): {exc} "
+                "- using yfinance fallback"
+            )
+            df = fetch_yfinance_daily_bars(ticker)
+            return normalize_market_frame(df)
+
+
+def fetch_yfinance_daily_bars(
+    ticker: str,
+    target_bars: int = TARGET_BARS,
+) -> pd.DataFrame:
+    """Fallback OHLCV loader when KIS VTS dailyprice is unavailable."""
+    import yfinance as yf
+
+    lookback_days = int(target_bars * 1.6) + 30
+    start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    raw = yf.download(
+        ticker,
+        start=start,
+        progress=False,
+        auto_adjust=True,
+    )
+    if raw is None or raw.empty:
+        raise RuntimeError(f"yfinance returned no data for {ticker}")
+
+    frame = raw.reset_index()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [str(level[0]).capitalize() for level in frame.columns]
+    else:
+        frame.columns = [str(column).capitalize() for column in frame.columns]
+
+    if "Date" not in frame.columns:
+        date_col = frame.columns[0]
+        frame = frame.rename(columns={date_col: "Date"})
+
+    frame["Date"] = pd.to_datetime(frame["Date"]).dt.strftime("%Y-%m-%d")
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame = (
+        frame.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
+        .drop_duplicates(subset=["Date"])
+        .sort_values("Date")
+        .tail(target_bars)
+        .reset_index(drop=True)
+    )
+    if len(frame) < MIN_DATA_BARS:
+        raise RuntimeError(
+            f"yfinance fallback for {ticker} returned only {len(frame)} bars"
+        )
+    return frame
 
 
 def _parse_amount(value: Any) -> float:
@@ -578,8 +670,53 @@ def _parse_kis_daily_output(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def read_market_csv(path: str) -> pd.DataFrame | None:
+    """Load a cached daily CSV, skipping yfinance metadata rows and coercing OHLCV."""
+    if not os.path.exists(path):
+        return None
+
+    frame = pd.read_csv(path)
+    if frame.empty:
+        return None
+
+    if "Date" not in frame.columns and "Price" in frame.columns:
+        frame = frame.rename(columns={"Price": "Date"})
+
+    if "Date" not in frame.columns:
+        return None
+
+    while len(frame) > 0:
+        first_cell = str(frame.iloc[0, 0]).strip()
+        if first_cell.lower() in {"ticker", "date"}:
+            frame = frame.iloc[1:].copy()
+            continue
+        if first_cell and not first_cell[:4].isdigit():
+            frame = frame.iloc[1:].copy()
+            continue
+        break
+
+    if frame.empty:
+        return None
+
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        if column not in frame.columns:
+            return None
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame = frame.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
+    if frame.empty:
+        return None
+
+    return frame.sort_values("Date").reset_index(drop=True)
+
+
 def normalize_market_frame(df: pd.DataFrame) -> pd.DataFrame:
-    frame = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
+    frame = df.copy()
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"]).copy()
     frame = frame[(frame["Close"] > 0) & (frame["Volume"] >= 0)]
     frame = frame.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(drop=True)
     if len(frame) < MIN_DATA_BARS:
