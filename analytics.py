@@ -315,6 +315,37 @@ def is_us_regular_market_hours(current_dt: datetime | None = None) -> bool:
     return US_REGULAR_MARKET_OPEN <= current_clock < US_REGULAR_MARKET_CLOSE
 
 
+def ny_regular_session_elapsed_fraction(current_dt: datetime | None = None) -> float:
+    """
+    Fraction of the NY regular session elapsed (09:30-16:00 ET).
+
+    Used to scale the volume gate during intraday polls so partial-bar volume
+    is not compared against a full-day 20-bar average without adjustment.
+    """
+    if not is_us_regular_market_hours(current_dt):
+        return 1.0
+
+    ny_dt = _to_ny_datetime(current_dt)
+    session_open = ny_dt.replace(
+        hour=US_REGULAR_MARKET_OPEN.hour,
+        minute=US_REGULAR_MARKET_OPEN.minute,
+        second=0,
+        microsecond=0,
+    )
+    session_close = ny_dt.replace(
+        hour=US_REGULAR_MARKET_CLOSE.hour,
+        minute=US_REGULAR_MARKET_CLOSE.minute,
+        second=0,
+        microsecond=0,
+    )
+    total_seconds = (session_close - session_open).total_seconds()
+    if total_seconds <= 0:
+        return 1.0
+
+    elapsed = (ny_dt - session_open).total_seconds()
+    return min(max(elapsed / total_seconds, 0.05), 1.0)
+
+
 def describe_us_market_closure(now: datetime | None = None) -> str | None:
     """Return a closure reason string, or None when the calendar session is open."""
     ny_dt = _to_ny_datetime(now)
@@ -390,8 +421,18 @@ class LiveSignalEngine:
         """ATR stop path requires an open position (held shares or in_position flag)."""
         return state.in_position or state.held_quantity > 0
 
-    def _passes_volume_filter(self, volume: float, volume_sma: float) -> bool:
-        return volume > volume_sma * self.config.volume_threshold
+    def _passes_volume_filter(
+        self,
+        volume: float,
+        volume_sma: float,
+        *,
+        session_volume_fraction: float = 1.0,
+    ) -> bool:
+        if volume_sma <= 0:
+            return False
+        fraction = min(max(session_volume_fraction, 0.05), 1.0)
+        effective_threshold = self.config.volume_threshold * fraction
+        return volume > volume_sma * effective_threshold
 
     def _golden_cross(
         self, close: float, sma: float, prev_close: float, prev_sma: float
@@ -538,6 +579,7 @@ class LiveSignalEngine:
         mutate_state: bool = True,
         allow_crossover: bool = True,
         session_low: float | None = None,
+        session_volume_fraction: float = 1.0,
     ) -> dict[str, Any]:
         """
         Evaluate one bar using unified priority:
@@ -548,7 +590,11 @@ class LiveSignalEngine:
           2. Update trailing peak/floor with close only after survival
           3. Death cross (unconditional) or conditional RSI crossdown exit
         """
-        liquidity_ok = self._passes_volume_filter(bar.volume, bar.volume_sma)
+        liquidity_ok = self._passes_volume_filter(
+            bar.volume,
+            bar.volume_sma,
+            session_volume_fraction=session_volume_fraction,
+        )
         effective_low = session_low if session_low is not None else bar.low
 
         working_state = (
@@ -789,6 +835,11 @@ class LiveSignalEngine:
             runtime.last_processed_date,
             regular_market_hours,
         )
+        session_volume_fraction = (
+            ny_regular_session_elapsed_fraction(now)
+            if regular_market_hours
+            else 1.0
+        )
 
         eval_state = PositionState.from_dict(position_state.to_dict())
         eval_state.pending_order = runtime.pending_order
@@ -802,7 +853,9 @@ class LiveSignalEngine:
             signal_result = {
                 "signal": "HOLD",
                 "liquidity_ok": self._passes_volume_filter(
-                    today.volume, today.volume_sma
+                    today.volume,
+                    today.volume_sma,
+                    session_volume_fraction=session_volume_fraction,
                 ),
                 "pending_order_locked": True,
             }
@@ -810,7 +863,9 @@ class LiveSignalEngine:
             signal_result = {
                 "signal": "HOLD",
                 "liquidity_ok": self._passes_volume_filter(
-                    today.volume, today.volume_sma
+                    today.volume,
+                    today.volume_sma,
+                    session_volume_fraction=1.0,
                 ),
                 "crossover_suppressed": True,
                 "outside_regular_hours": True,
@@ -823,6 +878,7 @@ class LiveSignalEngine:
                 mutate_state=False,
                 allow_crossover=allow_crossover,
                 session_low=session_low,
+                session_volume_fraction=session_volume_fraction,
             )
 
         if (

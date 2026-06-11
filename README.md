@@ -101,7 +101,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Dynamic Memory Window Caching** | `main.py` → `MarketDataCache` | 756-bar bootstrap once; 1-bar micro-fetch per cycle |
 | **State-Gated Order Lifecycle** | `main.py` + `analytics.py` | Dispatch → verify → lock → persist → transition |
 | **Hybrid EOD / Intraday Engine** | `analytics.py` | Bar-trailing crossover gate + continuous ATR scan |
-| **Liquidity Gate** | `analytics.py` + `strategy.py` | `Volume_t > Volume_SMA_20 × 1.2` for BUY |
+| **Liquidity Gate** | `analytics.py` + `strategy.py` | Ticker-scaled volume surge gate + intraday session fraction (live polls) |
 | **Configuration Externalization** | `config.py` → `StrategyConfigMapper` | Ticker-isolated signal params; `.env` for credentials/capital only |
 | **Ticker Regime Isolation** | `config.py` + `analytics.py` + `strategy.py` | NVDA / PLTR / DEFAULT matrix; dual MA; asymmetric RSI exit |
 | **P3 RTH Execution Gate** | `session_manager.py` + `main.py` | Zero-leakage block on all dispatchable signals outside 09:30–16:00 ET |
@@ -157,9 +157,9 @@ Two dataclasses form the isolation layer:
 
 | Regime Key | Profile | `sma_period` | `rsi_buy` | `volume_mult` | `atr_mult` | `use_trend_filter` |
 |---|---|---|---|---|---|---|
-| **`NVDA`** | High Volatility / Strong Trend | **10** | **45** | **1.0** | **3.0** | **True** |
-| **`PLTR`** | High Volatility / Breakout | **10** | **50** | **1.2** | **2.5** | **False** |
-| **`DEFAULT`** | Conservative / Low Volatility (`AAPL`, unlisted) | **20** | **55** | **1.5** | **2.0** | **True** |
+| **`NVDA`** | High Volatility / Strong Trend | **10** | **42** | **0.75** | **3.0** | **True** |
+| **`PLTR`** | High Volatility / Breakout | **10** | **45** | **0.85** | **2.5** | **False** |
+| **`DEFAULT`** | Conservative / Low Volatility (`AAPL`, unlisted) | **20** | **50** | **1.0** | **2.0** | **True** |
 
 Symbols not explicitly mapped in `_EXPLICIT` fall through to `DEFAULT`. Add new explicit mappings in `config.py` — not in `.env`.
 
@@ -212,7 +212,7 @@ All four conditions must pass simultaneously:
 | # | Gate | Condition |
 |---|---|---|
 | 1 | **Golden Cross** | $\text{Close}_t > \text{SMA\_SHORT}_t$ AND $\text{Close}_{t-1} \le \text{SMA\_SHORT}_{t-1}$ |
-| 2 | **RSI Gate** | $\text{RSI}_t \ge \text{rsi\_buy\_threshold}$ (ticker-specific: 45 / 50 / 55) |
+| 2 | **RSI Gate** | $\text{RSI}_t \ge \text{rsi\_buy\_threshold}$ (ticker-specific: 42 / 45 / 50) |
 | 3 | **Volume Gate** | $\text{Volume}_t > \text{Volume\_SMA}_{20} \times \text{volume\_mult}$ |
 | 4 | **Trend Filter** *(if `use_trend_filter=True`)* | $\text{Close}_t > \text{SMA\_LONG}_t$ **OR** $\text{SMA\_SHORT}_t > \text{SMA\_LONG}_t$ |
 
@@ -1072,14 +1072,21 @@ $$
 
 ### E. Liquidity Gate Calibration
 
-Long entry (`BUY`) requires institutional volume surge confirmation:
+Long entry (`BUY`) requires volume confirmation against the 20-day average. Thresholds are **ticker-isolated** in `config.py` (NVDA **0.75×**, PLTR **0.85×**, AAPL **1.0×**).
+
+During **live intraday polls**, the gate scales by NY session progress so partial-bar volume is not compared to a full-day average without adjustment:
+
+$$
+\text{Volume Gate PASS:}\quad \text{Volume}_t > \text{Volume\_SMA}_{20} \times \text{volume\_threshold} \times f_{\text{session}}
+$$
+
+where $f_{\text{session}}$ is the fraction of regular NY hours elapsed (09:30–16:00 ET, floor **0.05**). **Backtests and completed daily bars** use $f_{\text{session}} = 1.0$.
 
 ```
-Volume Gate PASS:  Volume_t > Volume_SMA_20 × 1.2
-Volume Gate FAIL:  Volume_t ≤ Volume_SMA_20 × 1.2  →  HOLD (liquidity_blocked)
+Volume Gate FAIL  →  HOLD (liquidity_blocked)
 ```
 
-Implemented identically in `analytics.py` and `strategy.py`.
+Implemented in `analytics.py` (`LiveSignalEngine`); Backtrader twin in `strategy.py` uses full-bar volume ($f_{\text{session}} = 1.0$).
 
 ---
 
@@ -1094,8 +1101,8 @@ Signal execution parameters are **ticker-isolated** via `config.py` → `Strateg
 | Parameter | NVDA | PLTR | DEFAULT (AAPL) | Description |
 |---|---|---|---|---|
 | `sma_period` | 10 | 10 | 20 | Short SMA — Golden/Death cross window |
-| `rsi_buy_threshold` | 45 | 50 | 55 | Minimum RSI for BUY authorization |
-| `volume_threshold` | 1.0 | 1.2 | 1.5 | Volume surge multiplier vs. 20-day avg |
+| `rsi_buy_threshold` | 42 | 45 | 50 | Minimum RSI for BUY authorization |
+| `volume_threshold` | 0.75 | 0.85 | 1.0 | Volume surge multiplier vs. 20-day avg (× session fraction live) |
 | `atr_multiplier` | 3.0 | 2.5 | 2.0 | Trailing stop width ($\text{ATR} \times \text{mult}$) |
 | `use_trend_filter` | True | False | True | Enable 50-day SMA regime gate + conditional RSI exit |
 | `sma_long_period` | 50 | 50 | 50 | Fixed macro regime baseline (not ticker-tuned) |
@@ -1124,6 +1131,10 @@ Signal execution parameters are **ticker-isolated** via `config.py` → `Strateg
 | `LOOP_COOLDOWN_SECONDS` | **60** | Open-session inter-cycle pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | **3600** | Closed-session extended sleep |
 | `TICKER_SLEEP_SECONDS` | **1** | Pause between tickers within a cycle |
+
+#### Gate Relaxation Note (June 2026)
+
+Live monitoring showed persistent `Liquidity OK: False` during RTH because partial intraday volume was compared to full-day averages, while RSI/volume thresholds were tuned for completed daily bars only. Parameters were **moderately lowered** in `config.py` and the live engine now applies **`ny_regular_session_elapsed_fraction()`** so BUY gates remain conservative but reachable during mock-trading demos without abandoning the multi-filter design.
 
 ---
 
