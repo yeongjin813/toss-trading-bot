@@ -4,7 +4,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | P3 Active — Infrastructure Hardening & Live Parity (RTH Gate + Reconciliation) |
+| **System Status** | Phase 5 Active — Ticker Regime Isolation + P3 Live Parity (RTH Gate + Reconciliation) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | `NVDA` (High-Vol leader), `PLTR` (Breakout growth), `AAPL` (Low-Vol control) — configurable via `.env` `WATCHLIST` |
@@ -265,7 +265,7 @@ For each ticker in WATCHLIST:
   └─ 6. Dispatch order → state transition → persist trading_state.json
 ```
 
-Backtest parity: `python run_backtest.py` invokes `TrendTradingStrategy(ticker=...)` with identical gates via `create_backtest_cerebro(ticker)`.
+Backtest parity: `python run_backtest.py` runs the **consolidated portfolio** simulator (`portfolio_backtest.run_portfolio_backtest`) with `LiveSignalEngine` + dual-clamp sizing. Legacy per-ticker Backtrader mode: `python run_backtest.py --isolated` via `create_backtest_cerebro(ticker)`.
 
 ### F. Data Science Justification: Structural Regime Mapping vs. Indicator Stacking
 
@@ -295,7 +295,9 @@ This is **variance reduction through regime conditioning**, not **bias reduction
 | `analytics.py` | `IndicatorAnalytics.populate_indicators()` | Dual MA + RSI + ATR + Volume computation |
 | `analytics.py` | `LiveSignalEngine(ticker)` | Live signal evaluation with asymmetric gates |
 | `strategy.py` | `TrendTradingStrategy(ticker=...)` | Backtrader twin with identical entry/exit mathematics |
-| `run_backtest.py` | `create_backtest_cerebro(ticker)` | Historical validation per isolated regime |
+| `run_backtest.py` | `run_portfolio_backtest()` (default) | Consolidated portfolio backtest — shared cash ledger |
+| `run_backtest.py` | `create_backtest_cerebro(ticker)` (`--isolated`) | Legacy per-ticker Backtrader validation |
+| `portfolio_backtest.py` | `run_portfolio_backtest()` | Live-parity portfolio simulation engine |
 
 ---
 
@@ -1181,7 +1183,7 @@ Expected startup sequence:
 1. `validate_environment()` — KIS credentials + `MARKET_META` routing
 2. KIS OAuth token (cached in `kis_token_cache.json`)
 3. `MarketDataCache.bootstrap()` — ~756 bars per ticker, once
-4. Load `trading_state.json`
+4. Load `trading_state.json` (empty file → `[WARN]` + fresh `{}` registry; no crash)
 5. `try_print_mock_account_balance()` — optional, non-blocking
 6. `log_configured_capital_model()` — confirms `CAPITAL_AT_RISK`
 7. `run_session_reconciliation(force=True)` — P3 startup broker sync
@@ -1242,7 +1244,20 @@ Runtime Registry     : pending=False | held_qty=40 | last_processed=2026-06-05
 ATR Stop Telemetry   : peak=$145.80 | floor=$137.37 | session_low=$138.42
 ```
 
-### F. Verification Suite
+### F. Portfolio Backtest Runner
+
+```powershell
+# Default — consolidated portfolio (shared $10k cash pool)
+python run_backtest.py
+
+# Synthetic smoke test (252 trading days, reproducible seed)
+python run_backtest.py --random --random-bars 252 --random-seed 42
+
+# Legacy — isolated per-ticker Backtrader (comparison only)
+python run_backtest.py --isolated
+```
+
+### G. Verification Suite
 
 ```powershell
 python test_analytics.py
@@ -1255,7 +1270,7 @@ Runs unit tests against `LiveSignalEngine`:
 - **3-step bar transitions** — look-ahead-free DYNAMIC_ATR_SELL (Test 3)
 - External state serialization round-trip (Test 4)
 
-### G. Graceful Thread Termination
+### H. Graceful Thread Termination
 
 To halt the continuous polling routine safely, dispatch a SIGINT termination signal via **Ctrl + C**. The orchestrator intercepts the termination hook, finishes the active processing sequence, and dumps the transactional matrix to `./trading_state.json` to prevent data loss.
 
@@ -1306,13 +1321,14 @@ $$
 \text{Live Engine Execution Price} = \text{Close}_t
 $$
 
-- **Operational Malfunction**: This structural 24-hour execution delta guarantees that live execution will drift into immediate anti-alignment (off-beat entries and exits), severely degrading actual realized performance compared to optimized backtests.
+- **Historical Risk**: Without Cheat-on-Close, Backtrader's default next-bar open fill ($\text{Open}_{t+1}$) diverges from the live engine's EOD close assumption ($\text{Close}_t$).
+- **Current Status**: **Resolved** — `configure_backtest_broker()` in `strategy.py` enables `set_coc(True)` for isolated Backtrader runs; the default portfolio path uses `LiveSignalEngine` directly at $\text{Close}_t$.
 
 | Execution Assumption | Module | Price Anchor |
 |---|---|---|
-| Next-bar open fill | `strategy.py` (Backtrader default) | $\text{Open}_{t+1}$ |
-| Same-bar close fill | `analytics.py` / `main.py` live loop | $\text{Close}_t$ |
-| Recommended alignment | Backtrader `set_coc(True)` | Cheat-on-Close → $\text{Close}_t$ (see Section 14) |
+| Same-bar close fill (isolated Backtrader) | `strategy.py` via `set_coc(True)` | $\text{Close}_t$ |
+| Same-bar close fill (portfolio default) | `portfolio_backtest.py` + `LiveSignalEngine` | $\text{Close}_t$ |
+| Live dispatch model | `analytics.py` / `main.py` | $\text{Close}_t$ (EOD signal on completed daily bar) |
 
 ---
 
@@ -1330,19 +1346,19 @@ The following items represent **known structural vulnerabilities** in the curren
 | Broker held quantity | Inquire present balance / holdings | `VTRP6504R` |
 | Local persisted quantity | `trading_state.json` → `held_quantity` | — |
 
-### ② All-In Leverage Capital Erosion Buffer (Fee & Slippage Leakage)
+### ② All-In Leverage Capital Erosion Buffer (Fee & Slippage Leakage) — **RESOLVED**
 
 - **The Defect**: The asset calculation string `shares_by_capital = int(deployable / entry_price)` inside `calculate_position_size()` assumes absolute zero-friction transactions. When deploying an aggressive 100% "all-in" capital allocation model, the omission of exchange fees, local broker taxes, and real-time execution slippage will cause order volumes to calculate slightly above available liquidation thresholds.
-- **The Hardening Patches**: Implement a strict **Capital Allocation Safety Buffer** inside `calculate_position_size()`. Force an operational haircut to restrict total immediate deployment capital to exactly 95%–98% of liquid buying power, or dynamically compute transaction fees prior to rounding down integer components:
+- **Resolution**: `calculate_position_size()` in `analytics.py` and `dual_clamp_portfolio_size()` in `portfolio_backtest.py` apply a fixed **95% deployable capital haircut**:
 
 $$
 \text{Adjusted Available Capital} = \text{Liquid Capital} \times 0.95
 $$
 
-| Current Behavior | Proposed Hardening |
+| Prior Behavior | Current Implementation |
 |---|---|
-| `deployable = capital_at_risk` (100%) | `deployable = capital_at_risk × CAPITAL_DEPLOY_BUFFER` (0.95–0.98) |
-| No fee deduction in sizing | Pre-deduct estimated commission + slippage reserve |
+| `deployable = capital_at_risk` (100%) | `shares_by_capital = int((deployable × 0.95) / entry_price)` |
+| No fee deduction in sizing | Commission still modeled at execution (`0.1%` default); sizing reserves 5% cash headroom |
 
 ### ③ Intraday vs. EOD Timeframe Non-Invertibility
 
@@ -1418,8 +1434,8 @@ $$
 | Priority | Task | Target Module | Implementation Directive |
 |---|---|---|---|
 | **P0** | Portfolio Reconciliation Layer | `session_manager.py` + `main.py` | **Done (P3)** — `VTRP6504R` sync at startup + daily RTH; auto-override on $\Delta \text{Shares} \neq 0$ |
-| **P0** | Backtest Timing Alignment | `strategy.py` / Backtrader init | Inject `self.cerebro.broker.set_coc(True)` (Cheat-on-Close) into the Backtrader initialization block. Forces backtester to execute transactions on the current bar's close price, synchronizing mathematical alignment with `analytics.py` ($\text{Close}_t$). |
-| **P1** | Capital Deploy Buffer | `analytics.py` | Apply $\text{Adjusted Capital} = \text{Liquid Capital} \times 0.95$ in `calculate_position_size()` (Section 12②). |
+| **P0** | Backtest Timing Alignment | `strategy.py` / Backtrader init | **Done** — `configure_backtest_broker()` calls `cerebro.broker.set_coc(True)` (Cheat-on-Close at $\text{Close}_t$). |
+| **P1** | Capital Deploy Buffer | `analytics.py` + `portfolio_backtest.py` | **Done** — `calculate_position_size()` / `dual_clamp_portfolio_size()` apply the $0.95$ deployable haircut (Section 12②). |
 | **P1** | NYSE Calendar Cross-Check | `analytics.py` | Integrate `holidays.NYSE` multi-layer validation (Section 12④). |
 | **P2** | API Exception Handling Queue | `main.py` | Build standardized asynchronous retry queue for failed order transmissions. |
 | **P2** | Telegram Alert Webhook | `main.py` | Automated alert infrastructure for unmapped broker failures, $\Delta \text{Shares} \neq 0$, and `api_response_time > 3.0s`. |
@@ -1437,9 +1453,9 @@ cerebro.broker.set_coc(True)   # Execute at current bar close — aligns with an
 
 ### Pre-Deployment Checklist
 
-- [ ] Backtrader `set_coc(True)` verified — backtest fills at $\text{Close}_t$, not $\text{Open}_{t+1}$
+- [x] Backtrader `set_coc(True)` verified — `strategy.configure_backtest_broker()`; fills at $\text{Close}_t$, not $\text{Open}_{t+1}$
 - [x] $\Delta \text{Shares}$ reconciliation active — local `held_quantity` overridden to match broker registry (P3)
-- [ ] Capital deploy buffer (95%) applied in `calculate_position_size()`
+- [x] Capital deploy buffer (95%) applied in `calculate_position_size()` and `dual_clamp_portfolio_size()`
 - [ ] `holidays.NYSE` cross-check integrated alongside internal calendar
 - [ ] `api_response_time` logged; Retry Queue wired for timeout events
 - [ ] Telegram / alert webhook configured for CRITICAL reconciliation failures
@@ -1550,7 +1566,8 @@ Toss Trading Bot/
 ├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
 ├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing
 ├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates
-├── run_backtest.py         # Historical backtest runner (per-ticker isolated regimes)
+├── portfolio_backtest.py   # Consolidated portfolio backtest (default live-parity path)
+├── run_backtest.py         # CLI: portfolio backtest (default), --isolated legacy, --random smoke test
 ├── test_analytics.py       # Engine verification (trend filter + conditional RSI tests)
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Configuration template (copy to .env)

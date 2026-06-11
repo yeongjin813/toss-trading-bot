@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import backtrader as bt
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -40,6 +41,17 @@ load_dotenv(override=True)
 DEFAULT_WATCHLIST = ["NVDA", "PLTR", "AAPL"]
 DEFAULT_RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 REQUIRED_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
+DEFAULT_RANDOM_BARS = 252
+RANDOM_START_PRICES: dict[str, float] = {
+    "NVDA": 200.0,
+    "PLTR": 130.0,
+    "AAPL": 290.0,
+}
+RANDOM_DAILY_VOL: dict[str, float] = {
+    "NVDA": 0.028,
+    "PLTR": 0.035,
+    "AAPL": 0.018,
+}
 
 
 def parse_watchlist(raw: str | None) -> list[str]:
@@ -71,6 +83,61 @@ def load_daily_csv(path: Path) -> pd.DataFrame | None:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     return df.dropna(subset=list(REQUIRED_COLUMNS))
+
+
+def generate_random_ohlcv(
+    ticker: str,
+    bars: int = DEFAULT_RANDOM_BARS,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """Synthetic 1-year daily OHLCV via geometric random walk (smoke-test data)."""
+    rng = np.random.default_rng(seed)
+    start_price = RANDOM_START_PRICES.get(ticker, 100.0)
+    daily_vol = RANDOM_DAILY_VOL.get(ticker, 0.025)
+    base_volume = {"NVDA": 150_000_000, "PLTR": 40_000_000, "AAPL": 50_000_000}.get(
+        ticker, 20_000_000
+    )
+
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=bars)
+    returns = rng.normal(loc=0.0002, scale=daily_vol, size=bars)
+    closes = start_price * np.cumprod(1.0 + returns)
+
+    records: list[dict[str, float]] = []
+    for idx, close in enumerate(closes):
+        intraday_noise = abs(rng.normal(0.0, daily_vol * 0.35))
+        open_price = close * (1.0 + rng.normal(0.0, daily_vol * 0.15))
+        high = max(open_price, close) * (1.0 + intraday_noise)
+        low = min(open_price, close) * (1.0 - intraday_noise)
+        volume = max(
+            1_000_000.0,
+            base_volume * float(np.exp(rng.normal(0.0, 0.45))),
+        )
+        records.append(
+            {
+                "Open": round(float(open_price), 4),
+                "High": round(float(high), 4),
+                "Low": round(float(low), 4),
+                "Close": round(float(close), 4),
+                "Volume": round(volume, 0),
+            }
+        )
+
+    return pd.DataFrame(records, index=dates)
+
+
+def load_random_watchlist_data(
+    tickers: list[str],
+    bars: int,
+    seed: int,
+) -> dict[str, pd.DataFrame]:
+    return {
+        ticker: generate_random_ohlcv(
+            ticker,
+            bars=bars,
+            seed=seed + sum(ord(char) for char in ticker),
+        )
+        for ticker in tickers
+    }
 
 
 def load_watchlist_data(
@@ -263,6 +330,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run legacy isolated per-ticker Backtrader mode (comparison only)",
     )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Use synthetic random OHLCV instead of CSV files (smoke test)",
+    )
+    parser.add_argument(
+        "--random-bars",
+        type=int,
+        default=DEFAULT_RANDOM_BARS,
+        help="Trading days for --random data (default: 252)",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=42,
+        help="RNG seed for --random data (default: 42)",
+    )
     return parser
 
 
@@ -275,23 +359,30 @@ def main(argv: list[str] | None = None) -> int:
     print("Toss Trading Bot - Portfolio Backtest Engine (P2)".center(88))
     print("=" * 88)
     print(f"Tickers          : {', '.join(tickers)}")
-    print(f"Data dir         : {data_dir.resolve()}")
+    if args.random:
+        print(f"Data source      : synthetic random ({args.random_bars} bars, seed={args.random_seed})")
+    else:
+        print(f"Data dir         : {data_dir.resolve()}")
     print(f"Portfolio capital: ${args.cash:,.0f} (single consolidated pool)")
     print(f"Risk per trade   : {args.risk_per_trade * 100:.1f}% of total equity")
     print(f"Commission       : {args.commission * 100:.1f}%")
     print()
 
-    ohlcv, skipped = load_watchlist_data(tickers, data_dir)
+    if args.random:
+        ohlcv = load_random_watchlist_data(tickers, args.random_bars, args.random_seed)
+        skipped: list[str] = []
+    else:
+        ohlcv, skipped = load_watchlist_data(tickers, data_dir)
 
-    if skipped:
-        print("Skipped:")
-        for line in skipped:
-            print(f"  - {line}")
-        print()
+        if skipped:
+            print("Skipped:")
+            for line in skipped:
+                print(f"  - {line}")
+            print()
 
-    if not ohlcv:
-        print("No valid CSV data found. Place files at data/{ticker}_daily.csv")
-        return 1
+        if not ohlcv:
+            print("No valid CSV data found. Place files at data/{ticker}_daily.csv")
+            return 1
 
     loaded = [t for t in tickers if t in ohlcv]
     for ticker in loaded:
