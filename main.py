@@ -32,11 +32,11 @@ from dotenv import load_dotenv
 from analytics import (
     LiveSignalEngine,
     PositionState,
-    StrategyConfig,
     describe_us_market_closure,
     is_us_equity_session,
     is_us_regular_market_hours,
 )
+from config import StrategyConfigMapper
 
 load_dotenv(override=True)
 
@@ -89,9 +89,6 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
-
-STRATEGY_CONFIG = StrategyConfig.from_env()
-
 
 def validate_environment() -> None:
     """Ensure all required KIS credentials are present in the environment."""
@@ -518,12 +515,17 @@ def print_mock_account_balance(client: KISApiClient) -> None:
 
 def log_configured_capital_model() -> None:
     print("-" * 88)
-    print("CAPITAL MODEL - MANUAL (STRATEGY_CONFIG)".center(88))
+    print("CAPITAL MODEL - TICKER-ISOLATED REGIMES".center(88))
     print("-" * 88)
     print(f"Capital At Risk      : ${CAPITAL_AT_RISK:,.2f}")
     print(f"Risk Per Trade       : {RISK_PER_TRADE * 100:.1f}%")
-    print(f"SMA / RSI / ATR      : {STRATEGY_CONFIG.sma_period} / "
-          f"{STRATEGY_CONFIG.rsi_period} / {STRATEGY_CONFIG.atr_period}")
+    for ticker in WATCHLIST:
+        cfg = StrategyConfigMapper.for_ticker(ticker)
+        print(
+            f"{ticker:<6} SMA={cfg.sma_period} RSI>={cfg.rsi_buy_threshold:.0f} "
+            f"Vol={cfg.volume_threshold:.1f}x ATR={cfg.atr_multiplier:.1f} "
+            f"TrendFilter={cfg.use_trend_filter}"
+        )
     print(
         "Order Placement      : Not gated on balance inquiry; "
         "mock VTS suffix mismatches are ignored."
@@ -584,7 +586,11 @@ def load_persisted_states(path: str = STATE_FILE) -> dict[str, Any]:
         return {}
 
     with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+        raw = handle.read().strip()
+        if not raw:
+            print(f"[WARN] {path} is empty — starting with a fresh state registry.")
+            return {}
+        payload = json.loads(raw)
 
     if not isinstance(payload, dict):
         raise ValueError("Invalid trading state file: root must be a dictionary.")
@@ -783,12 +789,12 @@ def print_session_telemetry(
 
 def process_ticker(
     client: KISApiClient,
-    engine: LiveSignalEngine,
     cache: MarketDataCache,
     ticker: str,
     states: dict[str, Any],
 ) -> str:
     """Run fetch-evaluate-execute-persist cycle for one ticker with state machine gates."""
+    engine = LiveSignalEngine(ticker)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing ticker: {ticker}")
 
     df, is_new_bar = cache.refresh_latest(ticker)
@@ -850,7 +856,6 @@ def process_ticker(
 
 def run_watchlist_cycle(
     client: KISApiClient,
-    engine: LiveSignalEngine,
     cache: MarketDataCache,
     states: dict[str, Any],
 ) -> dict[str, Any]:
@@ -870,7 +875,7 @@ def run_watchlist_cycle(
 
     for index, ticker in enumerate(WATCHLIST):
         try:
-            signal = process_ticker(client, engine, cache, ticker, states)
+            signal = process_ticker(client, cache, ticker, states)
             summary.append((ticker, signal))
         except requests.Timeout as exc:
             print(f"[ERROR] Timeout for {ticker}: {exc}")
@@ -913,7 +918,6 @@ def main() -> None:
     print("=" * 88)
 
     client = KISApiClient()
-    engine = LiveSignalEngine(STRATEGY_CONFIG)
     cache = MarketDataCache(client)
 
     print("Requesting KIS access token...")
@@ -960,7 +964,7 @@ def main() -> None:
                 f"{cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---"
             )
 
-            states = run_watchlist_cycle(client, engine, cache, states)
+            states = run_watchlist_cycle(client, cache, states)
 
             print(
                 f"Cycle {cycle_count} complete. "

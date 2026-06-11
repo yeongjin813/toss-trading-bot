@@ -13,13 +13,14 @@ import pandas as pd
 
 from analytics import (
     BarSnapshot,
+    IndicatorAnalytics,
     LiveSignalEngine,
     PositionState,
-    StrategyConfig,
     calculate_atr,
     calculate_rsi,
     calculate_sma,
 )
+from config import StrategyConfigMapper
 
 
 def build_synthetic_market_data(rows: int = 100) -> pd.DataFrame:
@@ -66,21 +67,22 @@ def build_synthetic_market_data(rows: int = 100) -> pd.DataFrame:
 def verify_indicator_computation(engine: LiveSignalEngine, df: pd.DataFrame) -> pd.DataFrame:
     """Validate indicator columns against direct reference implementations."""
     print("=" * 88)
-    print("TEST 1: INDICATOR COMPUTATION (WILDER SMOOTHING)")
+    print("TEST 1: INDICATOR COMPUTATION (SMA_SHORT + SMA_LONG + WILDER)")
     print("=" * 88)
 
     enriched = engine.calculate_indicators(df)
     cfg = engine.config
 
     pre_drop = df.copy()
-    pre_drop["SMA"] = calculate_sma(pre_drop, cfg.sma_period)
+    pre_drop["SMA_SHORT"] = calculate_sma(pre_drop, cfg.sma_period)
+    pre_drop["SMA_LONG"] = calculate_sma(pre_drop, cfg.sma_long_period)
     pre_drop["RSI"] = calculate_rsi(pre_drop, cfg.rsi_period)
     pre_drop["ATR"] = calculate_atr(pre_drop, cfg.atr_period)
     pre_drop["Volume_SMA"] = calculate_sma(
         pre_drop, cfg.volume_sma_period, column="Volume"
     )
 
-    assert not enriched[["SMA", "RSI", "ATR", "Volume_SMA"]].isna().any().any(), (
+    assert not enriched[["SMA_SHORT", "SMA_LONG", "RSI", "ATR", "Volume_SMA"]].isna().any().any(), (
         "NaN values detected in indicator tail after enrichment."
     )
 
@@ -91,7 +93,8 @@ def verify_indicator_computation(engine: LiveSignalEngine, df: pd.DataFrame) -> 
     ref_row = pre_drop.loc[pre_drop["Date"] == last_date].iloc[0]
     last_row = enriched.iloc[-1]
 
-    assert np.isclose(last_row["SMA"], ref_row["SMA"]), "SMA mismatch"
+    assert np.isclose(last_row["SMA_SHORT"], ref_row["SMA_SHORT"]), "SMA_SHORT mismatch"
+    assert np.isclose(last_row["SMA_LONG"], ref_row["SMA_LONG"]), "SMA_LONG mismatch"
     assert np.isclose(last_row["RSI"], ref_row["RSI"]), "RSI mismatch"
     assert np.isclose(last_row["ATR"], ref_row["ATR"]), "ATR mismatch"
     assert np.isclose(last_row["Volume_SMA"], ref_row["Volume_SMA"]), "Volume SMA mismatch"
@@ -99,7 +102,8 @@ def verify_indicator_computation(engine: LiveSignalEngine, df: pd.DataFrame) -> 
     print(f"Rows processed       : {len(enriched)}")
     print(f"NaN-free tail        : PASS")
     print(
-        f"Latest indicators    : SMA={enriched.iloc[-1]['SMA']:.2f} | "
+        f"Latest indicators    : SMA_SHORT={enriched.iloc[-1]['SMA_SHORT']:.2f} | "
+        f"SMA_LONG={enriched.iloc[-1]['SMA_LONG']:.2f} | "
         f"RSI={enriched.iloc[-1]['RSI']:.2f} | "
         f"ATR={enriched.iloc[-1]['ATR']:.4f} | "
         f"VolSMA={enriched.iloc[-1]['Volume_SMA']:,.0f}"
@@ -139,7 +143,8 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
         low=97.5,
         close=98.5,
         volume=2_000_000.0,
-        sma=99.0,
+        sma_short=99.0,
+        sma_long=95.0,
         rsi=55.0,
         atr=1.5,
         volume_sma=1_000_000.0,
@@ -151,7 +156,8 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
         low=98.8,
         close=101.0,
         volume=2_500_000.0,
-        sma=99.5,
+        sma_short=99.5,
+        sma_long=96.0,
         rsi=58.0,
         atr=1.6,
         volume_sma=1_100_000.0,
@@ -175,7 +181,8 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
         low=108.5,
         close=110.0,
         volume=2_200_000.0,
-        sma=100.0,
+        sma_short=100.0,
+        sma_long=97.0,
         rsi=62.0,
         atr=2.0,
         volume_sma=1_150_000.0,
@@ -198,7 +205,8 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
         low=trigger_floor - 0.5,
         close=108.0,
         volume=2_100_000.0,
-        sma=101.0,
+        sma_short=101.0,
+        sma_long=98.0,
         rsi=60.0,
         atr=2.0,
         volume_sma=1_200_000.0,
@@ -217,6 +225,55 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
     print()
 
 
+def verify_trend_filter_and_conditional_rsi(engine: LiveSignalEngine) -> None:
+    """Validate SMA-50 trend gate and conditional RSI crossdown exit."""
+    print("=" * 88)
+    print("TEST 5: TREND FILTER + CONDITIONAL RSI EXIT")
+    print("=" * 88)
+
+    state = PositionState(in_position=True, held_quantity=10)
+    state.highest_price_achieved = 200.0
+    state.trigger_floor = 180.0
+    state.current_atr = 5.0
+    state.dynamic_stop_distance = 20.0
+
+    prev_bar = BarSnapshot(
+        date=datetime(2024, 7, 1).date(),
+        open=195.0,
+        high=198.0,
+        low=194.0,
+        close=197.0,
+        volume=1_000_000.0,
+        sma_short=196.0,
+        sma_long=180.0,
+        rsi=52.0,
+        atr=5.0,
+        volume_sma=900_000.0,
+    )
+    bar = BarSnapshot(
+        date=datetime(2024, 7, 2).date(),
+        open=197.0,
+        high=198.0,
+        low=195.0,
+        close=196.5,
+        volume=1_000_000.0,
+        sma_short=196.2,
+        sma_long=181.0,
+        rsi=48.0,
+        atr=5.0,
+        volume_sma=900_000.0,
+    )
+
+    result = engine.evaluate_bar(state, bar, prev_bar, mutate_state=False)
+    if engine.config.use_trend_filter:
+        assert result["signal"] == "HOLD", "RSI crossdown must be suppressed above sma_long"
+        print("Trend-filter ON      : RSI crossdown suppressed in bull regime - PASS")
+    else:
+        assert result["signal"] == "SELL", "RSI crossdown must fire without trend filter"
+        print("Trend-filter OFF     : RSI crossdown exit fired - PASS")
+    print()
+
+
 def verify_external_state_roundtrip(engine: LiveSignalEngine, enriched: pd.DataFrame) -> None:
     """Verify state serialization supports external persistence stores."""
     print("=" * 88)
@@ -232,20 +289,42 @@ def verify_external_state_roundtrip(engine: LiveSignalEngine, enriched: pd.DataF
     print()
 
 
-def main() -> int:
-    config = StrategyConfig(
-        rsi_buy_threshold=50.0,
-        rsi_upper_limit=70.0,
-        volume_threshold=1.2,
-        rsi_exit_mode="threshold",
-    )
-    engine = LiveSignalEngine(config)
+def verify_config_registry() -> None:
+    print("=" * 88)
+    print("TEST 6: TICKER CONFIG ISOLATION")
+    print("=" * 88)
 
-    raw_df = build_synthetic_market_data(rows=100)
+    nvda = StrategyConfigMapper.for_ticker("NVDA")
+    pltr = StrategyConfigMapper.for_ticker("PLTR")
+    aapl = StrategyConfigMapper.for_ticker("AAPL")
+
+    assert nvda.sma_period == 10 and nvda.atr_multiplier == 3.0
+    assert pltr.use_trend_filter is False
+    assert aapl.sma_period == 20 and aapl.use_trend_filter is True
+
+    nvda_df = IndicatorAnalytics.populate_indicators(
+        build_synthetic_market_data(120), nvda
+    )
+    assert "SMA_LONG" in nvda_df.columns
+
+    print(f"NVDA regime          : SMA={nvda.sma_period} ATR={nvda.atr_multiplier}")
+    print(f"PLTR regime          : trend_filter={pltr.use_trend_filter}")
+    print(f"AAPL (DEFAULT)       : SMA={aapl.sma_period} vol={aapl.volume_threshold}")
+    print("Config isolation     : PASS")
+    print()
+
+
+def main() -> int:
+    engine = LiveSignalEngine("PLTR")
+
+    raw_df = build_synthetic_market_data(rows=120)
     enriched = verify_indicator_computation(engine, raw_df)
     verify_o1_replay(engine, enriched)
     verify_bar_transitions(engine)
     verify_external_state_roundtrip(engine, enriched)
+    verify_trend_filter_and_conditional_rsi(engine)
+    verify_trend_filter_and_conditional_rsi(LiveSignalEngine("NVDA"))
+    verify_config_registry()
 
     print("=" * 88)
     print("ALL ANALYTICS TESTS PASSED")

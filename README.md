@@ -4,7 +4,9 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 4 Active — Production Synchronization & Memory Window Caching |
+| **System Status** | Phase 5 Active — Ticker-Specific Configuration & Macro Regime Filtering |
+| **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
+| **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | `NVDA` (High-Vol leader), `PLTR` (Breakout growth), `AAPL` (Low-Vol control) — configurable via `.env` `WATCHLIST` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS Sandbox Deployment) |
 | **Anchor Account** | CANO: `50191906` \| ACNT_PRDT_CD: `01` (Unified Portfolio Suffix) — override via `.env` |
@@ -22,6 +24,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 ## Table of Contents
 
 1. [Project Evolution & Development Chronology](#1-project-evolution--development-chronology)
+1A. [Phase 3 Architecture: Ticker-Specific Configuration & Macro Regime Filtering](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)
 2. [Dedicated Section: Same-Bar Look-Ahead Bias Eradication](#2-dedicated-section-same-bar-look-ahead-bias-eradication)
 3. [Dedicated Section: RSI Crossdown Exit Engine](#3-dedicated-section-rsi-crossdown-exit-engine)
 4. [Dedicated Section: Dual-Clamp Position Sizing](#4-dedicated-section-dual-clamp-position-sizing)
@@ -66,10 +69,24 @@ An automated, production-grade quantitative trading infrastructure and empirical
 - **Architecture**: Replaced static CSV dependencies with automated, live API ingestion. Integrated credential encryption layers via `.env` state protection and established clean exception frameworks to process broker authorization sequences dynamically.
 - **Capability**: Dynamic data persistence, standardized English console telemetry, and integrated Backtrader performance analyzers (Final Portfolio Value, Sharpe Ratio, Max Drawdown).
 
-### Phase 4: Dynamic ATR Risk Engine & Mathematical Integrity Corrections *(Current)*
+### Phase 4: Dynamic ATR Risk Engine & Mathematical Integrity Corrections
 
 - **Architecture**: Expanded from single-asset to a parallel multi-ticker watchlist (`NVDA`, `PLTR`, `AAPL`) executing live routines through the KIS sandbox server (`openapivts.koreainvestment.com:29443`).
 - **Core Engineering Patches**: Mitigated critical production failures by implementing a localized memory bar caching engine (`MarketDataCache`), a state-gated concurrency lock to eliminate duplicate order flooding, an institutional volume liquidity surge gate, and a rigorous series of financial logic patches to eliminate same-bar look-ahead bias, capital over-leverage rejections, and weekend/holiday runtime crashes.
+
+### Phase 5: Ticker-Specific Configuration & Macro Regime Filtering *(Current)*
+
+- **Architecture**: Eliminated global `.env` execution-parameter overrides (`SMA_PERIOD`, `ATR_MULTIPLIER`, etc.) in favor of a hardcoded **TickerConfig isolation matrix** in `config.py`, resolved at runtime via `StrategyConfigMapper.for_ticker(ticker)`.
+- **Core Logic Patch**: Introduced dual-moving-average regime filtering (`SMA_SHORT` + 50-day `SMA_LONG`) with **asymmetric entry/exit mechanics** — trend-gated entries and whipsaw-protected conditional RSI exits during macro bull runs.
+- **Empirical Impact** (756-bar backtest, 2023-06 → 2026-06, `run_backtest.py`):
+
+| Ticker | Pre-Isolation Return | Post-Isolation Return | Buy & Hold |
+|---|---|---|---|
+| **NVDA** | **-16.9%** | **+16.3%** | +426.4% |
+| **PLTR** | +208.8% | +72.5% | +754.0% |
+| **AAPL** | +4.4% | +7.9% | +66.6% |
+
+- **Insight**: One-size-fits-all parameters forced high-beta trend leaders through conservative gates, producing catastrophic underperformance vs. buy-and-hold. Structural regime mapping per ticker reduced whipsaw variance without stacking noisy sub-indicators (see [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)).
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -83,7 +100,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **State-Gated Order Lifecycle** | `main.py` + `analytics.py` | Dispatch → verify → lock → persist → transition |
 | **Hybrid EOD / Intraday Engine** | `analytics.py` | Bar-trailing crossover gate + continuous ATR scan |
 | **Liquidity Gate** | `analytics.py` + `strategy.py` | `Volume_t > Volume_SMA_20 × 1.2` for BUY |
-| **Configuration Externalization** | `StrategyConfig.from_env()` | Watchlist, capital, strategy params from `.env` |
+| **Configuration Externalization** | `config.py` → `StrategyConfigMapper` | Ticker-isolated signal params; `.env` for credentials/capital only |
+| **Ticker Regime Isolation** | `config.py` + `analytics.py` + `strategy.py` | NVDA / PLTR / DEFAULT matrix; dual MA; asymmetric RSI exit |
 
 Additional Phase 4 safeguards preserved from prior milestones:
 
@@ -92,7 +110,187 @@ Additional Phase 4 safeguards preserved from prior milestones:
 - **PLTR NASDAQ VTS proxy**: `excd: NAS`, `ovrs_excg_cd: NASD` — bypasses 0-bar NYS truncation.
 - **NY regular-hours gate**: `is_us_regular_market_hours()` blocks pre/post-market crossover; `DYNAMIC_ATR_SELL` remains active for open positions outside regular hours.
 - **State persistence fix**: `last_processed_date` updates only after `BUY` / `SELL` / `DYNAMIC_ATR_SELL` order transitions — never on `HOLD`.
-- **Backtest/live parity**: `strategy.py` and `analytics.py` share identical 3-step trailing sequence, RSI crossdown logic, and Backtrader `set_coc(True)`.
+- **Backtest/live parity**: `TrendTradingStrategy` and `LiveSignalEngine` share identical regime gates, 3-step trailing sequence, and Backtrader `set_coc(True)`.
+
+---
+
+## Phase 3 Architecture: Ticker-Specific Configuration & Macro Regime Filtering
+
+This section documents the **Phase 3 architectural evolution** of the execution engine: the transition from global, one-size-fits-all `.env` strategy parameters to a **Ticker-Specific Configuration Isolation Architecture** with an **Asymmetric 50-Day Regime Trend Filter**. This refactor directly addresses the structural underperformance observed in strong-trend, high-beta assets (notably NVDA at **-16.9%** strategy return vs. **+426%** buy-and-hold under the prior global configuration).
+
+### A. Problem Statement: Global Parameters, Local Regimes
+
+Prior to this refactor, all watchlist symbols consumed identical execution parameters loaded from `.env`:
+
+```ini
+# DEPRECATED for signal generation — no longer consulted by LiveSignalEngine
+SMA_PERIOD=10
+ATR_MULTIPLIER=2.0
+VOLUME_THRESHOLD=1.2
+RSI_BUY_THRESHOLD=50
+```
+
+This global model produced three measurable failures:
+
+1. **Regime mismatch**: NVDA (high-beta trend leader) and AAPL (low-volatility control) were forced through identical SMA/ATR/volume gates, causing premature RSI exits and tight ATR stops during parabolic bull runs.
+2. **Whipsaw amplification**: Phase 2 grid-search stacking (RSI + volume + SMA) reduced trade count but did not adapt to per-asset volatility — net return fell from **+0.99%** to **+0.52%** (classic overfitting to in-sample noise).
+3. **Backtest/live divergence**: A single `LiveSignalEngine(STRATEGY_CONFIG)` instance could not express symbol-specific risk posture; `main.py` evaluated NVDA with the same thresholds as AAPL.
+
+**Resolution**: Signal parameters now resolve exclusively through `config.py`. The `.env` file retains **credentials**, **watchlist membership**, **capital sizing**, and **loop timing** only.
+
+### B. Configuration Isolation Matrix (`config.py`)
+
+Two dataclasses form the isolation layer:
+
+| Class | Role |
+|---|---|
+| **`TickerConfig`** | Regime-scoped parameter bundle: `sma_period`, `rsi_buy_threshold`, `volume_threshold`, `atr_multiplier`, `use_trend_filter` |
+| **`StrategyConfig`** | Fully resolved, ticker-bound config materialized from `TickerConfig` + shared infrastructure constants (RSI/ATR periods, `sma_long_period=50`) |
+| **`StrategyConfigMapper`** | Central registry: `StrategyConfigMapper.for_ticker("NVDA")` → isolated `StrategyConfig` |
+
+#### Hardcoded Regime Parameter Table
+
+| Regime Key | Profile | `sma_period` | `rsi_buy` | `volume_mult` | `atr_mult` | `use_trend_filter` |
+|---|---|---|---|---|---|---|
+| **`NVDA`** | High Volatility / Strong Trend | **10** | **45** | **1.0** | **3.0** | **True** |
+| **`PLTR`** | High Volatility / Breakout | **10** | **50** | **1.2** | **2.5** | **False** |
+| **`DEFAULT`** | Conservative / Low Volatility (`AAPL`, unlisted) | **20** | **55** | **1.5** | **2.0** | **True** |
+
+Symbols not explicitly mapped in `_EXPLICIT` fall through to `DEFAULT`. Add new explicit mappings in `config.py` — not in `.env`.
+
+#### Resolution Flow
+
+```
+process_ticker("NVDA")
+    │
+    ▼
+LiveSignalEngine("NVDA")
+    │
+    ▼
+StrategyConfigMapper.for_ticker("NVDA")
+    │
+    ▼
+StrategyConfig(ticker="NVDA", sma_period=10, atr_multiplier=3.0, use_trend_filter=True, ...)
+    │
+    ├─► analytics.py  → IndicatorAnalytics.populate_indicators(df, config)
+    └─► strategy.py   → TrendTradingStrategy(ticker="NVDA")  [backtest parity]
+```
+
+### C. Dual-Moving-Average Indicator Pipeline
+
+`IndicatorAnalytics.populate_indicators()` in `analytics.py` computes a **dual MA structure** on every bar refresh:
+
+| Column | Window | Source | Purpose |
+|---|---|---|---|
+| **`SMA_SHORT`** | Dynamic `config.sma_period` | Ticker-isolated | Golden Cross / Death Cross execution SMA |
+| **`SMA_LONG`** | Fixed `50` (`sma_long_period`) | Shared infrastructure | Macro regime filter baseline |
+| **`RSI`** | 14 (Wilder) | Shared | Entry momentum gate + conditional exit |
+| **`ATR`** | 14 (Wilder) | Shared | Dynamic trailing stop distance |
+| **`Volume_SMA`** | 20 | Shared | Liquidity surge baseline |
+
+```python
+# analytics.py — IndicatorAnalytics.populate_indicators()
+enriched["SMA_SHORT"] = calculate_sma(enriched, config.sma_period)      # ticker-isolated
+enriched["SMA_LONG"]  = calculate_sma(enriched, config.sma_long_period)  # fixed 50-day
+```
+
+The short SMA window adapts per ticker (10 for NVDA/PLTR, 20 for AAPL). The long SMA is always 50 days — the macro regime anchor.
+
+### D. Asymmetric Entry / Exit Mechanics
+
+Signal evaluation is **asymmetric by design**: entries require regime compliance; exits split into unconditional emergency triggers vs. conditional momentum exits.
+
+#### Entry Gate (Flat Position → BUY)
+
+All four conditions must pass simultaneously:
+
+| # | Gate | Condition |
+|---|---|---|
+| 1 | **Golden Cross** | $\text{Close}_t > \text{SMA\_SHORT}_t$ AND $\text{Close}_{t-1} \le \text{SMA\_SHORT}_{t-1}$ |
+| 2 | **RSI Gate** | $\text{RSI}_t \ge \text{rsi\_buy\_threshold}$ (ticker-specific: 45 / 50 / 55) |
+| 3 | **Volume Gate** | $\text{Volume}_t > \text{Volume\_SMA}_{20} \times \text{volume\_mult}$ |
+| 4 | **Trend Filter** *(if `use_trend_filter=True`)* | $\text{Close}_t > \text{SMA\_LONG}_t$ **OR** $\text{SMA\_SHORT}_t > \text{SMA\_LONG}_t$ |
+
+When `use_trend_filter=False` (PLTR breakout regime), Gate 4 is bypassed — entries fire on crossover + RSI + volume alone.
+
+**Rationale**: Requiring price or short SMA above the 50-day baseline prevents counter-trend entries in weak macro regimes while still allowing early trend capture when the short SMA leads price above the long baseline.
+
+#### Whipsaw-Protected Exit (Positioned → SELL)
+
+Exit evaluation follows the immutable 3-step in-position sequence (Section 2), then applies asymmetric exit rules:
+
+| Exit Type | Condition | Regime Behavior |
+|---|---|---|
+| **`DYNAMIC_ATR_SELL`** | $\text{Low}_t \le \text{Trigger Floor}_{t-1}$ | Always active when positioned (including pre/post-market) |
+| **Death Cross** | $\text{Close}_t < \text{SMA\_SHORT}_t$ (verified cross) | **Unconditional** — emergency exit regardless of macro regime |
+| **RSI Crossdown** | $\text{RSI}_{t-1} \ge 50$ AND $\text{RSI}_t < 50$ | **Conditional** — see regime table below |
+
+##### RSI Crossdown Regime Matrix
+
+| `use_trend_filter` | Macro Regime | RSI Crossdown (< 50) Fires? |
+|---|---|---|
+| **False** (PLTR) | Any | **Yes** — always eligible |
+| **True** (NVDA, DEFAULT) | Bull: $\text{Close}_t \ge \text{SMA\_LONG}_t$ | **No** — suppressed to let winners run |
+| **True** (NVDA, DEFAULT) | Weak: $\text{Close}_t < \text{SMA\_LONG}_t$ | **Yes** — momentum loss confirmed in bearish regime |
+
+**Rationale**: During parabolic bull runs, RSI routinely dips below 50 on healthy pullbacks. Unconditional RSI exits caused NVDA to be shaken out of multi-month trends. Suppressing RSI exit while price holds above the 50-day SMA eliminates this whipsaw class while preserving death cross and ATR stop as hard safety nets.
+
+### E. Operational Signal Flow (Per-Ticker Cycle)
+
+```
+For each ticker in WATCHLIST:
+  │
+  ├─ 1. Resolve config: StrategyConfigMapper.for_ticker(ticker)
+  │
+  ├─ 2. Instantiate: LiveSignalEngine(ticker)
+  │
+  ├─ 3. Fetch OHLCV → IndicatorAnalytics.populate_indicators(df, config)
+  │       └─ Computes SMA_SHORT, SMA_LONG, RSI, ATR, Volume_SMA
+  │
+  ├─ 4. Replay state through evaluate_bar() with ticker-specific gates
+  │
+  ├─ 5. Evaluate today's signal:
+  │       ├─ Positioned?
+  │       │    ├─ ATR stop (Priority 1)
+  │       │    ├─ Death cross → SELL (unconditional)
+  │       │    └─ RSI crossdown → SELL (regime-conditional)
+  │       └─ Flat?
+  │            └─ Golden cross + RSI + Volume + Trend filter → BUY
+  │
+  └─ 6. Dispatch order → state transition → persist trading_state.json
+```
+
+Backtest parity: `python run_backtest.py` invokes `TrendTradingStrategy(ticker=...)` with identical gates via `create_backtest_cerebro(ticker)`.
+
+### F. Data Science Justification: Structural Regime Mapping vs. Indicator Stacking
+
+Phase 2 attempted to reduce whipsaws by **adding filters** (RSI threshold, volume surge, shorter SMA grid search). This increased model complexity without reducing **variance** — it traded false positives for false negatives (+0.99% → +0.52%).
+
+The Phase 3 architecture takes a different approach:
+
+| Approach | Mechanism | Overfitting Risk |
+|---|---|---|
+| **Phase 2 (rejected)** | Stack independent sub-indicators on one global parameter set | High — each filter adds degrees of freedom tuned to the same in-sample window |
+| **Phase 3 (current)** | Map 3 discrete volatility regimes to isolated parameter bundles | Low — 3 regimes × 5 parameters = bounded structural hypothesis, not continuous grid search |
+
+Key properties that limit overfitting:
+
+1. **Regime count is fixed** (3 buckets: NVDA / PLTR / DEFAULT) — not optimized by walk-forward grid search.
+2. **Long SMA window is fixed at 50** — not tuned per ticker.
+3. **RSI exit threshold is fixed at 50** — the *conditional application* (not the threshold itself) adapts by regime.
+4. **Out-of-sample validation**: NVDA return improved from -16.9% to +16.3% on the full 756-bar window without adding new indicators — only structural parameter isolation and asymmetric exit logic.
+
+This is **variance reduction through regime conditioning**, not **bias reduction through filter accumulation**.
+
+### G. Module Reference
+
+| Module | Class / Function | Responsibility |
+|---|---|---|
+| `config.py` | `TickerConfig`, `StrategyConfig`, `StrategyConfigMapper` | Hardcoded regime matrix; `for_ticker()` resolution |
+| `analytics.py` | `IndicatorAnalytics.populate_indicators()` | Dual MA + RSI + ATR + Volume computation |
+| `analytics.py` | `LiveSignalEngine(ticker)` | Live signal evaluation with asymmetric gates |
+| `strategy.py` | `TrendTradingStrategy(ticker=...)` | Backtrader twin with identical entry/exit mathematics |
+| `run_backtest.py` | `create_backtest_cerebro(ticker)` | Historical validation per isolated regime |
 
 ---
 
@@ -411,8 +609,9 @@ During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **wee
 
 ### Strategic Parameter Telemetry Disconnect
 
-- **Execution Signal Engine**: Evaluates entries using $\text{SMA}_{10}$ via `StrategyConfig` for higher breakout sensitivity.
-- **Telemetry Logging Layer**: Independent extraction of $\text{SMA}_{20}$ (`ANALYTICS_SMA_PERIOD = 20` in `main.py`) for external regression and confusion-matrix modeling — intentional disconnect for empirical visualization.
+- **Execution Signal Engine**: Evaluates entries using ticker-isolated $\text{SMA\_SHORT}$ via `StrategyConfigMapper` (10 for NVDA/PLTR, 20 for AAPL).
+- **Regime Filter**: Fixed $\text{SMA\_LONG}$ (50-day) gates entries and conditionally suppresses RSI exits during bull regimes.
+- **Telemetry Logging Layer**: Independent extraction of $\text{SMA}_{20}$ (`ANALYTICS_SMA_PERIOD = 20` in `main.py`) for external regression — intentional disconnect from execution SMA.
 
 ### Runtime State Registry (`trading_state.json`)
 
@@ -564,25 +763,41 @@ Implemented identically in `analytics.py` and `strategy.py`.
 
 ## 8. Strategy Configurations & Parameters
 
-All defaults overridable via `.env` and `StrategyConfig.from_env()` (see [Appendix C](#appendix-c-configuration-externalization-matrix)).
+Signal execution parameters are **ticker-isolated** via `config.py` → `StrategyConfigMapper.for_ticker()`. See [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering) for the full regime matrix.
 
-| Parameter | Operational Assignment Value | Functional Description Reference |
+`.env` controls **credentials, watchlist, capital, and loop timing only** — not SMA/RSI/ATR signal thresholds.
+
+#### Ticker-Isolated Execution Parameters (Hardcoded in `config.py`)
+
+| Parameter | NVDA | PLTR | DEFAULT (AAPL) | Description |
+|---|---|---|---|---|
+| `sma_period` | 10 | 10 | 20 | Short SMA — Golden/Death cross window |
+| `rsi_buy_threshold` | 45 | 50 | 55 | Minimum RSI for BUY authorization |
+| `volume_threshold` | 1.0 | 1.2 | 1.5 | Volume surge multiplier vs. 20-day avg |
+| `atr_multiplier` | 3.0 | 2.5 | 2.0 | Trailing stop width ($\text{ATR} \times \text{mult}$) |
+| `use_trend_filter` | True | False | True | Enable 50-day SMA regime gate + conditional RSI exit |
+| `sma_long_period` | 50 | 50 | 50 | Fixed macro regime baseline (not ticker-tuned) |
+| `rsi_exit_threshold` | 50 | 50 | 50 | RSI crossdown level (conditionally applied) |
+
+#### Shared Infrastructure Constants
+
+| Parameter | Value | Description |
 |---|---|---|
-| `sma_period` | **10** | Moving average window for trend breakout execution signals |
-| `ANALYTICS_SMA_PERIOD` | **20** | Independent baseline window for `[METRICS]` logging disconnect |
-| `rsi_period` | **14** | Lookback window mapping momentum calculations (Wilder smoothing) |
-| `rsi_buy_threshold` | **50** | Minimum momentum score required to clear entry authorization |
-| `rsi_sell_threshold` / `rsi_upper_limit` | **70** | Structural ceiling threshold mapping Crossdown exit evaluations |
-| `rsi_exit_mode` | **crossdown** | Verified crossdown — not blind >70 threshold |
-| `atr_period` | **14** | Lookback window smoothing true range variance arrays |
-| `atr_multiplier` | **2.0** | Volatility standard multiplier for dynamic floor boundaries |
-| `volume_sma_period` | **20** | Institutional liquidity baseline window mapping |
-| `volume_threshold` | **1.2** | Multiplier requiring a 20% volume surge above baseline for BUY signals |
+| `rsi_period` | **14** | Wilder-smoothed RSI lookback |
+| `atr_period` | **14** | Wilder-smoothed ATR lookback |
+| `volume_sma_period` | **20** | Institutional liquidity baseline window |
 | `use_trailing_stop` | **true** | Enable dynamic ATR trailing stop (Step 1 prior-floor check) |
-| `commission_rate` | **0.001** | Transaction friction constant applied to backtest runs (0.1%) |
-| `min_data_bars` | **22** | Minimum baseline lookback window required to activate processing loops |
+| `commission_rate` | **0.001** | Transaction friction for backtest runs (0.1%) |
+| `min_data_bars` | **22** | Minimum lookback to activate processing loops |
+| `ANALYTICS_SMA_PERIOD` | **20** | Independent $\text{SMA}_{20}$ for `[METRICS]` telemetry only |
+
+#### Environment Parameters (`.env` — Non-Signal)
+
+| Parameter | Default | Description |
+|---|---|---|
 | `CAPITAL_AT_RISK` | **10000** | Deployable capital for dual-clamp sizing (USD) |
 | `RISK_PER_TRADE` | **0.01** | Per-trade risk fraction (1%) |
+| `WATCHLIST` | `NVDA,PLTR,AAPL` | Comma-separated ticker list |
 | `TARGET_BARS` | **756** | Rolling historical window (3 × 252 trading days) |
 | `LOOP_COOLDOWN_SECONDS` | **60** | Open-session inter-cycle pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | **3600** | Closed-session extended sleep |
@@ -611,14 +826,7 @@ LOOP_COOLDOWN_SECONDS=60
 TICKER_SLEEP_SECONDS=1
 MARKET_CLOSED_SLEEP_SECONDS=3600
 
-# Optional strategy overrides
-SMA_PERIOD=10
-RSI_PERIOD=14
-ATR_PERIOD=14
-ATR_MULTIPLIER=2.0
-VOLUME_THRESHOLD=1.2
-RSI_EXIT_MODE=crossdown
-RSI_UPPER_LIMIT=70
+# Signal parameters are NOT configured here — see config.py (StrategyConfigMapper)
 ```
 
 The system automatically triggers `load_dotenv(override=True)` to ensure localized parameter configurations take absolute precedence over stale shell environments.
@@ -948,17 +1156,19 @@ Signal evaluation runs independently per ticker according to strict descending c
 | Priority | Signal Code | Terminal Banner | Trigger Condition |
 |---|---|---|---|
 | **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{Low}_t \le \text{Trigger Floor}_{t-1}$ — **any hour if positioned** |
-| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 3: Death Cross OR RSI crossdown — **regular hours (09:30–16:00 ET) + new bar** |
-| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross AND RSI ≥ 50 AND Volume Gate — **regular hours + new bar** |
+| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Death Cross (unconditional) OR RSI crossdown (< 50, regime-conditional) — **regular hours + new bar** |
+| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross + RSI gate + Volume gate + Trend filter (`Close > SMA_LONG` OR `SMA_SHORT > SMA_LONG` when enabled) — **regular hours + new bar** |
 | **4** | `HOLD` | `[METRICS] ... Signal: HOLD` | Default; BUY blocked on liquidity fail or crossover suppression |
 
 ### Dynamic ATR Stop Formula
 
 ```
-Dynamic Stop Distance   = ATR(14) × 2.0
+Dynamic Stop Distance   = ATR(14) × atr_multiplier   # ticker-isolated (2.0 / 2.5 / 3.0)
 Prior Trigger Floor     = Peak_{t-1} − Dynamic Stop Distance_{t-1}
 Liquidation (Step 1)    = Low_t ≤ Prior Trigger Floor
 Post-Survival (Step 2)  = Peak_t = max(Peak_{t-1}, Close_t); recalculate floor
+RSI Exit (Step 3)       = RSI crossdown through 50 — ONLY if use_trend_filter=False OR Close < SMA_LONG
+Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 ```
 
 ---
@@ -969,9 +1179,10 @@ Post-Survival (Step 2)  = Peak_t = max(Peak_{t-1}, Close_t); recalculate floor
 
 | Source | Role |
 |---|---|
-| `.env` | Local secrets and overrides (never committed) |
+| `.env` | KIS credentials, watchlist, capital, loop timing (never committed) |
 | `.env.example` | Safe template with placeholders |
-| `StrategyConfig.from_env()` | Typed strategy parameter loader |
+| `config.py` | **`StrategyConfigMapper`** — ticker-isolated signal parameter matrix |
+| `StrategyConfigMapper.for_ticker()` | Resolves `TickerConfig` → `StrategyConfig` per symbol |
 
 `.gitignore` excludes: `.env`, `kis_token_cache.json`, `trading_state.json`, `project_metrics.log`, `__pycache__/`
 
@@ -996,24 +1207,17 @@ Post-Survival (Step 2)  = Peak_t = max(Peak_{t-1}, Close_t); recalculate floor
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
 | `TICKER_SLEEP_SECONDS` | No | `1` | Inter-ticker pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | No | `3600` | Holiday/weekend sleep |
-| `SMA_PERIOD` | No | `10` | Trend filter period |
-| `RSI_PERIOD` | No | `14` | RSI lookback |
-| `ATR_PERIOD` | No | `14` | ATR lookback |
-| `VOLUME_SMA_PERIOD` | No | `20` | Volume SMA period |
-| `ATR_MULTIPLIER` | No | `2.0` | Trailing stop multiplier |
-| `RSI_BUY_THRESHOLD` | No | `50` | BUY RSI minimum |
-| `RSI_UPPER_LIMIT` | No | `70` | Crossdown threshold |
-| `VOLUME_THRESHOLD` | No | `1.2` | Liquidity surge multiplier |
-| `RSI_EXIT_MODE` | No | `crossdown` | `crossdown` or `threshold` |
-| `USE_TRAILING_STOP` | No | `true` | Enable ATR trailing stop |
-| `EXECUTION_MODE` | No | `eod` | Execution timing mode |
+
+> **Deprecated for signal generation:** `SMA_PERIOD`, `ATR_MULTIPLIER`, `RSI_BUY_THRESHOLD`, `VOLUME_THRESHOLD`, `RSI_EXIT_MODE`, and related strategy keys in `.env` are **ignored**. Edit `config.py` to change execution parameters.
 
 ### Loading Chain
 
 ```
 .env  →  load_dotenv(override=True)
            ├─ WATCHLIST, CAPITAL_AT_RISK, RISK_PER_TRADE, loop timing
-           └─ StrategyConfig.from_env() → LiveSignalEngine + strategy.py parity
+           └─ config.py → StrategyConfigMapper.for_ticker(ticker)
+                ├─ LiveSignalEngine(ticker)     [live]
+                └─ TrendTradingStrategy(ticker)  [backtest]
 ```
 
 ---
@@ -1022,10 +1226,12 @@ Post-Survival (Step 2)  = Peak_t = max(Peak_{t-1}, Close_t); recalculate floor
 
 ```
 Toss Trading Bot/
-├── main.py                 # KIS orchestrator, MarketDataCache, holiday gate, state-gated orders, [METRICS]
-├── analytics.py            # LiveSignalEngine, dual-clamp sizing, NY calendar, regular-hours gate, 3-step bar eval
-├── strategy.py             # Backtrader SmaCross — look-ahead-free trailing + RSI crossdown parity
-├── test_analytics.py       # Engine verification suite (3-step transition tests)
+├── main.py                 # KIS orchestrator, per-ticker LiveSignalEngine, state-gated orders, [METRICS]
+├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
+├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing
+├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates
+├── run_backtest.py         # Historical backtest runner (per-ticker isolated regimes)
+├── test_analytics.py       # Engine verification (trend filter + conditional RSI tests)
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Configuration template (copy to .env)
 ├── .gitignore              # Excludes .env, kis_token_cache.json, trading_state.json

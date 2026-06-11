@@ -24,6 +24,7 @@ import backtrader as bt
 import pandas as pd
 from dotenv import load_dotenv
 
+from config import StrategyConfigMapper
 from strategy import (
     DEFAULT_COMMISSION_RATE,
     create_backtest_cerebro,
@@ -84,6 +85,7 @@ def run_single_backtest(
 ) -> dict:
     feed = bt.feeds.PandasData(dataname=df)
     cerebro = create_backtest_cerebro(
+        ticker=ticker,
         initial_cash=initial_cash,
         commission_rate=commission_rate,
     )
@@ -176,7 +178,7 @@ def print_results_table(rows: list[dict], initial_cash: float) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run SmaCross backtests on local daily CSV files."
+        description="Run TrendTradingStrategy backtests on local daily CSV files."
     )
     parser.add_argument(
         "--tickers",
@@ -236,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Running {ticker} - {len(df)} bars "
             f"({df.index[0].date()} -> {df.index[-1].date()})"
+        )
+        cfg = StrategyConfigMapper.for_ticker(ticker)
+        print(
+            f"  Regime: SMA={cfg.sma_period} RSI>={cfg.rsi_buy_threshold:.0f} "
+            f"ATR={cfg.atr_multiplier:.1f} TrendFilter={cfg.use_trend_filter}"
         )
         results.append(
             run_single_backtest(

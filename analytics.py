@@ -1,63 +1,63 @@
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Literal
+from typing import Any
 
 import pandas as pd
 import pytz
 
-ExecutionMode = Literal["eod", "next_open"]
-RsiExitMode = Literal["threshold", "crossdown"]
+from config import StrategyConfig, StrategyConfigMapper
+
+StrategyConfigRegistry = StrategyConfigMapper
 
 NY_TZ = pytz.timezone("America/New_York")
 US_REGULAR_MARKET_OPEN = time(hour=9, minute=30)
 US_REGULAR_MARKET_CLOSE = time(hour=16, minute=0)
 
 
-@dataclass(frozen=True)
-class StrategyConfig:
-    sma_period: int = 10
-    rsi_period: int = 14
-    atr_period: int = 14
-    volume_sma_period: int = 20
-    atr_multiplier: float = 2.0
-    rsi_buy_threshold: float = 50.0
-    rsi_upper_limit: float = 70.0
-    volume_threshold: float = 1.2
-    use_trailing_stop: bool = True
-    rsi_exit_mode: RsiExitMode = "crossdown"
-    execution_mode: ExecutionMode = "eod"
+class IndicatorAnalytics:
+    """
+    Stateless dual-moving-average indicator pipeline.
 
-    @classmethod
-    def from_env(cls, base: StrategyConfig | None = None) -> StrategyConfig:
-        """Build strategy config with optional environment overrides."""
-        seed = base or cls()
-        return cls(
-            sma_period=int(os.getenv("SMA_PERIOD", str(seed.sma_period))),
-            rsi_period=int(os.getenv("RSI_PERIOD", str(seed.rsi_period))),
-            atr_period=int(os.getenv("ATR_PERIOD", str(seed.atr_period))),
-            volume_sma_period=int(
-                os.getenv("VOLUME_SMA_PERIOD", str(seed.volume_sma_period))
-            ),
-            atr_multiplier=float(
-                os.getenv("ATR_MULTIPLIER", str(seed.atr_multiplier))
-            ),
-            rsi_buy_threshold=float(
-                os.getenv("RSI_BUY_THRESHOLD", str(seed.rsi_buy_threshold))
-            ),
-            rsi_upper_limit=float(
-                os.getenv("RSI_UPPER_LIMIT", str(seed.rsi_upper_limit))
-            ),
-            volume_threshold=float(
-                os.getenv("VOLUME_THRESHOLD", str(seed.volume_threshold))
-            ),
-            use_trailing_stop=os.getenv("USE_TRAILING_STOP", "true").lower()
-            in {"1", "true", "yes"},
-            rsi_exit_mode=os.getenv("RSI_EXIT_MODE", seed.rsi_exit_mode),  # type: ignore[arg-type]
-            execution_mode=os.getenv("EXECUTION_MODE", seed.execution_mode),  # type: ignore[arg-type]
+    populate_indicators() accepts the ticker-isolated sma_period from the strategy
+    layer and always computes sma_long (50-day regime baseline) alongside RSI,
+    ATR, and volume MA.
+    """
+
+    @staticmethod
+    def populate_indicators(
+        df: pd.DataFrame,
+        config: StrategyConfig,
+    ) -> pd.DataFrame:
+        """
+        Augment OHLCV with short SMA, long SMA, RSI, ATR, Volume SMA.
+
+        SMA_SHORT window = config.sma_period (ticker-isolated entry/exit cross).
+        SMA_LONG  window = config.sma_long_period (fixed 50-day regime filter).
+        """
+        enriched = df.copy()
+        enriched["SMA_SHORT"] = calculate_sma(enriched, config.sma_period)
+        enriched["SMA_LONG"] = calculate_sma(enriched, config.sma_long_period)
+        enriched["RSI"] = calculate_rsi(enriched, config.rsi_period)
+        enriched["ATR"] = calculate_atr(enriched, config.atr_period)
+        enriched["Volume_SMA"] = calculate_sma(
+            enriched,
+            config.volume_sma_period,
+            column="Volume",
         )
+
+        if enriched.isna().any().any():
+            lookback = max(
+                config.sma_period,
+                config.sma_long_period,
+                config.rsi_period,
+                config.atr_period,
+                config.volume_sma_period,
+            )
+            enriched = enriched.iloc[lookback:].dropna().reset_index(drop=True)
+
+        return enriched
 
 
 @dataclass
@@ -111,10 +111,16 @@ class BarSnapshot:
     low: float
     close: float
     volume: float
-    sma: float
+    sma_short: float
+    sma_long: float
     rsi: float
     atr: float
     volume_sma: float
+
+    @property
+    def sma(self) -> float:
+        """Alias for sma_short — preserves legacy telemetry consumers."""
+        return self.sma_short
 
     @classmethod
     def from_row(cls, row: pd.Series) -> BarSnapshot:
@@ -125,7 +131,8 @@ class BarSnapshot:
             low=float(row["Low"]),
             close=float(row["Close"]),
             volume=float(row["Volume"]),
-            sma=float(row["SMA"]),
+            sma_short=float(row["SMA_SHORT"]),
+            sma_long=float(row["SMA_LONG"]),
             rsi=float(row["RSI"]),
             atr=float(row["ATR"]),
             volume_sma=float(row["Volume_SMA"]),
@@ -139,17 +146,13 @@ class BarSnapshot:
             "low": self.low,
             "close": self.close,
             "volume": self.volume,
-            "sma": self.sma,
+            "sma": self.sma_short,
+            "sma_short": self.sma_short,
+            "sma_long": self.sma_long,
             "rsi": self.rsi,
             "atr": self.atr,
             "volume_sma": self.volume_sma,
         }
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    return float(value)
 
 
 def _format_bar_date(value: Any) -> str:
@@ -193,24 +196,10 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def enrich_with_indicators(
     df: pd.DataFrame,
-    sma_period: int,
-    rsi_period: int,
-    atr_period: int,
-    volume_sma_period: int,
+    config: StrategyConfig,
 ) -> pd.DataFrame:
-    enriched = df.copy()
-    enriched["SMA"] = calculate_sma(enriched, sma_period)
-    enriched["RSI"] = calculate_rsi(enriched, rsi_period)
-    enriched["ATR"] = calculate_atr(enriched, atr_period)
-    enriched["Volume_SMA"] = calculate_sma(
-        enriched, volume_sma_period, column="Volume"
-    )
-
-    if enriched.isna().any().any():
-        lookback = max(sma_period, rsi_period, atr_period, volume_sma_period)
-        enriched = enriched.iloc[lookback:].dropna().reset_index(drop=True)
-
-    return enriched
+    """Backward-compatible wrapper delegating to IndicatorAnalytics."""
+    return IndicatorAnalytics.populate_indicators(df, config)
 
 
 def calculate_position_size(
@@ -310,9 +299,9 @@ def _to_ny_datetime(current_dt: datetime | None) -> datetime:
 
 def is_us_regular_market_hours(current_dt: datetime | None = None) -> bool:
     """
-    True during NYSE regular session: Mon–Fri 09:30–16:00 America/New_York.
+    True during NYSE regular session: Mon-Fri 09:30-16:00 America/New_York.
 
-    Uses pytz for DST transitions — no hardcoded Korea/local offset math.
+    Uses pytz for DST transitions - no hardcoded Korea/local offset math.
     """
     ny_dt = _to_ny_datetime(current_dt)
 
@@ -363,31 +352,32 @@ def should_allow_crossover_signals(
 
 class LiveSignalEngine:
     """
-    Unified live signal engine with shared bar-level decision logic.
+    Ticker-bound live signal engine with regime-isolated configuration.
 
-    Execution assumption: EOD signal generation on completed daily bars.
-    Intraday cycles may re-evaluate Priority-1 DYNAMIC_ATR_SELL using the
-    session low sequence (Low_t <= floor) without re-firing crossover entries.
+    Entry (all required):
+      Golden Cross AND RSI >= rsi_buy_threshold AND Volume > threshold * Volume_SMA
+      AND (if use_trend_filter: Close > sma_long OR sma_short > sma_long)
+
+    Exit priority when positioned:
+      1. DYNAMIC_ATR_SELL (prior trigger_floor vs bar low)
+      2. Death Cross (unconditional emergency exit)
+      3. RSI crossdown through rsi_exit_threshold (50) — conditional:
+         - use_trend_filter=False: always eligible (breakout regime)
+         - use_trend_filter=True: only when Close < sma_long (weak/bearish regime)
     """
 
-    def __init__(self, config: StrategyConfig | None = None) -> None:
-        self.config = config or StrategyConfig()
+    def __init__(self, ticker: str, config: StrategyConfig | None = None) -> None:
+        self.ticker = ticker.strip().upper()
+        self.config = config or StrategyConfigMapper.for_ticker(self.ticker)
 
     def enrich(self, df: pd.DataFrame) -> pd.DataFrame:
-        cfg = self.config
-        enriched = enrich_with_indicators(
-            df,
-            cfg.sma_period,
-            cfg.rsi_period,
-            cfg.atr_period,
-            cfg.volume_sma_period,
-        )
+        enriched = IndicatorAnalytics.populate_indicators(df, self.config)
         if len(enriched) < 2:
             raise ValueError("Insufficient data length for signal evaluation.")
         return enriched
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute SMA, RSI, ATR, and Volume SMA using Wilder smoothing where applicable."""
+        """Compute short SMA, 50-day SMA, RSI, ATR, and Volume SMA."""
         return self.enrich(df)
 
     def load_state(self, payload: dict[str, Any] | None) -> PositionState:
@@ -401,8 +391,7 @@ class LiveSignalEngine:
         return state.in_position or state.held_quantity > 0
 
     def _passes_volume_filter(self, volume: float, volume_sma: float) -> bool:
-        threshold = self.config.volume_threshold
-        return volume > volume_sma * threshold
+        return volume > volume_sma * self.config.volume_threshold
 
     def _golden_cross(
         self, close: float, sma: float, prev_close: float, prev_sma: float
@@ -417,17 +406,42 @@ class LiveSignalEngine:
     def _rsi_allows_entry(self, rsi: float) -> bool:
         return rsi >= self.config.rsi_buy_threshold
 
-    def _rsi_triggers_exit(self, rsi: float, prev_rsi: float) -> bool:
+    def _passes_trend_filter(self, bar: BarSnapshot) -> bool:
         """
-        RSI exit criteria (default crossdown mode).
+        Regime gate for entries when use_trend_filter=True.
 
-        crossdown: RSI_{t-1} >= upper_limit and RSI_t < upper_limit
-        threshold: RSI_t > upper_limit
+        Permits entry when price is above the 50-day baseline OR short SMA is
+        above the 50-day baseline — captures strong trends before full price
+        confirmation while blocking counter-trend whipsaws.
         """
-        upper = self.config.rsi_upper_limit
-        if self.config.rsi_exit_mode == "threshold":
-            return rsi > upper
-        return prev_rsi >= upper and rsi < upper
+        if not self.config.use_trend_filter:
+            return True
+        return bar.close > bar.sma_long or bar.sma_short > bar.sma_long
+
+    def _in_weak_regime(self, bar: BarSnapshot) -> bool:
+        """Weak/bearish regime: current_close < sma_long."""
+        return bar.close < bar.sma_long
+
+    def _rsi_crossdown_exit(self, rsi: float, prev_rsi: float) -> bool:
+        """
+        RSI crossdown exit at rsi_exit_threshold (default 50).
+
+        Triggers when RSI_{t-1} >= threshold AND RSI_t < threshold.
+        """
+        threshold = self.config.rsi_exit_threshold
+        return prev_rsi >= threshold and rsi < threshold
+
+    def _rsi_exit_allowed(self, bar: BarSnapshot) -> bool:
+        """
+        Conditional RSI exit gate (whipsaw protection during bull runs).
+
+        - use_trend_filter=False (PLTR): RSI crossdown always eligible.
+        - use_trend_filter=True (NVDA/DEFAULT): RSI crossdown only in weak regime
+          (current_close < sma_long). Death cross remains unconditional.
+        """
+        if not self.config.use_trend_filter:
+            return True
+        return self._in_weak_regime(bar)
 
     def _update_trailing_state(
         self, state: PositionState, close: float, atr: float
@@ -532,9 +546,7 @@ class LiveSignalEngine:
         Position-active sequence (no look-ahead):
           1. ATR stop vs prior trigger_floor and current low
           2. Update trailing peak/floor with close only after survival
-          3. Death cross or RSI exit evaluation
-
-        When allow_crossover is False, only steps 1-2 run for open positions.
+          3. Death cross (unconditional) or conditional RSI crossdown exit
         """
         liquidity_ok = self._passes_volume_filter(bar.volume, bar.volume_sma)
         effective_low = session_low if session_low is not None else bar.low
@@ -579,9 +591,13 @@ class LiveSignalEngine:
                 }
 
             cross_below = self._death_cross(
-                bar.close, bar.sma, prev_bar.close, prev_bar.sma
+                bar.close, bar.sma_short, prev_bar.close, prev_bar.sma_short
             )
-            if cross_below or self._rsi_triggers_exit(bar.rsi, prev_bar.rsi):
+            rsi_exit = (
+                self._rsi_exit_allowed(bar)
+                and self._rsi_crossdown_exit(bar.rsi, prev_bar.rsi)
+            )
+            if cross_below or rsi_exit:
                 if mutate_state:
                     state.in_position = False
                     state.held_quantity = 0
@@ -614,36 +630,41 @@ class LiveSignalEngine:
             }
 
         cross_above = self._golden_cross(
-            bar.close, bar.sma, prev_bar.close, prev_bar.sma
+            bar.close, bar.sma_short, prev_bar.close, prev_bar.sma_short
         )
-        if cross_above and self._rsi_allows_entry(bar.rsi):
-            if liquidity_ok:
-                if mutate_state:
-                    state.in_position = True
-                    state.highest_price_achieved = bar.close
-                    self._update_trailing_state(state, bar.close, bar.atr)
-                return {
-                    "signal": "BUY",
-                    "dynamic_atr_stop": None,
-                    "liquidity_ok": True,
-                    "state": (
-                        state.to_dict()
-                        if mutate_state
-                        else working_state.to_dict()
-                    ),
-                }
+        trend_ok = self._passes_trend_filter(bar)
+        if (
+            cross_above
+            and self._rsi_allows_entry(bar.rsi)
+            and liquidity_ok
+            and trend_ok
+        ):
+            if mutate_state:
+                state.in_position = True
+                state.highest_price_achieved = bar.close
+                self._update_trailing_state(state, bar.close, bar.atr)
             return {
-                "signal": "HOLD",
+                "signal": "BUY",
                 "dynamic_atr_stop": None,
-                "liquidity_ok": False,
-                "liquidity_blocked": True,
-                "state": working_state.to_dict(),
+                "liquidity_ok": True,
+                "state": (
+                    state.to_dict()
+                    if mutate_state
+                    else working_state.to_dict()
+                ),
             }
+
+        hold_reason: dict[str, Any] = {}
+        if cross_above and self._rsi_allows_entry(bar.rsi) and not liquidity_ok:
+            hold_reason["liquidity_blocked"] = True
+        elif cross_above and self._rsi_allows_entry(bar.rsi) and not trend_ok:
+            hold_reason["trend_filter_blocked"] = True
 
         return {
             "signal": "HOLD",
             "dynamic_atr_stop": None,
             "liquidity_ok": liquidity_ok,
+            **hold_reason,
             "state": working_state.to_dict(),
         }
 
@@ -822,6 +843,12 @@ class LiveSignalEngine:
             "regular_market_hours": regular_market_hours,
             "market_open": regular_market_hours,
             "state_snapshot": self.dump_state(position_state),
+            "ticker_config": {
+                "ticker": self.config.ticker,
+                "sma_period": self.config.sma_period,
+                "atr_multiplier": self.config.atr_multiplier,
+                "use_trend_filter": self.config.use_trend_filter,
+            },
         }
 
     def apply_post_order_transition(
@@ -888,19 +915,9 @@ def passes_volume_filter(
 
 def extract_latest_metrics(
     df: pd.DataFrame,
-    sma_period: int,
-    rsi_period: int,
-    atr_period: int,
-    volume_sma_period: int,
+    ticker: str,
 ) -> dict:
-    engine = LiveSignalEngine(
-        StrategyConfig(
-            sma_period=sma_period,
-            rsi_period=rsi_period,
-            atr_period=atr_period,
-            volume_sma_period=volume_sma_period,
-        )
-    )
+    engine = LiveSignalEngine(ticker)
     enriched = engine.enrich(df)
     today = BarSnapshot.from_row(enriched.iloc[-1])
     yesterday = BarSnapshot.from_row(enriched.iloc[-2])
@@ -912,29 +929,11 @@ def extract_latest_metrics(
 
 def derive_position_state(
     df: pd.DataFrame,
-    sma_period: int,
-    rsi_period: int,
-    atr_period: int,
-    volume_sma_period: int,
-    atr_multiplier: float,
-    rsi_buy_threshold: float,
-    rsi_sell_threshold: float,
+    ticker: str,
     end_index: int | None = None,
-    volume_threshold: float = 1.2,
     external_state: dict[str, Any] | None = None,
 ) -> dict:
-    engine = LiveSignalEngine(
-        StrategyConfig(
-            sma_period=sma_period,
-            rsi_period=rsi_period,
-            atr_period=atr_period,
-            volume_sma_period=volume_sma_period,
-            atr_multiplier=atr_multiplier,
-            rsi_buy_threshold=rsi_buy_threshold,
-            rsi_upper_limit=rsi_sell_threshold,
-            volume_threshold=volume_threshold,
-        )
-    )
+    engine = LiveSignalEngine(ticker)
     enriched = engine.enrich(df)
     state = engine.replay_state(
         enriched,
@@ -947,21 +946,9 @@ def derive_position_state(
 def evaluate_live_signal(
     metrics: dict,
     position_state: dict,
-    atr_multiplier: float = 2.0,
-    rsi_buy_threshold: float = 50,
-    rsi_sell_threshold: float = 70,
-    volume_threshold: float = 1.2,
-    rsi_exit_mode: RsiExitMode = "crossdown",
+    ticker: str,
 ) -> dict:
-    engine = LiveSignalEngine(
-        StrategyConfig(
-            atr_multiplier=atr_multiplier,
-            rsi_buy_threshold=rsi_buy_threshold,
-            rsi_upper_limit=rsi_sell_threshold,
-            volume_threshold=volume_threshold,
-            rsi_exit_mode=rsi_exit_mode,
-        )
-    )
+    engine = LiveSignalEngine(ticker)
 
     today = BarSnapshot(
         date=metrics["today"]["date"],
@@ -970,7 +957,8 @@ def evaluate_live_signal(
         low=float(metrics["today"].get("low", metrics["today"]["close"])),
         close=float(metrics["today"]["close"]),
         volume=float(metrics["today"]["volume"]),
-        sma=float(metrics["today"]["sma"]),
+        sma_short=float(metrics["today"]["sma_short"]),
+        sma_long=float(metrics["today"]["sma_long"]),
         rsi=float(metrics["today"]["rsi"]),
         atr=float(metrics["today"]["atr"]),
         volume_sma=float(metrics["today"]["volume_sma"]),
@@ -982,7 +970,8 @@ def evaluate_live_signal(
         low=float(metrics["yesterday"].get("low", metrics["yesterday"]["close"])),
         close=float(metrics["yesterday"]["close"]),
         volume=float(metrics["yesterday"]["volume"]),
-        sma=float(metrics["yesterday"]["sma"]),
+        sma_short=float(metrics["yesterday"]["sma_short"]),
+        sma_long=float(metrics["yesterday"]["sma_long"]),
         rsi=float(metrics["yesterday"]["rsi"]),
         atr=float(metrics["yesterday"]["atr"]),
         volume_sma=float(metrics["yesterday"]["volume_sma"]),
