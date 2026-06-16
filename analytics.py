@@ -75,6 +75,12 @@ class PositionState:
     latest_bar_date: str | None = None
     held_quantity: int = 0
     last_failed_order_key: str | None = None
+    open_order_id: str | None = None
+    open_order_side: str | None = None
+    open_order_qty: int = 0
+    open_order_price: float | None = None
+    open_order_submitted_at: str | None = None
+    open_order_filled_qty: int = 0
     session_low: float | None = None
     highest_price_achieved: float | None = None
     current_atr: float | None = None
@@ -101,6 +107,19 @@ class PositionState:
             filtered["in_position"] = bool(filtered["in_position"])
         if "pending_order" in filtered:
             filtered["pending_order"] = bool(filtered["pending_order"])
+        if "open_order_qty" in filtered:
+            filtered["open_order_qty"] = int(filtered["open_order_qty"] or 0)
+        if "open_order_filled_qty" in filtered:
+            filtered["open_order_filled_qty"] = int(
+                filtered["open_order_filled_qty"] or 0
+            )
+        if "open_order_price" in filtered and filtered["open_order_price"] not in (
+            None,
+            "",
+        ):
+            filtered["open_order_price"] = float(filtered["open_order_price"])
+        elif "open_order_price" in filtered:
+            filtered["open_order_price"] = None
         return cls(**filtered)
 
 
@@ -1028,20 +1047,22 @@ class LiveSignalEngine:
     ) -> None:
         """Mutate runtime registry after a confirmed KIS order (rt_cd == 0)."""
         if signal == "BUY":
-            runtime.in_position = True
+            runtime.in_position = filled_quantity > 0
             runtime.held_quantity = filled_quantity
             runtime.pending_order = False
             runtime.last_processed_date = current_bar_date
             return
 
         if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
-            runtime.in_position = False
-            runtime.held_quantity = 0
-            runtime.highest_price_achieved = None
-            runtime.current_atr = None
-            runtime.dynamic_stop_distance = None
-            runtime.trigger_floor = None
-            runtime.session_low = None
+            remaining = max(int(runtime.held_quantity) - int(filled_quantity), 0)
+            runtime.in_position = remaining > 0
+            runtime.held_quantity = remaining
+            if remaining <= 0:
+                runtime.highest_price_achieved = None
+                runtime.current_atr = None
+                runtime.dynamic_stop_distance = None
+                runtime.trigger_floor = None
+                runtime.session_low = None
             runtime.pending_order = False
             runtime.last_processed_date = current_bar_date
             return

@@ -1598,6 +1598,33 @@ During live integration deployment, several severe sandbox anomalies within the 
 - **Symptom**: Same-bar BUY/SELL retried every 60 seconds after rejection, flooding logs and marking cycles `FAILED`.
 - **Resolution**: `PositionState.last_failed_order_key` stores `{signal}:{bar_date}` on rejection. Subsequent attempts on the same bar log `[ORDER/SKIP]` and return `HOLD` without raising. Rejections log `[ORDER/REJECTED]` — cycle summary stays `HOLD`, not `FAILED`.
 
+### Incident 7: rt_cd=0 Treated as Immediate Fill (Phase 6)
+
+- **Symptom**: Limit orders accepted (`rt_cd=0`) updated `held_quantity` before any shares filled — phantom positions and invalid SELL attempts.
+- **Resolution**: `execution_engine.py` + `OrderFillMonitor` poll KIS `inquire-ccnl` / `inquire-nccs` (`VTTS3035R` / `VTTS3018R` on VTS). State mutates only after confirmed fills (including partial). Events append to `trade_log.csv`.
+
+---
+
+## Phase 6: Fill Verification, Trade Log, and Risk Gates
+
+Production loop order:
+
+```
+reconcile -> fill poll -> RTH/risk/data gates -> dispatch (accept only) -> fill poll -> trade_log.csv
+```
+
+| Component | File | Purpose |
+|---|---|---|
+| `OrderFillMonitor` | `execution_engine.py` | Poll ccnl/nccs; partial fill support; stale `pending_order` release |
+| `TradeLogWriter` | `execution_engine.py` | Append `trade_log.csv` audit trail |
+| `RiskGuard` | `execution_engine.py` | `MAX_DAILY_LOSS_USD`, `MAX_OPEN_POSITIONS`, `MAX_TICKER_EXPOSURE_USD` |
+| RTH open/close BUY block | `execution_engine.py` | Block new BUY 09:30–09:40 ET and last 5m before close |
+| yfinance BUY block | `main.py` | Fallback OHLCV may inform HOLD/SELL only — **never new BUY** |
+
+**Trade log columns:** `timestamp,ticker,signal,qty,order_price,fill_price,status,reason,cash_after,held_qty`
+
+**Statuses:** `ACCEPTED`, `PARTIAL`, `FILLED`, `REJECTED`, `RELEASED`
+
 ---
 
 ## Appendix B: Signal Priority & Execution Rules
@@ -1660,7 +1687,15 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `MARKET_CLOSED_SLEEP_SECONDS` | No | `3600` | Holiday/weekend sleep |
 | `USE_SPY_MARKET_FILTER` | No | `true` | Block BUY when SPY ≤ 200MA |
 | `KIS_ORDER_TYPE` | No | `limit` on VTS URL | `limit` or `market` |
-| `KIS_LIMIT_PRICE_BUFFER_BPS` | No | `10` | Limit price buffer vs reference close |
+| `KIS_LIMIT_PRICE_BUFFER_BPS` | No | `10` | Default limit buffer vs reference close |
+| `KIS_HIGH_VOL_LIMIT_BUFFER_BPS` | No | `15` | NVDA/TSLA/PLTR/CRWD/AMD/META buffer |
+| `TRADE_LOG_FILE` | No | `./trade_log.csv` | Append-only execution audit log |
+| `MAX_DAILY_LOSS_USD` | No | `100` | Block new BUY when day P&L exceeds limit |
+| `MAX_OPEN_POSITIONS` | No | `3` | Max simultaneous held tickers |
+| `MAX_TICKER_EXPOSURE_USD` | No | `1000` | Max notional per new BUY |
+| `RTH_BUY_BLOCK_OPEN_MINUTES` | No | `10` | No new BUY after 09:30 ET open |
+| `RTH_BUY_BLOCK_CLOSE_MINUTES` | No | `5` | No new BUY before 16:00 ET close |
+| `PENDING_ORDER_STALE_MINUTES` | No | `120` | Release pending lock if zero fill |
 
 > **Deprecated for signal generation:** `SMA_PERIOD`, `ATR_MULTIPLIER`, `RSI_BUY_THRESHOLD`, `VOLUME_THRESHOLD`, `RSI_EXIT_MODE`, and related strategy keys in `.env` are **ignored**. Edit `config.py` to change execution parameters.
 

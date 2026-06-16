@@ -3,4 +3,5 @@ kis_token_cache.json
 __pycache__/
 *.pyc
 project_metrics.log
+trade_log.csv
 trading_state.json

@@ -1,0 +1,561 @@
+"""
+Live execution hardening: fill verification, trade logging, and risk gates.
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+
+from analytics import PositionState, _to_ny_datetime
+from market_registry import MARKET_META
+
+TRADE_LOG_COLUMNS = (
+    "timestamp",
+    "ticker",
+    "signal",
+    "qty",
+    "order_price",
+    "fill_price",
+    "status",
+    "reason",
+    "cash_after",
+    "held_qty",
+)
+
+HIGH_VOL_TICKERS = frozenset({"NVDA", "TSLA", "PLTR", "CRWD", "AMD", "META"})
+
+
+@dataclass
+class ExecutionSettings:
+    max_daily_loss_usd: float
+    max_open_positions: int
+    max_ticker_exposure_usd: float
+    rth_buy_block_open_minutes: int
+    rth_buy_block_close_minutes: int
+    pending_order_stale_minutes: int
+    default_limit_buffer_bps: float
+    high_vol_limit_buffer_bps: float
+
+    @classmethod
+    def from_env(cls) -> ExecutionSettings:
+        return cls(
+            max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "100")),
+            max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
+            max_ticker_exposure_usd=float(os.getenv("MAX_TICKER_EXPOSURE_USD", "1000")),
+            rth_buy_block_open_minutes=int(os.getenv("RTH_BUY_BLOCK_OPEN_MINUTES", "10")),
+            rth_buy_block_close_minutes=int(os.getenv("RTH_BUY_BLOCK_CLOSE_MINUTES", "5")),
+            pending_order_stale_minutes=int(
+                os.getenv("PENDING_ORDER_STALE_MINUTES", "120")
+            ),
+            default_limit_buffer_bps=float(os.getenv("KIS_LIMIT_PRICE_BUFFER_BPS", "10")),
+            high_vol_limit_buffer_bps=float(
+                os.getenv("KIS_HIGH_VOL_LIMIT_BUFFER_BPS", "15")
+            ),
+        )
+
+
+def limit_buffer_bps_for_ticker(ticker: str, settings: ExecutionSettings) -> float:
+    if ticker.upper() in HIGH_VOL_TICKERS:
+        return settings.high_vol_limit_buffer_bps
+    return settings.default_limit_buffer_bps
+
+
+def limit_order_price(
+    side: str, reference_price: float, buffer_bps: float
+) -> float:
+    if reference_price <= 0:
+        raise ValueError("Reference price must be positive for limit orders.")
+    buffer = buffer_bps / 10_000.0
+    if side.upper() == "BUY":
+        return round(reference_price * (1.0 + buffer), 2)
+    return round(reference_price * (1.0 - buffer), 2)
+
+
+def extract_order_odno(payload: dict[str, Any]) -> str | None:
+    output = payload.get("output") or {}
+    if isinstance(output, list):
+        output = output[0] if output else {}
+    if not isinstance(output, dict):
+        return None
+    for key in ("ODNO", "odno", "ORD_NO", "ord_no"):
+        raw = output.get(key)
+        if raw not in (None, ""):
+            return str(raw).strip()
+    return None
+
+
+def clear_open_order(runtime: PositionState) -> None:
+    runtime.pending_order = False
+    runtime.open_order_id = None
+    runtime.open_order_side = None
+    runtime.open_order_qty = 0
+    runtime.open_order_price = None
+    runtime.open_order_submitted_at = None
+    runtime.open_order_filled_qty = 0
+
+
+def assign_open_order(
+    runtime: PositionState,
+    *,
+    odno: str,
+    side: str,
+    qty: int,
+    price: float,
+    submitted_at: str,
+) -> None:
+    runtime.pending_order = True
+    runtime.open_order_id = odno
+    runtime.open_order_side = side
+    runtime.open_order_qty = qty
+    runtime.open_order_price = price
+    runtime.open_order_submitted_at = submitted_at
+    runtime.open_order_filled_qty = 0
+
+
+def ny_today_yyyymmdd(now: datetime | None = None) -> str:
+    return _to_ny_datetime(now).strftime("%Y%m%d")
+
+
+def block_new_buy_rth_window(now: datetime | None, settings: ExecutionSettings) -> str | None:
+    """Return block reason for new BUY during open/close volatility windows."""
+    ny_dt = _to_ny_datetime(now)
+    if ny_dt.weekday() >= 5:
+        return None
+
+    open_minutes = (
+        ny_dt.hour * 60 + ny_dt.minute
+    ) - (9 * 60 + 30)
+    if 0 <= open_minutes < settings.rth_buy_block_open_minutes:
+        return (
+            f"RTH open window (first {settings.rth_buy_block_open_minutes}m after 09:30 ET)"
+        )
+
+    close_minutes = (16 * 60) - (ny_dt.hour * 60 + ny_dt.minute)
+    if 0 < close_minutes <= settings.rth_buy_block_close_minutes:
+        return (
+            f"RTH close window (last {settings.rth_buy_block_close_minutes}m before 16:00 ET)"
+        )
+    return None
+
+
+class TradeLogWriter:
+    def __init__(self, path: str = "./trade_log.csv") -> None:
+        self.path = path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                csv.writer(handle).writerow(TRADE_LOG_COLUMNS)
+
+    def append(
+        self,
+        *,
+        ticker: str,
+        signal: str,
+        qty: int,
+        order_price: float | None,
+        fill_price: float | None,
+        status: str,
+        reason: str,
+        cash_after: float | None,
+        held_qty: int,
+    ) -> None:
+        row = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ticker": ticker,
+            "signal": signal,
+            "qty": qty,
+            "order_price": "" if order_price is None else f"{order_price:.2f}",
+            "fill_price": "" if fill_price is None else f"{fill_price:.2f}",
+            "status": status,
+            "reason": reason,
+            "cash_after": "" if cash_after is None else f"{cash_after:.2f}",
+            "held_qty": held_qty,
+        }
+        with open(self.path, "a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow([row[column] for column in TRADE_LOG_COLUMNS])
+
+
+class RiskGuard:
+    def __init__(self, settings: ExecutionSettings) -> None:
+        self.settings = settings
+
+    def _portfolio_block(self, states: dict[str, Any], now: datetime | None) -> str | None:
+        portfolio = states.get("_portfolio", {})
+        ny_date = _to_ny_datetime(now).strftime("%Y-%m-%d")
+        anchor_date = portfolio.get("daily_pnl_anchor_date")
+        day_start = float(portfolio.get("day_start_equity_usd", 0.0) or 0.0)
+        current = float(portfolio.get("last_equity_usd", day_start) or day_start)
+
+        if anchor_date != ny_date or day_start <= 0:
+            return None
+
+        loss = day_start - current
+        if loss >= self.settings.max_daily_loss_usd:
+            return (
+                f"daily loss limit (${loss:.2f} >= "
+                f"${self.settings.max_daily_loss_usd:.2f})"
+            )
+        return None
+
+    def check_buy_allowed(
+        self,
+        ticker: str,
+        proposed_size: int,
+        entry_price: float,
+        states: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        block = self._portfolio_block(states, now)
+        if block:
+            return block
+
+        open_positions = sum(
+            1
+            for key, payload in states.items()
+            if not str(key).startswith("_")
+            and isinstance(payload, dict)
+            and int(payload.get("held_quantity", 0) or 0) > 0
+        )
+        ticker_state = states.get(ticker, {})
+        already_held = int(ticker_state.get("held_quantity", 0) or 0) > 0
+        if not already_held and open_positions >= self.settings.max_open_positions:
+            return (
+                f"max open positions ({open_positions} >= "
+                f"{self.settings.max_open_positions})"
+            )
+
+        notional = proposed_size * entry_price
+        if notional > self.settings.max_ticker_exposure_usd:
+            return (
+                f"max ticker exposure (${notional:.2f} > "
+                f"${self.settings.max_ticker_exposure_usd:.2f})"
+            )
+        return None
+
+    def update_daily_equity_anchor(
+        self,
+        states: dict[str, Any],
+        portfolio_equity: float,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        portfolio = states.setdefault("_portfolio", {})
+        ny_date = _to_ny_datetime(now).strftime("%Y-%m-%d")
+        if portfolio.get("daily_pnl_anchor_date") != ny_date:
+            portfolio["daily_pnl_anchor_date"] = ny_date
+            portfolio["day_start_equity_usd"] = portfolio_equity
+        portfolio["last_equity_usd"] = portfolio_equity
+
+
+def _parse_int(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_float(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def summarize_ccnl_fills(
+    rows: list[dict[str, Any]],
+    *,
+    odno: str,
+    ticker: str,
+) -> tuple[int, float]:
+    """Return (filled_qty, vwap_fill_price) for a specific order."""
+    filled_qty = 0
+    weighted = 0.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_odno = str(row.get("odno") or row.get("ODNO") or "").strip()
+        row_ticker = str(row.get("pdno") or row.get("PDNO") or "").strip().upper()
+        if row_odno != odno or row_ticker != ticker.upper():
+            continue
+        qty = _parse_int(row.get("ft_ccld_qty") or row.get("FT_CCLD_QTY"))
+        price = _parse_float(row.get("ft_ccld_unpr3") or row.get("FT_CCLD_UNPR3"))
+        if qty <= 0:
+            continue
+        filled_qty += qty
+        weighted += qty * price
+    avg_price = weighted / filled_qty if filled_qty > 0 else 0.0
+    return filled_qty, avg_price
+
+
+def order_still_open(
+    rows: list[dict[str, Any]],
+    *,
+    odno: str,
+    ticker: str,
+) -> bool:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_odno = str(row.get("odno") or row.get("ODNO") or "").strip()
+        row_ticker = str(row.get("pdno") or row.get("PDNO") or "").strip().upper()
+        if row_odno != odno or row_ticker != ticker.upper():
+            continue
+        nccs = _parse_int(row.get("nccs_qty") or row.get("NCCS_QTY"))
+        if nccs > 0:
+            return True
+    return False
+
+
+def pending_order_age_minutes(runtime: PositionState, now: datetime | None = None) -> float:
+    submitted = runtime.open_order_submitted_at
+    if not submitted:
+        return 0.0
+    try:
+        submitted_at = datetime.fromisoformat(submitted)
+    except ValueError:
+        return 0.0
+    current = now or datetime.now()
+    return max((current - submitted_at).total_seconds() / 60.0, 0.0)
+
+
+class OrderFillMonitor:
+    """Poll KIS ccnl/nccs and broker holdings before mutating local position state."""
+
+    def __init__(
+        self,
+        settings: ExecutionSettings,
+        trade_log: TradeLogWriter,
+    ) -> None:
+        self.settings = settings
+        self.trade_log = trade_log
+
+    def resolve_ticker(
+        self,
+        client: Any,
+        engine: Any,
+        ticker: str,
+        runtime: PositionState,
+        states: dict[str, Any],
+        *,
+        broker_qty: int | None = None,
+        cash_after: float | None = None,
+        current_bar_date: str | None = None,
+    ) -> bool:
+        """
+        Resolve pending order for one ticker.
+
+        Returns True when pending lock was cleared or updated.
+        """
+        if not runtime.pending_order and not runtime.open_order_id:
+            return False
+
+        odno = runtime.open_order_id
+        side = (runtime.open_order_side or "").upper()
+        order_qty = int(runtime.open_order_qty or 0)
+
+        if not odno:
+            runtime.pending_order = False
+            clear_open_order(runtime)
+            return True
+
+        ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
+        today = ny_today_yyyymmdd()
+
+        try:
+            ccnl_rows = client.fetch_overseas_order_ccnl(
+                ord_strt_dt=today,
+                ord_end_dt=today,
+                pdno="",
+                ovrs_excg_cd="",
+            )
+            nccs_rows = client.fetch_overseas_open_orders(ovrs_excg_cd=ovrs_excg_cd)
+        except Exception as exc:
+            print(f"[FILL/POLL] {ticker} inquiry failed: {exc}")
+            return False
+
+        filled_qty, fill_price = summarize_ccnl_fills(
+            ccnl_rows, odno=odno, ticker=ticker
+        )
+        still_open = order_still_open(nccs_rows, odno=odno, ticker=ticker)
+
+        if broker_qty is None:
+            broker_qty = int(states.get(ticker, {}).get("held_quantity", 0) or 0)
+
+        age = pending_order_age_minutes(runtime)
+        if age >= self.settings.pending_order_stale_minutes and filled_qty == 0:
+            self._release_stale(runtime, ticker, side, cash_after, reason="stale_no_fill")
+            return True
+
+        if filled_qty <= 0 and still_open:
+            print(
+                f"[FILL/PENDING] {ticker} odno={odno} side={side} "
+                f"waiting (0/{order_qty} filled)"
+            )
+            return False
+
+        if side == "BUY":
+            runtime.held_quantity = max(broker_qty, filled_qty)
+            runtime.in_position = runtime.held_quantity > 0
+            runtime.open_order_filled_qty = filled_qty
+
+            if still_open and filled_qty < order_qty:
+                self.trade_log.append(
+                    ticker=ticker,
+                    signal="BUY",
+                    qty=filled_qty,
+                    order_price=runtime.open_order_price,
+                    fill_price=fill_price or None,
+                    status="PARTIAL",
+                    reason=f"odno={odno} filled {filled_qty}/{order_qty}",
+                    cash_after=cash_after,
+                    held_qty=runtime.held_quantity,
+                )
+                print(
+                    f"[FILL/PARTIAL] {ticker} BUY {filled_qty}/{order_qty} "
+                    f"@ {fill_price:.2f} odno={odno}"
+                )
+                return False
+
+            engine.apply_post_order_transition(
+                runtime,
+                signal="BUY",
+                filled_quantity=runtime.held_quantity,
+                current_bar_date=current_bar_date or today,
+                allow_crossover=True,
+            )
+            clear_open_order(runtime)
+            self.trade_log.append(
+                ticker=ticker,
+                signal="BUY",
+                qty=runtime.held_quantity,
+                order_price=runtime.open_order_price,
+                fill_price=fill_price or None,
+                status="FILLED",
+                reason=f"odno={odno}",
+                cash_after=cash_after,
+                held_qty=runtime.held_quantity,
+            )
+            print(
+                f"[FILL/COMPLETE] {ticker} BUY held_qty={runtime.held_quantity} "
+                f"odno={odno}"
+            )
+            return True
+
+        if side in {"SELL", "DYNAMIC_ATR_SELL"}:
+            sold_qty = filled_qty if filled_qty > 0 else max(order_qty - broker_qty, 0)
+            pre_held = max(broker_qty + sold_qty, runtime.held_quantity)
+            runtime.held_quantity = pre_held
+            runtime.open_order_filled_qty = sold_qty
+
+            if still_open and broker_qty > 0:
+                runtime.held_quantity = broker_qty
+                self.trade_log.append(
+                    ticker=ticker,
+                    signal=side,
+                    qty=sold_qty,
+                    order_price=runtime.open_order_price,
+                    fill_price=fill_price or None,
+                    status="PARTIAL",
+                    reason=f"odno={odno} sold {sold_qty}/{order_qty}",
+                    cash_after=cash_after,
+                    held_qty=runtime.held_quantity,
+                )
+                print(
+                    f"[FILL/PARTIAL] {ticker} SELL {sold_qty}/{order_qty} "
+                    f"remaining={runtime.held_quantity}"
+                )
+                return False
+
+            engine.apply_post_order_transition(
+                runtime,
+                signal="SELL",
+                filled_quantity=sold_qty,
+                current_bar_date=current_bar_date or today,
+                allow_crossover=True,
+            )
+            clear_open_order(runtime)
+            self.trade_log.append(
+                ticker=ticker,
+                signal=side,
+                qty=sold_qty,
+                order_price=runtime.open_order_price,
+                fill_price=fill_price or None,
+                status="FILLED",
+                reason=f"odno={odno}",
+                cash_after=cash_after,
+                held_qty=runtime.held_quantity,
+            )
+            print(
+                f"[FILL/COMPLETE] {ticker} SELL sold={sold_qty} "
+                f"held_qty={runtime.held_quantity}"
+            )
+            return True
+
+        return False
+
+    def _release_stale(
+        self,
+        runtime: PositionState,
+        ticker: str,
+        side: str,
+        cash_after: float | None,
+        *,
+        reason: str,
+    ) -> None:
+        odno = runtime.open_order_id or ""
+        runtime.pending_order = False
+        clear_open_order(runtime)
+        self.trade_log.append(
+            ticker=ticker,
+            signal=side or "UNKNOWN",
+            qty=0,
+            order_price=None,
+            fill_price=None,
+            status="RELEASED",
+            reason=f"{reason} odno={odno}",
+            cash_after=cash_after,
+            held_qty=int(runtime.held_quantity or 0),
+        )
+        print(f"[FILL/RELEASE] {ticker} pending cleared ({reason}) odno={odno}")
+
+    def resolve_all_pending(
+        self,
+        client: Any,
+        states: dict[str, Any],
+        watchlist: list[str],
+        engine_factory: Any,
+        *,
+        cash_after: float | None = None,
+    ) -> None:
+        broker_holdings = (
+            states.get("_portfolio", {}).get("broker_holdings", {}) or {}
+        )
+        for ticker in watchlist:
+            payload = states.get(ticker, {})
+            if not isinstance(payload, dict):
+                continue
+            runtime = PositionState.from_dict(payload)
+            if not runtime.pending_order and not runtime.open_order_id:
+                continue
+            engine = engine_factory(ticker)
+            broker_qty = int(broker_holdings.get(ticker, runtime.held_quantity) or 0)
+            changed = self.resolve_ticker(
+                client,
+                engine,
+                ticker,
+                runtime,
+                states,
+                broker_qty=broker_qty,
+                cash_after=cash_after,
+            )
+            if changed or runtime.pending_order:
+                states[ticker] = engine.dump_state(runtime)

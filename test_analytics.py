@@ -368,7 +368,9 @@ def verify_phantom_sell_guard() -> None:
     print("TEST 8: PHANTOM SELL GUARD + EXECUTION QTY")
     print("=" * 88)
 
-    from main import _limit_order_price, _resolve_execution_quantity
+    from execution_engine import limit_order_price
+
+    from main import _resolve_execution_quantity
 
     runtime = PositionState(in_position=True, held_quantity=0)
     sell_qty = _resolve_execution_quantity("SELL", proposed_size=4, runtime=runtime)
@@ -378,8 +380,8 @@ def verify_phantom_sell_guard() -> None:
     sell_qty = _resolve_execution_quantity("SELL", proposed_size=4, runtime=runtime)
     assert sell_qty == 3
 
-    assert _limit_order_price("BUY", 100.0) == 100.10
-    assert _limit_order_price("SELL", 100.0) == 99.90
+    assert limit_order_price("BUY", 100.0, 10.0) == 100.10
+    assert limit_order_price("SELL", 100.0, 10.0) == 99.90
 
     engine = LiveSignalEngine("NVDA")
     df = build_synthetic_market_data(rows=80)

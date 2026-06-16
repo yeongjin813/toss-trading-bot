@@ -49,6 +49,17 @@ from market_registry import (
     validate_watchlist_routing,
 )
 from strategy import DEFAULT_COMMISSION_RATE
+from execution_engine import (
+    ExecutionSettings,
+    OrderFillMonitor,
+    RiskGuard,
+    TradeLogWriter,
+    assign_open_order,
+    block_new_buy_rth_window,
+    extract_order_odno,
+    limit_buffer_bps_for_ticker,
+    limit_order_price,
+)
 from session_manager import (
     LiveExecutionGatekeeper,
     PortfolioLedger,
@@ -69,12 +80,18 @@ TR_ID_US_BUY = "VTTT1002U"
 TR_ID_US_SELL = "VTTT1006U"
 TR_ID_DAILY_PRICE = "HHDFS76240000"
 TR_ID_US_PRESENT_BALANCE = "VTRP6504R"
+TR_ID_US_CCNL = "VTTS3035R" if "openapivts" in BASE_URL else "TTTS3035R"
+TR_ID_US_NCCS = "VTTS3018R" if "openapivts" in BASE_URL else "TTTS3018R"
+TR_ID_US_CANCEL = "VTTT1004U" if "openapivts" in BASE_URL else "TTTT1004U"
 
 TOKEN_PATH = "/oauth2/tokenP"
 HASHKEY_PATH = "/uapi/hashkey"
 DAILY_PRICE_PATH = "/uapi/overseas-price/v1/quotations/dailyprice"
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 PRESENT_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
+INQUIRE_CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+INQUIRE_NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
+ORDER_RVSECNCL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 
 WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
 USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
@@ -84,6 +101,7 @@ MIN_DATA_BARS = 22
 
 DATA_DIR = "./data"
 STATE_FILE = "./trading_state.json"
+TRADE_LOG_FILE = os.getenv("TRADE_LOG_FILE", "./trade_log.csv")
 TOKEN_CACHE_FILE = "./kis_token_cache.json"
 LOOKBACK_YEARS = 3
 TARGET_BARS = LOOKBACK_YEARS * 252
@@ -92,7 +110,6 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
-KIS_LIMIT_PRICE_BUFFER_BPS = float(os.getenv("KIS_LIMIT_PRICE_BUFFER_BPS", "10"))
 
 
 def _resolve_kis_order_type() -> str:
@@ -105,6 +122,11 @@ def _resolve_kis_order_type() -> str:
 
 
 KIS_ORDER_TYPE = _resolve_kis_order_type()
+
+EXECUTION_SETTINGS = ExecutionSettings.from_env()
+TRADE_LOG = TradeLogWriter(TRADE_LOG_FILE)
+RISK_GUARD = RiskGuard(EXECUTION_SETTINGS)
+FILL_MONITOR = OrderFillMonitor(EXECUTION_SETTINGS, TRADE_LOG)
 
 _reconciliation_engine = PortfolioReconciliationEngine(WATCHLIST)
 _execution_gatekeeper = LiveExecutionGatekeeper()
@@ -431,6 +453,125 @@ class KISApiClient:
 
         return payload
 
+    def fetch_overseas_order_ccnl(
+        self,
+        ord_strt_dt: str,
+        ord_end_dt: str,
+        pdno: str = "",
+        ovrs_excg_cd: str = "",
+        sll_buy_dvsn: str = "00",
+        ccld_nccs_dvsn: str = "00",
+    ) -> list[dict[str, Any]]:
+        """Fetch overseas order/fill rows for the given NY order-date window."""
+        url = f"{BASE_URL}{INQUIRE_CCNL_PATH}"
+        params = {
+            "CANO": CANO,
+            "ACNT_PRDT_CD": ACNT_PRDT_CD,
+            "PDNO": pdno,
+            "ORD_STRT_DT": ord_strt_dt,
+            "ORD_END_DT": ord_end_dt,
+            "SLL_BUY_DVSN": sll_buy_dvsn,
+            "CCLD_NCCS_DVSN": ccld_nccs_dvsn,
+            "OVRS_EXCG_CD": ovrs_excg_cd,
+            "SORT_SQN": "DS",
+            "ORD_DT": "",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "CTX_AREA_NK200": "",
+            "CTX_AREA_FK200": "",
+        }
+        response = requests.get(
+            url,
+            headers=self._build_headers(TR_ID_US_CCNL),
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("rt_cd") not in (None, "0"):
+            raise RuntimeError(
+                f"Order ccnl inquiry failed: "
+                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
+            )
+        output = payload.get("output") or []
+        if isinstance(output, dict):
+            return [output]
+        if isinstance(output, list):
+            return [row for row in output if isinstance(row, dict)]
+        return []
+
+    def fetch_overseas_open_orders(
+        self,
+        ovrs_excg_cd: str = "NASD",
+        sort_sqn: str = "DS",
+    ) -> list[dict[str, Any]]:
+        """Fetch open (unfilled) overseas orders for an exchange bucket."""
+        url = f"{BASE_URL}{INQUIRE_NCCS_PATH}"
+        params = {
+            "CANO": CANO,
+            "ACNT_PRDT_CD": ACNT_PRDT_CD,
+            "OVRS_EXCG_CD": ovrs_excg_cd,
+            "SORT_SQN": sort_sqn,
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        response = requests.get(
+            url,
+            headers=self._build_headers(TR_ID_US_NCCS),
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("rt_cd") not in (None, "0"):
+            raise RuntimeError(
+                f"Open-order inquiry failed: "
+                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
+            )
+        output = payload.get("output") or []
+        if isinstance(output, dict):
+            return [output]
+        if isinstance(output, list):
+            return [row for row in output if isinstance(row, dict)]
+        return []
+
+    def cancel_overseas_order(
+        self,
+        ticker: str,
+        orgn_odno: str,
+        quantity: int,
+    ) -> dict[str, Any]:
+        """Cancel an open overseas limit order."""
+        ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
+        order_body = {
+            "CANO": CANO,
+            "ACNT_PRDT_CD": ACNT_PRDT_CD,
+            "OVRS_EXCG_CD": ovrs_excg_cd,
+            "PDNO": ticker,
+            "ORGN_ODNO": orgn_odno,
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(quantity),
+            "OVRS_ORD_UNPR": "0",
+            "MGCO_APTM_ODNO": "",
+            "ORD_SVR_DVSN_CD": "0",
+        }
+        hashkey = self.get_hashkey(order_body)
+        url = f"{BASE_URL}{ORDER_RVSECNCL_PATH}"
+        response = requests.post(
+            url,
+            headers=self._build_headers(TR_ID_US_CANCEL, include_hashkey=True, hashkey=hashkey),
+            json=order_body,
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("rt_cd") not in (None, "0"):
+            raise RuntimeError(
+                f"Cancel rejected for {ticker}: "
+                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
+            )
+        return payload
+
 
 class MarketDataCache:
     """
@@ -442,6 +583,10 @@ class MarketDataCache:
     def __init__(self, client: KISApiClient) -> None:
         self._client = client
         self._frames: dict[str, pd.DataFrame] = {}
+        self._data_sources: dict[str, str] = {}
+
+    def get_data_source(self, ticker: str) -> str:
+        return self._data_sources.get(ticker, "kis")
 
     def bootstrap(self, tickers: list[str]) -> None:
         for ticker in tickers:
@@ -504,6 +649,7 @@ class MarketDataCache:
             cached = read_market_csv(path)
             if cached is not None and len(cached) >= MIN_DATA_BARS:
                 try:
+                    self._data_sources[ticker] = "kis"
                     return normalize_market_frame(cached)
                 except ValueError as exc:
                     print(
@@ -514,6 +660,7 @@ class MarketDataCache:
         excd = MARKET_META[ticker]["excd"]
         try:
             df = self._client.fetch_us_daily_bars(ticker=ticker, excd=excd)
+            self._data_sources[ticker] = "kis"
             return normalize_market_frame(df)
         except (requests.RequestException, RuntimeError, ValueError) as exc:
             print(
@@ -521,6 +668,7 @@ class MarketDataCache:
                 "- using yfinance fallback"
             )
             df = fetch_yfinance_daily_bars(ticker)
+            self._data_sources[ticker] = "yfinance"
             return normalize_market_frame(df)
 
 
@@ -774,15 +922,6 @@ def _failed_order_key(signal: str, bar_date: str) -> str:
     return f"{signal}:{bar_date}"
 
 
-def _limit_order_price(side: str, reference_price: float) -> float:
-    if reference_price <= 0:
-        raise ValueError("Reference price must be positive for limit orders.")
-    buffer = KIS_LIMIT_PRICE_BUFFER_BPS / 10_000.0
-    if side.upper() == "BUY":
-        return round(reference_price * (1.0 + buffer), 2)
-    return round(reference_price * (1.0 - buffer), 2)
-
-
 def _resolve_execution_quantity(
     signal: str,
     proposed_size: int,
@@ -807,7 +946,10 @@ def execute_broker_order(
     ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
     use_limit = KIS_ORDER_TYPE == "limit"
     side = "BUY" if signal == "BUY" else "SELL"
-    order_price = _limit_order_price(side, reference_price) if use_limit else 0.0
+    buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
+    order_price = (
+        limit_order_price(side, reference_price, buffer_bps) if use_limit else 0.0
+    )
     order_kind = "limit order" if use_limit else "market order"
     price_suffix = f" @{order_price:.2f}" if use_limit else ""
 
@@ -852,10 +994,11 @@ def dispatch_order_with_state_machine(
     allow_crossover: bool,
     states: dict[str, Any],
     reference_price: float,
+    ledger: PortfolioLedger,
 ) -> str:
     """
     Enforce order lifecycle:
-      pending lock -> cooldown check -> KIS dispatch -> rt_cd verify -> transition -> persist
+      pending lock -> cooldown -> dispatch -> store odno -> fill poll updates state
     """
     if runtime.pending_order:
         print(f"[LOCK] {ticker} pending_order=True — signal suppressed")
@@ -894,6 +1037,17 @@ def dispatch_order_with_state_machine(
         runtime.last_failed_order_key = fail_key
         states[ticker] = engine.dump_state(runtime)
         save_persisted_states(states)
+        TRADE_LOG.append(
+            ticker=ticker,
+            signal=signal,
+            qty=execution_qty,
+            order_price=None,
+            fill_price=None,
+            status="REJECTED",
+            reason=str(exc),
+            cash_after=ledger.available_cash_usd,
+            held_qty=int(runtime.held_quantity or 0),
+        )
         print(f"[ORDER/REJECTED] {ticker} {signal} qty={execution_qty} — {exc}")
         return "HOLD"
 
@@ -904,33 +1058,68 @@ def dispatch_order_with_state_machine(
         runtime.last_failed_order_key = fail_key
         states[ticker] = engine.dump_state(runtime)
         save_persisted_states(states)
+        TRADE_LOG.append(
+            ticker=ticker,
+            signal=signal,
+            qty=execution_qty,
+            order_price=None,
+            fill_price=None,
+            status="REJECTED",
+            reason=f"rt_cd={order_payload.get('rt_cd')}",
+            cash_after=ledger.available_cash_usd,
+            held_qty=int(runtime.held_quantity or 0),
+        )
         print(
             f"[ORDER/REJECTED] {ticker} {signal} qty={execution_qty} — "
             f"rt_cd={order_payload.get('rt_cd')}"
         )
         return "HOLD"
 
-    runtime.pending_order = True
+    odno = extract_order_odno(order_payload)
+    side = "BUY" if signal == "BUY" else "SELL"
+    buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
+    order_price = (
+        limit_order_price(side, reference_price, buffer_bps)
+        if KIS_ORDER_TYPE == "limit"
+        else 0.0
+    )
+    submitted_at = datetime.now().isoformat(timespec="seconds")
+    if odno:
+        assign_open_order(
+            runtime,
+            odno=odno,
+            side=side,
+            qty=execution_qty,
+            price=order_price,
+            submitted_at=submitted_at,
+        )
+    else:
+        runtime.pending_order = True
+        runtime.open_order_side = side
+        runtime.open_order_qty = execution_qty
+        runtime.open_order_price = order_price
+        runtime.open_order_submitted_at = submitted_at
+        print(f"[ORDER/WARN] {ticker} accepted without odno — fill poll via ccnl/broker")
+
     runtime.last_failed_order_key = None
     states[ticker] = engine.dump_state(runtime)
     save_persisted_states(states)
-
-    engine.apply_post_order_transition(
-        runtime,
+    TRADE_LOG.append(
+        ticker=ticker,
         signal=signal,
-        filled_quantity=execution_qty,
-        current_bar_date=current_bar_date,
-        allow_crossover=allow_crossover,
+        qty=execution_qty,
+        order_price=order_price or None,
+        fill_price=None,
+        status="ACCEPTED",
+        reason=f"odno={odno or 'unknown'}",
+        cash_after=ledger.available_cash_usd,
+        held_qty=int(runtime.held_quantity or 0),
     )
-
-    states[ticker] = engine.dump_state(runtime)
-    save_persisted_states(states)
-
     print(
-        f"  -> Order accepted (rt_cd=0). State transition applied for {ticker}: "
-        f"has_position={runtime.has_position}, held_qty={runtime.held_quantity}"
+        f"  -> Order accepted (rt_cd=0). Awaiting fill confirmation for {ticker}: "
+        f"odno={odno or 'unknown'}, side={side}, qty={execution_qty}"
     )
-    return signal
+    return "PENDING"
 
 
 def _analytics_sma20(df: pd.DataFrame) -> float:
@@ -1094,18 +1283,47 @@ def process_ticker(
 
     df, is_new_bar = cache.refresh_latest(ticker)
     persist_market_data(df, data_path_for_ticker(ticker))
+    data_source = cache.get_data_source(ticker)
     print(
         f"  -> {len(df)} bars in memory "
-        f"({'new daily bar' if is_new_bar else 'intraday refresh'})"
+        f"({'new daily bar' if is_new_bar else 'intraday refresh'}) "
+        f"[source={data_source}]"
     )
 
     ticker_state = states.get(ticker, {})
     if not isinstance(ticker_state, dict):
         ticker_state = {}
 
-    portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
     current_price = float(df.iloc[-1]["Close"])
     current_bar_date = pd.Timestamp(df.iloc[-1]["Date"]).strftime("%Y-%m-%d")
+
+    runtime = engine.load_state(ticker_state)
+    if runtime.pending_order or runtime.open_order_id:
+        broker_qty = int(
+            states.get("_portfolio", {})
+            .get("broker_holdings", {})
+            .get(ticker, runtime.held_quantity)
+            or 0
+        )
+        FILL_MONITOR.resolve_ticker(
+            client,
+            engine,
+            ticker,
+            runtime,
+            states,
+            broker_qty=broker_qty,
+            cash_after=ledger.available_cash_usd,
+            current_bar_date=current_bar_date,
+        )
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        if runtime.pending_order:
+            print(f"  -> Pending order still open for {ticker}")
+            return "PENDING"
+        ticker_state = states.get(ticker, engine.dump_state(runtime))
+
+    portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
+    RISK_GUARD.update_daily_equity_anchor(states, portfolio_equity)
 
     market_bullish = True
     spy_close: float | None = None
@@ -1123,7 +1341,7 @@ def process_ticker(
 
     cycle = engine.evaluate_trading_cycle(
         df,
-        runtime_state=ticker_state if isinstance(ticker_state, dict) else {},
+        runtime_state=states.get(ticker, ticker_state if isinstance(ticker_state, dict) else {}),
         capital_at_risk=CAPITAL_AT_RISK,
         risk_per_trade=RISK_PER_TRADE,
         now=datetime.now(),
@@ -1178,6 +1396,35 @@ def process_ticker(
         return "HOLD"
 
     if signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
+        if signal == "BUY" and data_source == "yfinance":
+            print(
+                f"[GATE/DATA] {ticker} BUY blocked — bar history loaded via yfinance fallback"
+            )
+            states[ticker] = engine.dump_state(runtime)
+            save_persisted_states(states)
+            return "HOLD"
+
+        if signal == "BUY":
+            rth_block = block_new_buy_rth_window(datetime.now(), EXECUTION_SETTINGS)
+            if rth_block:
+                print(f"[GATE/RTH] {ticker} BUY blocked — {rth_block}")
+                states[ticker] = engine.dump_state(runtime)
+                save_persisted_states(states)
+                return "HOLD"
+
+            risk_block = RISK_GUARD.check_buy_allowed(
+                ticker,
+                proposed_size,
+                current_price,
+                states,
+                now=datetime.now(),
+            )
+            if risk_block:
+                print(f"[GATE/RISK] {ticker} BUY blocked — {risk_block}")
+                states[ticker] = engine.dump_state(runtime)
+                save_persisted_states(states)
+                return "HOLD"
+
         execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
         final_signal = dispatch_order_with_state_machine(
             client,
@@ -1190,14 +1437,30 @@ def process_ticker(
             cycle["allow_crossover"],
             states,
             reference_price=current_price,
+            ledger=ledger,
         )
-        if final_signal == "BUY" and execution_qty > 0:
-            cost = execution_qty * current_price * (1.0 + DEFAULT_COMMISSION_RATE)
-            ledger.available_cash_usd = max(0.0, ledger.available_cash_usd - cost)
-        elif final_signal in {"SELL", "DYNAMIC_ATR_SELL"} and execution_qty > 0:
-            proceeds = execution_qty * current_price * (1.0 - DEFAULT_COMMISSION_RATE)
-            ledger.available_cash_usd += proceeds
-        states.setdefault("_portfolio", {})["available_cash_usd"] = ledger.available_cash_usd
+        if final_signal == "PENDING":
+            broker_qty = int(
+                states.get("_portfolio", {})
+                .get("broker_holdings", {})
+                .get(ticker, runtime.held_quantity)
+                or 0
+            )
+            FILL_MONITOR.resolve_ticker(
+                client,
+                engine,
+                ticker,
+                runtime,
+                states,
+                broker_qty=broker_qty,
+                cash_after=ledger.available_cash_usd,
+                current_bar_date=cycle["current_bar_date"],
+            )
+            states[ticker] = engine.dump_state(runtime)
+            save_persisted_states(states)
+            if runtime.pending_order:
+                return "PENDING"
+            return signal
     else:
         final_signal = signal
         states[ticker] = engine.dump_state(runtime)
@@ -1228,6 +1491,14 @@ def run_watchlist_cycle(
         )
     else:
         states, ledger = run_session_reconciliation(client, states)
+        FILL_MONITOR.resolve_all_pending(
+            client,
+            states,
+            WATCHLIST,
+            LiveSignalEngine,
+            cash_after=ledger.available_cash_usd,
+        )
+        save_persisted_states(states)
 
     for index, ticker in enumerate(WATCHLIST):
         try:
@@ -1273,7 +1544,14 @@ def main() -> None:
     print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
     print(
         f"KIS Order Type      : {KIS_ORDER_TYPE.upper()} "
-        f"(buffer={KIS_LIMIT_PRICE_BUFFER_BPS} bps when limit)"
+        f"(default buffer={EXECUTION_SETTINGS.default_limit_buffer_bps} bps, "
+        f"high-vol={EXECUTION_SETTINGS.high_vol_limit_buffer_bps} bps)"
+    )
+    print(f"Trade Log File      : {TRADE_LOG_FILE}")
+    print(
+        f"Risk Limits         : daily_loss=${EXECUTION_SETTINGS.max_daily_loss_usd:.0f}, "
+        f"max_positions={EXECUTION_SETTINGS.max_open_positions}, "
+        f"max_exposure=${EXECUTION_SETTINGS.max_ticker_exposure_usd:.0f}/ticker"
     )
     print(f"State File          : {STATE_FILE}")
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
@@ -1302,9 +1580,19 @@ def main() -> None:
 
     print("[P3] Running startup portfolio reconciliation...")
     states, ledger = run_session_reconciliation(client, states, force=True)
+    FILL_MONITOR.resolve_all_pending(
+        client,
+        states,
+        WATCHLIST,
+        LiveSignalEngine,
+        cash_after=ledger.available_cash_usd,
+    )
+    save_persisted_states(states)
 
     print("Starting production monitoring loop. Press Ctrl+C to stop.")
-    print("Order pipeline: reconcile -> RTH gate -> intraday ATR scan -> dispatch -> persist")
+    print(
+        "Order pipeline: reconcile -> fill poll -> RTH/risk gates -> dispatch -> trade_log"
+    )
     print("=" * 88)
 
     cycle_count = 0

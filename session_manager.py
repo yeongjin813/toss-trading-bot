@@ -305,13 +305,13 @@ class PortfolioReconciliationEngine:
                     )
                     ticker_state["held_quantity"] = broker_qty
                     ticker_state["in_position"] = broker_qty > 0
-                    if broker_qty <= 0:
+                    if broker_qty <= 0 and not ticker_state.get("pending_order"):
                         ticker_state["highest_price_achieved"] = None
                         ticker_state["current_atr"] = None
                         ticker_state["dynamic_stop_distance"] = None
                         ticker_state["trigger_floor"] = None
                         ticker_state["session_low"] = None
-                    elif not ticker_state.get("in_position"):
+                    elif broker_qty > 0 and not ticker_state.get("in_position"):
                         ticker_state["in_position"] = True
 
             if mismatches:
