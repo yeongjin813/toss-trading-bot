@@ -4,7 +4,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 5 Active — Ticker Regime Isolation + P3 Live Parity (RTH Gate + Reconciliation) |
+| **System Status** | Phase 7 Active — Fill Verification + Telegram Alerts (Phase 6 execution hardening) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
@@ -16,6 +16,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
 | **Timeline Alignment** | All dispatchable signals (`BUY`/`SELL`/`DYNAMIC_ATR_SELL`) bound to NY RTH 09:30–16:00 ET |
 | **Reconciliation** | `PortfolioReconciliationEngine` — KIS `VTRP6504R` broker-vs-local sync at startup + daily RTH |
+| **Fill Verification** | `OrderFillMonitor` — ccnl/nccs poll; state mutates only on confirmed fills; `trade_log.csv` |
+| **Mobile Alerts** | `telegram_notifier.py` — trade reports + system alerts via Telegram Bot API (optional) |
 | **Risk Posture** | Documented in Sections 11–14 — backtest/live parity gaps, reconciliation vectors, monitoring telemetry |
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
@@ -48,6 +50,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 - [C. Configuration Externalization Matrix](#appendix-c-configuration-externalization-matrix)
 - [D. Project Structure](#appendix-d-project-structure)
 - [E. Academic Regime Mapping (Watchlist Design)](#appendix-e-academic-regime-mapping-watchlist-design)
+- [Phase 6: Fill Verification, Trade Log & Risk Gates](#phase-6-fill-verification-trade-log-and-risk-gates)
+- [Phase 7: Telegram Mobile Alerts](#phase-7-telegram-mobile-alerts)
 - [License & Disclaimer](#license--disclaimer)
 
 ---
@@ -76,7 +80,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 - **Architecture**: Expanded to a **15-ticker** parallel watchlist (default in `market_registry.py`: AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) executing live routines through the KIS sandbox server (`openapivts.koreainvestment.com:29443`). Optional **SPY > 200MA** market filter blocks new BUY entries in bear regimes (`USE_SPY_MARKET_FILTER=true`).
 - **Core Engineering Patches**: Mitigated critical production failures by implementing a localized memory bar caching engine (`MarketDataCache`), a state-gated concurrency lock to eliminate duplicate order flooding, an institutional volume liquidity surge gate, and a rigorous series of financial logic patches to eliminate same-bar look-ahead bias, capital over-leverage rejections, and weekend/holiday runtime crashes.
 
-### Phase 5: Ticker-Specific Configuration & Macro Regime Filtering *(Current)*
+### Phase 5: Ticker-Specific Configuration & Macro Regime Filtering
 
 - **Architecture**: Eliminated global `.env` execution-parameter overrides (`SMA_PERIOD`, `ATR_MULTIPLIER`, etc.) in favor of a hardcoded **TickerConfig isolation matrix** in `config.py`, resolved at runtime via `StrategyConfigMapper.for_ticker(ticker)`.
 - **Core Logic Patch**: Introduced dual-moving-average regime filtering (`SMA_SHORT` + 50-day `SMA_LONG`) with **asymmetric entry/exit mechanics** — trend-gated entries and whipsaw-protected conditional RSI exits during macro bull runs.
@@ -89,6 +93,18 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **AAPL** | +4.4% | +7.9% | +66.6% |
 
 - **Insight**: One-size-fits-all parameters forced high-beta trend leaders through conservative gates, producing catastrophic underperformance vs. buy-and-hold. Structural regime mapping per ticker reduced whipsaw variance without stacking noisy sub-indicators (see [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)).
+
+### Phase 6: Fill Verification, Trade Log & Risk Gates *(2026-06)*
+
+- **Architecture**: Order acceptance (`rt_cd=0`) no longer mutates `held_quantity`. `OrderFillMonitor` polls KIS `inquire-ccnl` / `inquire-nccs` until fills confirm (including partial). All events append to `trade_log.csv`. `RiskGuard` enforces daily loss, max open positions, and per-ticker exposure caps.
+- **Gates**: RTH open/close BUY blocks, yfinance fallback BUY block, stale `pending_order` release.
+- **Commit**: `66951a6` — see [Phase 6 detail](#phase-6-fill-verification-trade-log-and-risk-gates).
+
+### Phase 7: Telegram Mobile Alerts *(2026-06 — current)*
+
+- **Architecture**: `telegram_notifier.py` sends async push notifications when trades fill and when the live loop hits critical failures. Integrated into `main.py` via fill callbacks in `execution_engine.py`. Gated by `USE_TELEGRAM_ALERTS=true`.
+- **Session model**: Each message uses `async with Bot(token=...) as bot:` (python-telegram-bot v21+) — one HTTP session per dispatch, no long-lived singleton bot.
+- **Commit**: `872f7d2` — see [Phase 7 detail](#phase-7-telegram-mobile-alerts).
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -107,6 +123,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **P3 RTH Execution Gate** | `session_manager.py` + `main.py` | Zero-leakage block on all dispatchable signals outside 09:30–16:00 ET |
 | **P3 Intraday Session Low** | `session_manager.py` + `analytics.py` | Real-time `session_low` ATR stop parity with daily backtest `Low` trigger |
 | **P3 Portfolio Reconciliation** | `session_manager.py` + `main.py` | KIS `VTRP6504R` broker override + deployable cash refresh |
+| **P6 Fill Verification** | `execution_engine.py` + `main.py` | ccnl/nccs poll; partial fills; `trade_log.csv`; risk gates |
+| **P7 Telegram Alerts** | `telegram_notifier.py` + `main.py` | Trade reports on fill; CRITICAL/WARNING system alerts |
 
 Additional Phase 4 safeguards preserved from prior milestones:
 
@@ -1283,13 +1301,38 @@ sudo systemctl status toss-bot
 
 ```bash
 cd ~/toss-trading-bot
-git pull
+git fetch origin && git reset --hard origin/main   # use if local data/*.csv blocks pull
+.venv/bin/pip install -r requirements.txt          # never use bare `pip` on Ubuntu 24+ (PEP 668)
 sudo systemctl restart toss-bot
+sudo systemctl status toss-bot --no-pager
 ```
 
-**Monitor from Windows PowerShell:**
+> **Ubuntu PEP 668:** System Python rejects `pip install` outside a venv. Production uses `/home/ubuntu/toss-trading-bot/.venv/bin/python` (see systemd unit below). Create the venv once with `python3 -m venv .venv` if missing.
 
-```powershell
+**Telegram on EC2:** `.env` on the server is separate from your PC. After `git pull`, add these keys to `~/toss-trading-bot/.env` if not present:
+
+```env
+USE_TELEGRAM_ALERTS=true
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_numeric_user_id
+```
+
+Verify before restart:
+
+```bash
+.venv/bin/python telegram_notifier.py --diagnose
+.venv/bin/python telegram_notifier.py --verbose
+```
+
+**Monitor logs:**
+
+```bash
+# Inside EC2 SSH session (you are already on the server — do not run ssh again):
+tail -f ~/toss-trading-bot/project_metrics.log
+sudo systemctl status toss-bot
+```
+
+**From Windows PowerShell (remote):**
 # Service health
 ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "sudo systemctl status toss-bot --no-pager"
 
@@ -1539,7 +1582,7 @@ $$
 | **P1** | Capital Deploy Buffer | `analytics.py` + `portfolio_backtest.py` | **Done** — `calculate_position_size()` / `dual_clamp_portfolio_size()` apply the $0.95$ deployable haircut (Section 12②). |
 | **P1** | NYSE Calendar Cross-Check | `analytics.py` | Integrate `holidays.NYSE` multi-layer validation (Section 12④). |
 | **P2** | API Exception Handling Queue | `main.py` | Build standardized asynchronous retry queue for failed order transmissions. |
-| **P2** | Telegram Alert Webhook | `main.py` | Automated alert infrastructure for unmapped broker failures, $\Delta \text{Shares} \neq 0$, and `api_response_time > 3.0s`. |
+| **P2** | Telegram Alert Webhook | `telegram_notifier.py` + `main.py` | **Done (P7)** — trade reports on `PARTIAL`/`FILLED`; system alerts on auth/reconcile/API/crash paths; `USE_TELEGRAM_ALERTS` gate |
 | **P3** | Intraday Backtest Parity | `strategy.py` | Refactor to 1-minute / 5-minute bars **or** downgrade live to pure EOD (Section 12③). |
 
 ### Cheat-on-Close Reference Implementation
@@ -1559,7 +1602,7 @@ cerebro.broker.set_coc(True)   # Execute at current bar close — aligns with an
 - [x] Capital deploy buffer (95%) applied in `calculate_position_size()` and `dual_clamp_portfolio_size()`
 - [ ] `holidays.NYSE` cross-check integrated alongside internal calendar
 - [ ] `api_response_time` logged; Retry Queue wired for timeout events
-- [ ] Telegram / alert webhook configured for CRITICAL reconciliation failures
+- [x] Telegram alerts wired — `telegram_notifier.py`; fill callbacks; `--diagnose` CLI; requires `/start` on your bot + `.env` on each host
 - [ ] Backtest vs. live granularity decision documented (EOD-only or intraday bars)
 
 ---
@@ -1603,6 +1646,11 @@ During live integration deployment, several severe sandbox anomalies within the 
 - **Symptom**: Limit orders accepted (`rt_cd=0`) updated `held_quantity` before any shares filled — phantom positions and invalid SELL attempts.
 - **Resolution**: `execution_engine.py` + `OrderFillMonitor` poll KIS `inquire-ccnl` / `inquire-nccs` (`VTTS3035R` / `VTTS3018R` on VTS). State mutates only after confirmed fills (including partial). Events append to `trade_log.csv`.
 
+### Incident 8: Telegram `Chat not found` (Phase 7)
+
+- **Symptom**: `BadRequest: Chat not found` despite correct-looking `TELEGRAM_CHAT_ID`; token validates via `getMe`.
+- **Resolution**: User must `/start` the **exact bot** matching `TELEGRAM_BOT_TOKEN` (not a similarly named bot). Run `python telegram_notifier.py --diagnose` to compare `.env` chat id vs `getUpdates`. Use `.venv/bin/pip` on Ubuntu EC2 (PEP 668). Keep Telegram credentials in each host's `.env` separately (PC vs EC2).
+
 ---
 
 ## Phase 6: Fill Verification, Trade Log, and Risk Gates
@@ -1624,6 +1672,79 @@ reconcile -> fill poll -> RTH/risk/data gates -> dispatch (accept only) -> fill 
 **Trade log columns:** `timestamp,ticker,signal,qty,order_price,fill_price,status,reason,cash_after,held_qty`
 
 **Statuses:** `ACCEPTED`, `PARTIAL`, `FILLED`, `REJECTED`, `RELEASED`
+
+---
+
+## Phase 7: Telegram Mobile Alerts
+
+Optional push notifications to your phone when the bot fills orders or hits infrastructure failures.
+
+### Architecture
+
+```
+OrderFillMonitor (FILLED/PARTIAL)
+        │ on_fill callback
+        ▼
+main.py → _dispatch_trade_report() → send_trade_report()
+                                              │
+                                              ▼
+                              telegram_notifier._send_message_safe()
+                              async with Bot(token) as bot: ...
+
+main.py exception paths / reconcile failure
+        ▼
+_dispatch_system_alert() → send_system_alert()
+```
+
+| Component | File | Purpose |
+|---|---|---|
+| `TelegramNotifier` | `telegram_notifier.py` | Thin facade; formats MarkdownV2 messages |
+| `_send_message_safe()` | `telegram_notifier.py` | `async with Bot` per message; 3 retries; exponential backoff |
+| `diagnose_telegram_setup()` | `telegram_notifier.py` | Read-only `getMe` + `getUpdates` chat-id match check |
+| Fill callback | `execution_engine.py` | `OrderFillMonitor(on_fill=..., on_alert=...)` |
+| Sync bridge | `main.py` | `asyncio.run(send_*())` from the 60s polling loop |
+
+### Alert Types
+
+| Event | Level / Type | Trigger |
+|---|---|---|
+| BUY/SELL fill (full or partial) | Trade report | `OrderFillMonitor` after ccnl confirms qty |
+| KIS auth failure at startup | CRITICAL | `get_access_token()` exception |
+| Broker reconcile failure | CRITICAL | `ReconciliationReport.reconciled == False` |
+| Per-ticker timeout | WARNING | `requests.Timeout` in watchlist cycle |
+| KIS network / 401 auth | WARNING or CRITICAL | `requests.RequestException`; auth → CRITICAL |
+| Unhandled ticker error / loop crash | CRITICAL | `process_ticker` / main loop outer `except` |
+| Fill poll inquiry failure | WARNING | ccnl/nccs exception inside `OrderFillMonitor` |
+
+When `USE_TELEGRAM_ALERTS=false`, messages are **logged locally only** — no Telegram API calls.
+
+### Setup (one-time)
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) → copy token to `.env` as `TELEGRAM_BOT_TOKEN`.
+2. Open **your bot** in Telegram (must match the token) → tap **Start** → send `/start`.
+3. Set `TELEGRAM_CHAT_ID` to your numeric user id (from [@userinfobot](https://t.me/userinfobot) or `--diagnose` output).
+4. Install dependency: `pip install -r requirements.txt` (`python-telegram-bot>=21.0`).
+
+### Verification Commands
+
+```bash
+# Read-only: bot username, recent chat ids, env match
+python telegram_notifier.py --diagnose
+
+# Send sample trade + summary + INFO alert
+python telegram_notifier.py --verbose
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Chat not found` | `/start` was sent to a **different** bot than the token in `.env`. Open the bot shown by `--diagnose` and `/start` again. |
+| `externally-managed-environment` (EC2) | Use `.venv/bin/pip install -r requirements.txt`, not system `pip`. |
+| Alerts on PC but not EC2 | EC2 `~/toss-trading-bot/.env` needs its own `USE_TELEGRAM_ALERTS` + token + chat id. |
+| `git pull` blocked by `data/*.csv` | On server: `git fetch origin && git reset --hard origin/main` (CSV caches are regenerated at runtime). |
+
+**Security:** Never commit `.env` or paste bot tokens in chat. Revoke and reissue via @BotFather if exposed.
 
 ---
 
@@ -1697,6 +1818,16 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `RTH_BUY_BLOCK_CLOSE_MINUTES` | No | `5` | No new BUY before 16:00 ET close |
 | `PENDING_ORDER_STALE_MINUTES` | No | `120` | Release pending lock if zero fill |
 
+#### Telegram Alerts (Phase 7)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `USE_TELEGRAM_ALERTS` | No | `false` | Master switch; when false, log locally only |
+| `TELEGRAM_BOT_TOKEN` | If alerts on | — | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | If alerts on | — | Numeric user or group chat id |
+| `TELEGRAM_MAX_RETRIES` | No | `3` | Send retry count |
+| `TELEGRAM_BACKOFF_SECONDS` | No | `1.0` | Base backoff (exponential: `2^attempt` seconds) |
+
 > **Deprecated for signal generation:** `SMA_PERIOD`, `ATR_MULTIPLIER`, `RSI_BUY_THRESHOLD`, `VOLUME_THRESHOLD`, `RSI_EXIT_MODE`, and related strategy keys in `.env` are **ignored**. Edit `config.py` to change execution parameters.
 
 ### Loading Chain
@@ -1715,7 +1846,11 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 
 ```
 Toss Trading Bot/
-├── main.py                 # KIS orchestrator, reconciliation, RTH gate, state-gated orders, [METRICS]
+├── main.py                 # KIS orchestrator, reconciliation, RTH gate, Telegram dispatch, state-gated orders
+├── execution_engine.py     # P6: OrderFillMonitor, TradeLogWriter, RiskGuard, fill callbacks
+├── telegram_notifier.py    # P7: async Telegram alerts (trade reports + system alerts)
+├── test_telegram_notifier.py
+├── test_execution_engine.py
 ├── session_manager.py      # P3: RegularHoursGate, IntradaySessionTracker, PortfolioReconciliationEngine
 ├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
 ├── market_registry.py      # DEFAULT_WATCHLIST (15) + KIS MARKET_META routing + parse/validate helpers
@@ -1724,16 +1859,19 @@ Toss Trading Bot/
 ├── portfolio_backtest.py   # Consolidated portfolio backtest (default live-parity path)
 ├── run_backtest.py         # CLI: portfolio backtest, --walk-forward, --isolated legacy, --random smoke test
 ├── test_analytics.py       # Engine verification (trend filter + conditional RSI tests)
-├── requirements.txt        # Python dependencies
+├── requirements.txt        # Python dependencies (includes python-telegram-bot>=21.0)
 ├── .env.example            # Configuration template (copy to .env)
 ├── .gitignore              # Excludes .env, kis_token_cache.json, trading_state.json
 ├── trading_state.json      # Multi-ticker PositionState registry (auto-generated)
+├── trade_log.csv           # P6: append-only fill audit log (auto-generated)
 ├── kis_token_cache.json    # OAuth token cache (auto-generated)
 ├── project_metrics.log     # Example redirected telemetry output
 └── data/
+    ├── spy_daily.csv       # SPY benchmark cache (market filter)
     ├── nvda_daily.csv      # OHLCV cache (bootstrap + incremental refresh)
     ├── pltr_daily.csv
-    └── aapl_daily.csv
+    ├── aapl_daily.csv
+    └── …                   # one CSV per watchlist ticker
 ```
 
 ---
