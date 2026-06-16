@@ -74,6 +74,7 @@ class PositionState:
     last_processed_date: str | None = None
     latest_bar_date: str | None = None
     held_quantity: int = 0
+    last_failed_order_key: str | None = None
     session_low: float | None = None
     highest_price_achieved: float | None = None
     current_atr: float | None = None
@@ -483,7 +484,7 @@ class LiveSignalEngine:
         return state.to_dict()
 
     def _has_active_position(self, state: PositionState) -> bool:
-        """ATR stop path requires an open position (held shares or in_position flag)."""
+        """Position path for replay/intraday logic (dispatch still requires held_quantity > 0)."""
         return state.in_position or state.held_quantity > 0
 
     def _passes_volume_filter(
@@ -881,11 +882,8 @@ class LiveSignalEngine:
         runtime.current_atr = position_state.current_atr
         runtime.dynamic_stop_distance = position_state.dynamic_stop_distance
         runtime.trigger_floor = position_state.trigger_floor
-        if runtime.in_position and runtime.held_quantity <= 0:
-            runtime.held_quantity = max(
-                int(runtime_state.get("held_quantity", 0) if runtime_state else 0),
-                0,
-            )
+        if runtime.held_quantity <= 0:
+            runtime.in_position = False
 
         today = BarSnapshot.from_row(enriched.iloc[-1])
         yesterday = BarSnapshot.from_row(enriched.iloc[-2])
@@ -923,6 +921,8 @@ class LiveSignalEngine:
         eval_state.latest_bar_date = runtime.latest_bar_date
         eval_state.held_quantity = runtime.held_quantity
         eval_state.session_low = runtime.session_low
+        if eval_state.held_quantity <= 0:
+            eval_state.in_position = False
 
         signal_result: dict[str, Any]
         if runtime.pending_order:
@@ -968,6 +968,17 @@ class LiveSignalEngine:
                 "crossover_suppressed": True,
                 "outside_regular_hours": True,
             }
+
+        if (
+            signal_result.get("signal") in {"SELL", "DYNAMIC_ATR_SELL"}
+            and runtime.held_quantity <= 0
+        ):
+            signal_result = {
+                **signal_result,
+                "signal": "HOLD",
+                "liquidation_blocked": True,
+            }
+            runtime.in_position = False
 
         stop_distance = today.atr * self.config.atr_multiplier
         risk_base = portfolio_equity if portfolio_equity is not None else capital_at_risk

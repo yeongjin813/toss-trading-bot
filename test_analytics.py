@@ -363,6 +363,50 @@ def verify_spy_market_filter_blocks_buy() -> None:
     print()
 
 
+def verify_phantom_sell_guard() -> None:
+    print("=" * 88)
+    print("TEST 8: PHANTOM SELL GUARD + EXECUTION QTY")
+    print("=" * 88)
+
+    from main import _limit_order_price, _resolve_execution_quantity
+
+    runtime = PositionState(in_position=True, held_quantity=0)
+    sell_qty = _resolve_execution_quantity("SELL", proposed_size=4, runtime=runtime)
+    assert sell_qty == 0, "SELL must not use proposed_size when held_qty=0"
+
+    runtime.held_quantity = 3
+    sell_qty = _resolve_execution_quantity("SELL", proposed_size=4, runtime=runtime)
+    assert sell_qty == 3
+
+    assert _limit_order_price("BUY", 100.0) == 100.10
+    assert _limit_order_price("SELL", 100.0) == 99.90
+
+    engine = LiveSignalEngine("NVDA")
+    df = build_synthetic_market_data(rows=80)
+    enriched = engine.enrich(df)
+    replay_state = engine.replay_state(enriched, end_index=len(enriched) - 2)
+    runtime_state = {
+        "in_position": replay_state.in_position,
+        "held_quantity": 0,
+        "pending_order": False,
+        "last_processed_date": None,
+    }
+    cycle = engine.evaluate_trading_cycle(
+        df,
+        runtime_state=runtime_state,
+        capital_at_risk=10_000,
+        risk_per_trade=0.01,
+        market_bullish=True,
+    )
+    signal = cycle["signal_result"]["signal"]
+    if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
+        assert cycle["signal_result"].get("liquidation_blocked") is True
+        assert cycle["signal_result"]["signal"] == "HOLD"
+    print("Phantom SELL blocked when held_qty=0   : PASS")
+    print("Limit price buffer (10 bps)            : PASS")
+    print()
+
+
 def main() -> int:
     engine = LiveSignalEngine("PLTR")
 
@@ -375,6 +419,7 @@ def main() -> int:
     verify_trend_filter_and_conditional_rsi(LiveSignalEngine("NVDA"))
     verify_config_registry()
     verify_spy_market_filter_blocks_buy()
+    verify_phantom_sell_guard()
 
     print("=" * 88)
     print("ALL ANALYTICS TESTS PASSED")

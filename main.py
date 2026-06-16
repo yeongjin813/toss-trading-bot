@@ -11,6 +11,8 @@ Setup:
     WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
     USE_SPY_MARKET_FILTER=true
     CAPITAL_AT_RISK=10000
+    KIS_ORDER_TYPE=limit
+    KIS_LIMIT_PRICE_BUFFER_BPS=10
 
 Run:
   python main.py
@@ -90,6 +92,19 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
+KIS_LIMIT_PRICE_BUFFER_BPS = float(os.getenv("KIS_LIMIT_PRICE_BUFFER_BPS", "10"))
+
+
+def _resolve_kis_order_type() -> str:
+    explicit = os.getenv("KIS_ORDER_TYPE", "").strip().lower()
+    if explicit in {"limit", "market"}:
+        return explicit
+    if "openapivts" in BASE_URL:
+        return "limit"
+    return "market"
+
+
+KIS_ORDER_TYPE = _resolve_kis_order_type()
 
 _reconciliation_engine = PortfolioReconciliationEngine(WATCHLIST)
 _execution_gatekeeper = LiveExecutionGatekeeper()
@@ -755,6 +770,19 @@ def persist_market_data(df: pd.DataFrame, path: str) -> None:
     df.to_csv(path, index=False)
 
 
+def _failed_order_key(signal: str, bar_date: str) -> str:
+    return f"{signal}:{bar_date}"
+
+
+def _limit_order_price(side: str, reference_price: float) -> float:
+    if reference_price <= 0:
+        raise ValueError("Reference price must be positive for limit orders.")
+    buffer = KIS_LIMIT_PRICE_BUFFER_BPS / 10_000.0
+    if side.upper() == "BUY":
+        return round(reference_price * (1.0 + buffer), 2)
+    return round(reference_price * (1.0 - buffer), 2)
+
+
 def _resolve_execution_quantity(
     signal: str,
     proposed_size: int,
@@ -764,10 +792,7 @@ def _resolve_execution_quantity(
         return max(int(proposed_size), 0)
 
     if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
-        held = max(int(runtime.held_quantity), 0)
-        if held <= 0 and runtime.has_position:
-            held = max(int(proposed_size), 1)
-        return held
+        return max(int(runtime.held_quantity), 0)
 
     return 0
 
@@ -777,12 +802,18 @@ def execute_broker_order(
     ticker: str,
     signal: str,
     quantity: int,
+    reference_price: float,
 ) -> dict[str, Any]:
     ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
+    use_limit = KIS_ORDER_TYPE == "limit"
+    side = "BUY" if signal == "BUY" else "SELL"
+    order_price = _limit_order_price(side, reference_price) if use_limit else 0.0
+    order_kind = "limit order" if use_limit else "market order"
+    price_suffix = f" @{order_price:.2f}" if use_limit else ""
 
     if signal == "BUY" and quantity > 0:
         print(
-            f"[KIS ORDER] BUY  {ticker} | qty={quantity} | market order | "
+            f"[KIS ORDER] BUY  {ticker} | qty={quantity} | {order_kind}{price_suffix} | "
             f"tr_id={TR_ID_US_BUY}"
         )
         return client.place_us_order(
@@ -790,20 +821,20 @@ def execute_broker_order(
             ticker=ticker,
             ovrs_excg_cd=ovrs_excg_cd,
             quantity=quantity,
-            price=0.0,
+            price=order_price,
         )
 
     if signal in {"SELL", "DYNAMIC_ATR_SELL"} and quantity > 0:
         print(
             f"[KIS ORDER] SELL {ticker} | qty={quantity} | close-position | "
-            f"market order | tr_id={TR_ID_US_SELL}"
+            f"{order_kind}{price_suffix} | tr_id={TR_ID_US_SELL}"
         )
         return client.place_us_order(
             side="SELL",
             ticker=ticker,
             ovrs_excg_cd=ovrs_excg_cd,
             quantity=quantity,
-            price=0.0,
+            price=order_price,
         )
 
     print(f"[KIS ORDER] NO ACTION | {ticker} | signal={signal} | qty={quantity}")
@@ -820,10 +851,11 @@ def dispatch_order_with_state_machine(
     current_bar_date: str,
     allow_crossover: bool,
     states: dict[str, Any],
+    reference_price: float,
 ) -> str:
     """
     Enforce order lifecycle:
-      pending lock -> KIS dispatch -> rt_cd verify -> transition -> persist
+      pending lock -> cooldown check -> KIS dispatch -> rt_cd verify -> transition -> persist
     """
     if runtime.pending_order:
         print(f"[LOCK] {ticker} pending_order=True — signal suppressed")
@@ -832,6 +864,7 @@ def dispatch_order_with_state_machine(
     execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
     if signal in {"SELL", "DYNAMIC_ATR_SELL"} and execution_qty <= 0:
         print(f"[SKIP] {ticker} liquidation skipped — no held quantity tracked")
+        runtime.in_position = False
         return "HOLD"
 
     if signal == "BUY" and execution_qty <= 0:
@@ -841,16 +874,44 @@ def dispatch_order_with_state_machine(
     if signal not in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
         return signal
 
-    order_payload = execute_broker_order(client, ticker, signal, execution_qty)
+    fail_key = _failed_order_key(signal, current_bar_date)
+    if runtime.last_failed_order_key == fail_key:
+        print(
+            f"[ORDER/SKIP] {ticker} — prior rejection on {fail_key}; "
+            "waiting for new bar"
+        )
+        return "HOLD"
+
+    try:
+        order_payload = execute_broker_order(
+            client,
+            ticker,
+            signal,
+            execution_qty,
+            reference_price,
+        )
+    except (RuntimeError, requests.RequestException) as exc:
+        runtime.last_failed_order_key = fail_key
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        print(f"[ORDER/REJECTED] {ticker} {signal} qty={execution_qty} — {exc}")
+        return "HOLD"
+
     if order_payload.get("skipped"):
         return signal
 
     if str(order_payload.get("rt_cd", "")) != "0":
-        raise RuntimeError(
-            f"Order transmission failed for {ticker}: rt_cd={order_payload.get('rt_cd')}"
+        runtime.last_failed_order_key = fail_key
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        print(
+            f"[ORDER/REJECTED] {ticker} {signal} qty={execution_qty} — "
+            f"rt_cd={order_payload.get('rt_cd')}"
         )
+        return "HOLD"
 
     runtime.pending_order = True
+    runtime.last_failed_order_key = None
     states[ticker] = engine.dump_state(runtime)
     save_persisted_states(states)
 
@@ -1106,6 +1167,16 @@ def process_ticker(
         save_persisted_states(states)
         return "HOLD"
 
+    if signal in {"SELL", "DYNAMIC_ATR_SELL"} and runtime.held_quantity <= 0:
+        print(
+            f"[SKIP] {ticker} {signal} suppressed — held_qty=0 "
+            "(no broker shares)"
+        )
+        runtime.in_position = False
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        return "HOLD"
+
     if signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
         execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
         final_signal = dispatch_order_with_state_machine(
@@ -1118,6 +1189,7 @@ def process_ticker(
             cycle["current_bar_date"],
             cycle["allow_crossover"],
             states,
+            reference_price=current_price,
         )
         if final_signal == "BUY" and execution_qty > 0:
             cost = execution_qty * current_price * (1.0 + DEFAULT_COMMISSION_RATE)
@@ -1199,6 +1271,10 @@ def main() -> None:
         f"{'ON (BUY only when SPY > 200MA)' if USE_SPY_MARKET_FILTER else 'OFF'}"
     )
     print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
+    print(
+        f"KIS Order Type      : {KIS_ORDER_TYPE.upper()} "
+        f"(buffer={KIS_LIMIT_PRICE_BUFFER_BPS} bps when limit)"
+    )
     print(f"State File          : {STATE_FILE}")
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")

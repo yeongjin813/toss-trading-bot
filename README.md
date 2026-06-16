@@ -1136,6 +1136,9 @@ Signal execution parameters are **ticker-isolated** via `config.py` → `Strateg
 | `LOOP_COOLDOWN_SECONDS` | **60** | Open-session inter-cycle pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | **3600** | Closed-session extended sleep |
 | `TICKER_SLEEP_SECONDS` | **1** | Pause between tickers within a cycle |
+| `USE_SPY_MARKET_FILTER` | **true** | Block new BUY entries when SPY close ≤ 200-day SMA |
+| `KIS_ORDER_TYPE` | **limit** on VTS (`openapivts` URL) | `limit` or `market`; VTS mock rejects market orders for many US names |
+| `KIS_LIMIT_PRICE_BUFFER_BPS` | **10** | Limit price offset from reference close (buy +bps, sell −bps) |
 
 #### Gate Relaxation Note (June 2026)
 
@@ -1164,6 +1167,10 @@ RISK_PER_TRADE=0.01
 LOOP_COOLDOWN_SECONDS=60
 TICKER_SLEEP_SECONDS=1
 MARKET_CLOSED_SLEEP_SECONDS=3600
+
+# VTS mock: limit orders required for many US tickers (AMD/TSLA etc.)
+KIS_ORDER_TYPE=limit
+KIS_LIMIT_PRICE_BUFFER_BPS=10
 
 # Signal parameters are NOT configured here — see config.py (StrategyConfigMapper)
 ```
@@ -1222,7 +1229,78 @@ Intraday ATR Scan    : ACTIVE (session_low vs prior trigger_floor)
 Deployable Cash      : $9,750.00
 Portfolio Equity     : $11,234.50
 [LOCK] NVDA pending_order=True — signal suppressed
+[KIS ORDER] BUY  AMD | qty=1 | limit order @497.15 | tr_id=VTTT1002U
+[ORDER/REJECTED] AMD BUY qty=1 — Order rejected for AMD: 40650000 | ...
+[ORDER/SKIP] AMD — prior rejection on BUY:2026-06-12; waiting for new bar
+[SKIP] NVDA SELL suppressed — held_qty=0 (no broker shares)
 ```
+
+### D2. AWS EC2 Deployment (systemd)
+
+Production runs on a Linux VM (e.g. AWS EC2 `t3.micro`) with **systemd** keeping `main.py` alive after SSH disconnect.
+
+**Typical layout on server:**
+
+```
+/home/ubuntu/toss-trading-bot/
+├── .venv/
+├── .env              # credentials + WATCHLIST (never commit)
+├── main.py
+├── project_metrics.log
+└── trading_state.json
+```
+
+**systemd unit** (`/etc/systemd/system/toss-bot.service`):
+
+```ini
+[Unit]
+Description=Toss Trading Bot (KIS VTS)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/toss-trading-bot
+Environment=PATH=/home/ubuntu/toss-trading-bot/.venv/bin
+ExecStart=/home/ubuntu/toss-trading-bot/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Enable and start:**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable toss-bot
+sudo systemctl start toss-bot
+sudo systemctl status toss-bot
+```
+
+**After code changes on your PC:**
+
+```bash
+cd ~/toss-trading-bot
+git pull
+sudo systemctl restart toss-bot
+```
+
+**Monitor from Windows PowerShell:**
+
+```powershell
+# Service health
+ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "sudo systemctl status toss-bot --no-pager"
+
+# Live log tail
+ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "tail -f ~/toss-trading-bot/project_metrics.log"
+
+# Download full log for Cursor analysis
+scp -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP:~/toss-trading-bot/project_metrics.log "C:\path\to\Toss Trading Bot\project_metrics_aws.log"
+```
+
+Log growth is ~10–15 MB per US trading day (60s cycles × 15 tickers). Rotate or truncate `project_metrics.log` periodically on long-running instances.
 
 ### D. Empirical Log Redirection Command
 
@@ -1505,6 +1583,21 @@ During live integration deployment, several severe sandbox anomalies within the 
 - **Symptom**: TR ID `VTTT3402R` returned `OPSQ0002` (invalid TR code) on VTS.
 - **Resolution**: Confirmed working mock TR is **`VTRP6504R`**. Inquiry remains optional and non-blocking.
 
+### Incident 4: VTS Market-Order Rejection (`40650000`)
+
+- **Symptom**: BUY attempts for `AMD`, `TSLA`, and other US names failed with `모의투자 주문처리가 안되었습니다(지정가만 가능한 상품입니다)` — 400+ retries in a single session with zero fills.
+- **Resolution**: `main.py` defaults to **`KIS_ORDER_TYPE=limit`** when `BASE_URL` contains `openapivts`. Limit price = reference close ± `KIS_LIMIT_PRICE_BUFFER_BPS` (default 10 bps). Log banner: `[KIS ORDER] BUY … | limit order @price`.
+
+### Incident 5: Phantom SELL Without Broker Shares
+
+- **Symptom**: Historical replay set `in_position=True` while `held_quantity=0` after failed BUYs, generating `SELL`/`DYNAMIC_ATR_SELL` signals that VTS rejected (`90000000 | 모의투자에서는 해당업무가 제공되지 않습니다`).
+- **Resolution**: `LiveSignalEngine.evaluate_trading_cycle()` downgrades liquidation signals to `HOLD` when `held_quantity <= 0`. `_resolve_execution_quantity()` uses **broker-held shares only** (no `proposed_size` fallback). `process_ticker()` prints `[SKIP] … held_qty=0`.
+
+### Incident 6: Order-Rejection Retry Storm
+
+- **Symptom**: Same-bar BUY/SELL retried every 60 seconds after rejection, flooding logs and marking cycles `FAILED`.
+- **Resolution**: `PositionState.last_failed_order_key` stores `{signal}:{bar_date}` on rejection. Subsequent attempts on the same bar log `[ORDER/SKIP]` and return `HOLD` without raising. Rejections log `[ORDER/REJECTED]` — cycle summary stays `HOLD`, not `FAILED`.
+
 ---
 
 ## Appendix B: Signal Priority & Execution Rules
@@ -1514,8 +1607,8 @@ Signal evaluation runs independently per ticker according to strict descending c
 | Priority | Signal Code | Terminal Banner | Trigger Condition |
 |---|---|---|---|
 | **1** | `DYNAMIC_ATR_SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Step 1: $\text{session\_low} \le \text{Trigger Floor}_{t-1}$ — **RTH only if positioned** |
-| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Death Cross (unconditional) OR RSI crossdown (< 50, regime-conditional) — **regular hours + new bar** |
-| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| market order` | Golden Cross + RSI gate + Volume gate + Trend filter (`Close > SMA_LONG` OR `SMA_SHORT > SMA_LONG` when enabled) — **regular hours + new bar** |
+| **2** | `SELL` | `[KIS ORDER] SELL {TICKER} \| close-position` | Death Cross (unconditional) OR RSI crossdown (< 50, regime-conditional) — **regular hours + new bar + held_qty > 0** |
+| **3** | `BUY` | `[KIS ORDER] BUY {TICKER} \| limit order @price` (VTS default) | Golden Cross + RSI gate + Volume gate + Trend filter — **regular hours + new bar** |
 | **4** | `HOLD` | `[METRICS] ... Signal: HOLD` | Default; BUY blocked on liquidity fail or crossover suppression |
 
 ### Dynamic ATR Stop Formula
@@ -1565,6 +1658,9 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
 | `TICKER_SLEEP_SECONDS` | No | `1` | Inter-ticker pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | No | `3600` | Holiday/weekend sleep |
+| `USE_SPY_MARKET_FILTER` | No | `true` | Block BUY when SPY ≤ 200MA |
+| `KIS_ORDER_TYPE` | No | `limit` on VTS URL | `limit` or `market` |
+| `KIS_LIMIT_PRICE_BUFFER_BPS` | No | `10` | Limit price buffer vs reference close |
 
 > **Deprecated for signal generation:** `SMA_PERIOD`, `ATR_MULTIPLIER`, `RSI_BUY_THRESHOLD`, `VOLUME_THRESHOLD`, `RSI_EXIT_MODE`, and related strategy keys in `.env` are **ignored**. Edit `config.py` to change execution parameters.
 
