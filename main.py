@@ -20,7 +20,9 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -65,6 +67,11 @@ from session_manager import (
     PortfolioLedger,
     PortfolioReconciliationEngine,
     RegularHoursGate,
+)
+from telegram_notifier import (
+    TelegramConfig,
+    send_system_alert,
+    send_trade_report,
 )
 
 load_dotenv(override=True)
@@ -126,7 +133,117 @@ KIS_ORDER_TYPE = _resolve_kis_order_type()
 EXECUTION_SETTINGS = ExecutionSettings.from_env()
 TRADE_LOG = TradeLogWriter(TRADE_LOG_FILE)
 RISK_GUARD = RiskGuard(EXECUTION_SETTINGS)
-FILL_MONITOR = OrderFillMonitor(EXECUTION_SETTINGS, TRADE_LOG)
+
+logger = logging.getLogger(__name__)
+
+
+def _telegram_enabled() -> bool:
+    return TelegramConfig.from_env().enabled
+
+
+def _run_telegram(coro) -> None:
+    """Run an async Telegram coroutine from sync code; no-op when alerts disabled."""
+    if not _telegram_enabled():
+        return
+
+    try:
+        asyncio.run(coro)
+    except Exception as exc:
+        logger.error("Telegram dispatch failed: %s", exc)
+
+
+def _dispatch_trade_report(
+    ticker: str,
+    action: str,
+    quantity: int,
+    price: float,
+    execution_time: datetime,
+    *,
+    fill_status: str = "FILLED",
+) -> None:
+    logger.info(
+        "[TRADE/%s] %s %s qty=%s @ $%.2f",
+        fill_status,
+        action,
+        ticker,
+        quantity,
+        price,
+    )
+    if not _telegram_enabled():
+        logger.debug("USE_TELEGRAM_ALERTS=false — trade report logged locally only")
+        return
+
+    _run_telegram(
+        send_trade_report(
+            ticker,
+            action,
+            quantity,
+            price,
+            execution_time,
+        )
+    )
+    logger.info("Telegram trade report sent for %s %s", action, ticker)
+
+
+def _dispatch_system_alert(level: str, message: str) -> None:
+    level_upper = level.upper()
+    log_fn = {
+        "CRITICAL": logger.critical,
+        "WARNING": logger.warning,
+        "INFO": logger.info,
+    }.get(level_upper, logger.info)
+    log_fn("[ALERT/%s] %s", level_upper, message)
+
+    if not _telegram_enabled():
+        logger.debug("USE_TELEGRAM_ALERTS=false — system alert logged locally only")
+        return
+
+    _run_telegram(send_system_alert(level_upper, message))
+
+
+def _handle_trade_fill(
+    ticker: str,
+    side: str,
+    quantity: int,
+    fill_price: float,
+    status: str,
+) -> None:
+    action = "SELL" if side in {"SELL", "DYNAMIC_ATR_SELL"} else "BUY"
+    _dispatch_trade_report(
+        ticker,
+        action,
+        quantity,
+        fill_price,
+        datetime.now(),
+        fill_status=status,
+    )
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if any(
+        keyword in text
+        for keyword in (
+            "401",
+            "403",
+            "unauthorized",
+            "authentication",
+            "token issuance",
+            "access_token",
+        )
+    ):
+        return True
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code in {401, 403}
+
+
+FILL_MONITOR = OrderFillMonitor(
+    EXECUTION_SETTINGS,
+    TRADE_LOG,
+    on_fill=_handle_trade_fill,
+    on_alert=_dispatch_system_alert,
+)
 
 _reconciliation_engine = PortfolioReconciliationEngine(WATCHLIST)
 _execution_gatekeeper = LiveExecutionGatekeeper()
@@ -1262,6 +1379,11 @@ def run_session_reconciliation(
         states,
         fallback_cash=CAPITAL_AT_RISK,
     )
+    if not report.reconciled and report.error:
+        _dispatch_system_alert(
+            "CRITICAL",
+            f"Broker reconciliation failed: {report.error}",
+        )
     if report.reconciled and is_us_regular_market_hours(now):
         states.setdefault("_portfolio", {})["last_reconcile_session_date"] = now.strftime(
             "%Y-%m-%d"
@@ -1506,13 +1628,23 @@ def run_watchlist_cycle(
             summary.append((ticker, signal))
         except requests.Timeout as exc:
             print(f"[ERROR] Timeout for {ticker}: {exc}")
+            _dispatch_system_alert("WARNING", f"{ticker} KIS request timeout: {exc}")
             summary.append((ticker, "TIMEOUT"))
         except requests.RequestException as exc:
             print(f"[ERROR] Network failure for {ticker}: {exc}")
+            alert_level = "CRITICAL" if _is_auth_failure(exc) else "WARNING"
+            _dispatch_system_alert(
+                alert_level,
+                f"{ticker} KIS API connection failure: {exc}",
+            )
             summary.append((ticker, "NETWORK_ERROR"))
         except Exception as exc:
             print(f"[ERROR] Unhandled failure for {ticker}: {exc}")
             traceback.print_exc()
+            _dispatch_system_alert(
+                "CRITICAL",
+                f"{ticker} unhandled trading loop failure: {exc}",
+            )
             summary.append((ticker, "FAILED"))
 
         if index < len(WATCHLIST) - 1:
@@ -1530,7 +1662,16 @@ def run_watchlist_cycle(
 
 
 def main() -> None:
-    validate_environment()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    try:
+        validate_environment()
+    except RuntimeError as exc:
+        _dispatch_system_alert("CRITICAL", f"Startup validation failed: {exc}")
+        raise
 
     print("KIS Mock Trading - Production Execution Engine")
     print(f"Execution Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1557,13 +1698,21 @@ def main() -> None:
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
     print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
+    print(
+        f"Telegram Alerts     : "
+        f"{'ON' if _telegram_enabled() else 'OFF (USE_TELEGRAM_ALERTS=false)'}"
+    )
     print("=" * 88)
 
     client = KISApiClient()
     cache = MarketDataCache(client)
 
     print("Requesting KIS access token...")
-    client.get_access_token()
+    try:
+        client.get_access_token()
+    except Exception as exc:
+        _dispatch_system_alert("CRITICAL", f"KIS authentication failed: {exc}")
+        raise
     print("Access token ready.")
 
     print("Bootstrapping historical market data cache (one-time full fetch)...")
@@ -1636,7 +1785,18 @@ def main() -> None:
         save_persisted_states(states)
         print(f"Final state saved to {STATE_FILE}")
         sys.exit(0)
+    except Exception as exc:
+        print(f"[FATAL] Trading loop crashed: {exc}")
+        traceback.print_exc()
+        _dispatch_system_alert("CRITICAL", f"Trading loop crashed: {exc}")
+        save_persisted_states(states)
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        if not isinstance(exc, KeyboardInterrupt):
+            logger.critical("Bot terminated: %s", exc)
+        raise

@@ -6,3 +6,4 @@ backtrader
 requests
 python-dotenv
 pytz
+python-telegram-bot>=21.0

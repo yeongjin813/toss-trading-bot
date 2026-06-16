@@ -8,7 +8,10 @@ import csv
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
+
+FillCallback = Callable[[str, str, int, float, str], None]
+AlertCallback = Callable[[str, str], None]
 
 from analytics import PositionState, _to_ny_datetime
 from market_registry import MARKET_META
@@ -334,9 +337,37 @@ class OrderFillMonitor:
         self,
         settings: ExecutionSettings,
         trade_log: TradeLogWriter,
+        *,
+        on_fill: FillCallback | None = None,
+        on_alert: AlertCallback | None = None,
     ) -> None:
         self.settings = settings
         self.trade_log = trade_log
+        self.on_fill = on_fill
+        self.on_alert = on_alert
+
+    def _notify_fill(
+        self,
+        ticker: str,
+        side: str,
+        quantity: int,
+        fill_price: float,
+        status: str,
+    ) -> None:
+        if quantity <= 0 or not self.on_fill:
+            return
+        try:
+            self.on_fill(ticker, side, quantity, fill_price, status)
+        except Exception as exc:
+            print(f"[NOTIFY/FILL] callback failed for {ticker}: {exc}")
+
+    def _notify_alert(self, level: str, message: str) -> None:
+        if not self.on_alert:
+            return
+        try:
+            self.on_alert(level, message)
+        except Exception as exc:
+            print(f"[NOTIFY/ALERT] callback failed: {exc}")
 
     def resolve_ticker(
         self,
@@ -380,6 +411,10 @@ class OrderFillMonitor:
             nccs_rows = client.fetch_overseas_open_orders(ovrs_excg_cd=ovrs_excg_cd)
         except Exception as exc:
             print(f"[FILL/POLL] {ticker} inquiry failed: {exc}")
+            self._notify_alert(
+                "WARNING",
+                f"{ticker} KIS fill inquiry failed: {exc}",
+            )
             return False
 
         filled_qty, fill_price = summarize_ccnl_fills(
@@ -423,6 +458,13 @@ class OrderFillMonitor:
                     f"[FILL/PARTIAL] {ticker} BUY {filled_qty}/{order_qty} "
                     f"@ {fill_price:.2f} odno={odno}"
                 )
+                self._notify_fill(
+                    ticker,
+                    "BUY",
+                    filled_qty,
+                    float(fill_price or runtime.open_order_price or 0.0),
+                    "PARTIAL",
+                )
                 return False
 
             engine.apply_post_order_transition(
@@ -447,6 +489,13 @@ class OrderFillMonitor:
             print(
                 f"[FILL/COMPLETE] {ticker} BUY held_qty={runtime.held_quantity} "
                 f"odno={odno}"
+            )
+            self._notify_fill(
+                ticker,
+                "BUY",
+                runtime.held_quantity,
+                float(fill_price or runtime.open_order_price or 0.0),
+                "FILLED",
             )
             return True
 
@@ -473,6 +522,13 @@ class OrderFillMonitor:
                     f"[FILL/PARTIAL] {ticker} SELL {sold_qty}/{order_qty} "
                     f"remaining={runtime.held_quantity}"
                 )
+                self._notify_fill(
+                    ticker,
+                    side,
+                    sold_qty,
+                    float(fill_price or runtime.open_order_price or 0.0),
+                    "PARTIAL",
+                )
                 return False
 
             engine.apply_post_order_transition(
@@ -497,6 +553,13 @@ class OrderFillMonitor:
             print(
                 f"[FILL/COMPLETE] {ticker} SELL sold={sold_qty} "
                 f"held_qty={runtime.held_quantity}"
+            )
+            self._notify_fill(
+                ticker,
+                side,
+                sold_qty,
+                float(fill_price or runtime.open_order_price or 0.0),
+                "FILLED",
             )
             return True
 
