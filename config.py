@@ -84,24 +84,24 @@ class StrategyConfigMapper:
 
     _NVDA: ClassVar[TickerConfig] = TickerConfig(
         sma_period=10,
-        rsi_buy_threshold=42.0,
-        volume_threshold=0.75,
+        rsi_buy_threshold=40.0,
+        volume_threshold=0.55,
         atr_multiplier=3.0,
         use_trend_filter=True,
     )
 
     _PLTR: ClassVar[TickerConfig] = TickerConfig(
         sma_period=10,
-        rsi_buy_threshold=45.0,
-        volume_threshold=0.85,
+        rsi_buy_threshold=42.0,
+        volume_threshold=0.60,
         atr_multiplier=2.5,
         use_trend_filter=False,
     )
 
     _DEFAULT: ClassVar[TickerConfig] = TickerConfig(
         sma_period=20,
-        rsi_buy_threshold=50.0,
-        volume_threshold=1.0,
+        rsi_buy_threshold=48.0,
+        volume_threshold=0.65,
         atr_multiplier=2.0,
         use_trend_filter=True,
     )

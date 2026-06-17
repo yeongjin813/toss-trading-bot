@@ -425,6 +425,29 @@ def verify_nyse_holiday_library_merge() -> None:
     print()
 
 
+def verify_intraday_volume_projection() -> None:
+    print("=" * 88)
+    print("TEST 10: INTRADAY VOLUME PROJECTION (live liquidity gate)")
+    print("=" * 88)
+
+    engine = LiveSignalEngine("NVDA")
+    volume_sma = 1_000_000.0
+
+    # Mid-session: raw 0.30x fails old gate, passes projected gate at threshold 0.55
+    assert engine._passes_volume_filter(
+        volume=0.30 * volume_sma,
+        volume_sma=volume_sma,
+        session_volume_fraction=0.5,
+    )
+    assert not engine._passes_volume_filter(
+        volume=0.20 * volume_sma,
+        volume_sma=volume_sma,
+        session_volume_fraction=0.5,
+    )
+    print("Projected volume gate (50% session)    : PASS")
+    print()
+
+
 def verify_use_eod_atr_stops_env() -> None:
     print("=" * 88)
     print("TEST 9: USE_EOD_ATR_STOPS ENV FLAG")
@@ -460,6 +483,7 @@ def main() -> int:
     verify_spy_market_filter_blocks_buy()
     verify_phantom_sell_guard()
     verify_nyse_holiday_library_merge()
+    verify_intraday_volume_projection()
     verify_use_eod_atr_stops_env()
 
     print("=" * 88)

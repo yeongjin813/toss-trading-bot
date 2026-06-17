@@ -626,8 +626,13 @@ class LiveSignalEngine:
         if volume_sma <= 0:
             return False
         fraction = min(max(session_volume_fraction, 0.05), 1.0)
-        effective_threshold = self.config.volume_threshold * fraction
-        return volume > volume_sma * effective_threshold
+        if fraction >= 0.999:
+            projected_volume = volume
+        else:
+            # Scale partial RTH volume to a full-session equivalent before comparing
+            # to the 20-day average daily volume (backtest uses fraction=1.0).
+            projected_volume = volume / fraction
+        return projected_volume > volume_sma * self.config.volume_threshold
 
     def _golden_cross(
         self, close: float, sma: float, prev_close: float, prev_sma: float

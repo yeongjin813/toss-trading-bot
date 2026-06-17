@@ -1176,15 +1176,15 @@ $$
 
 ### E. Liquidity Gate Calibration
 
-Long entry (`BUY`) requires volume confirmation against the 20-day average. Thresholds are **ticker-isolated** in `config.py` (NVDA **0.75×**, PLTR **0.85×**, AAPL **1.0×**).
+Long entry (`BUY`) requires volume confirmation against the 20-day average. Thresholds are **ticker-isolated** in `config.py` (NVDA **0.55×**, PLTR **0.60×**, DEFAULT **0.65×**).
 
-During **live intraday polls**, the gate scales by NY session progress so partial-bar volume is not compared to a full-day average without adjustment:
+During **live intraday polls**, partial-bar volume is **projected to a full-session equivalent** before comparison (fixes false `Liquidity OK: False` spam during RTH):
 
 $$
-\text{Volume Gate PASS:}\quad \text{Volume}_t > \text{Volume\_SMA}_{20} \times \text{volume\_threshold} \times f_{\text{session}}
+\text{Volume Gate PASS:}\quad \frac{\text{Volume}_t}{f_{\text{session}}} > \text{Volume\_SMA}_{20} \times \text{volume\_threshold}
 $$
 
-where $f_{\text{session}}$ is the fraction of regular NY hours elapsed (09:30–16:00 ET, floor **0.05**). **Backtests and completed daily bars** use $f_{\text{session}} = 1.0$.
+where $f_{\text{session}}$ is the fraction of regular NY hours elapsed (09:30–16:00 ET, floor **0.05**). **Backtests and completed daily bars** use $f_{\text{session}} = 1.0$ (no projection).
 
 ```
 Volume Gate FAIL  →  HOLD (liquidity_blocked)
@@ -1205,8 +1205,8 @@ Signal execution parameters are **ticker-isolated** via `config.py` → `Strateg
 | Parameter | NVDA | PLTR | DEFAULT (AAPL) | Description |
 |---|---|---|---|---|
 | `sma_period` | 10 | 10 | 20 | Short SMA — Golden/Death cross window |
-| `rsi_buy_threshold` | 42 | 45 | 50 | Minimum RSI for BUY authorization |
-| `volume_threshold` | 0.75 | 0.85 | 1.0 | Volume surge multiplier vs. 20-day avg (× session fraction live) |
+| `volume_threshold` | 0.55 | 0.60 | 0.65 | Projected volume surge multiplier vs. 20-day avg |
+| `rsi_buy_threshold` | 40 | 42 | 48 | Minimum RSI for BUY authorization |
 | `atr_multiplier` | 3.0 | 2.5 | 2.0 | Trailing stop width ($\text{ATR} \times \text{mult}$) |
 | `use_trend_filter` | True | False | True | Enable 50-day SMA regime gate + conditional RSI exit |
 | `sma_long_period` | 50 | 50 | 50 | Fixed macro regime baseline (not ticker-tuned) |
