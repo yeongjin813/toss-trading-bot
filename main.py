@@ -40,6 +40,7 @@ from analytics import (
     describe_us_market_closure,
     is_us_equity_session,
     is_us_regular_market_hours,
+    seconds_until_us_rth_open,
     spy_regime_snapshot,
 )
 from config import StrategyConfigMapper
@@ -117,6 +118,7 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
+KIS_REQUEST_TIMEOUT_SECONDS = int(os.getenv("KIS_REQUEST_TIMEOUT_SECONDS", "30"))
 
 
 def _resolve_kis_order_type() -> str:
@@ -185,7 +187,12 @@ def _dispatch_trade_report(
     logger.info("Telegram trade report sent for %s %s", action, ticker)
 
 
-def _dispatch_system_alert(level: str, message: str) -> None:
+def _dispatch_system_alert(
+    level: str,
+    message: str,
+    *,
+    telegram: bool | None = None,
+) -> None:
     level_upper = level.upper()
     log_fn = {
         "CRITICAL": logger.critical,
@@ -196,6 +203,13 @@ def _dispatch_system_alert(level: str, message: str) -> None:
 
     if not _telegram_enabled():
         logger.debug("USE_TELEGRAM_ALERTS=false — system alert logged locally only")
+        return
+
+    send_telegram = telegram
+    if send_telegram is None:
+        send_telegram = level_upper != "WARNING" or is_us_regular_market_hours()
+    if not send_telegram:
+        logger.debug("Outside RTH — %s alert logged locally only (no Telegram)", level_upper)
         return
 
     _run_telegram(send_system_alert(level_upper, message))
@@ -329,7 +343,7 @@ class KISApiClient:
             "appkey": APP_KEY,
             "appsecret": APP_SECRET,
         }
-        response = requests.post(url, json=body, timeout=15)
+        response = requests.post(url, json=body, timeout=KIS_REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         payload = response.json()
 
@@ -373,7 +387,7 @@ class KISApiClient:
                 "appsecret": APP_SECRET,
             },
             json=body,
-            timeout=15,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
@@ -407,7 +421,7 @@ class KISApiClient:
                     url,
                     headers=self._build_headers(TR_ID_DAILY_PRICE),
                     params=params,
-                    timeout=15,
+                    timeout=KIS_REQUEST_TIMEOUT_SECONDS,
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -523,7 +537,7 @@ class KISApiClient:
             url,
             headers=self._build_headers(tr_id, include_hashkey=True, hashkey=hashkey),
             json=order_body,
-            timeout=15,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
@@ -557,7 +571,7 @@ class KISApiClient:
             url,
             headers=self._build_headers(TR_ID_US_PRESENT_BALANCE),
             params=params,
-            timeout=15,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
@@ -601,7 +615,7 @@ class KISApiClient:
             url,
             headers=self._build_headers(TR_ID_US_CCNL),
             params=params,
-            timeout=15,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
@@ -636,7 +650,7 @@ class KISApiClient:
             url,
             headers=self._build_headers(TR_ID_US_NCCS),
             params=params,
-            timeout=15,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
@@ -678,7 +692,7 @@ class KISApiClient:
             url,
             headers=self._build_headers(TR_ID_US_CANCEL, include_hashkey=True, hashkey=hashkey),
             json=order_body,
-            timeout=15,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
@@ -1606,21 +1620,24 @@ def run_watchlist_cycle(
             f"[GATE] US calendar session closed ({closure_reason}) — "
             "no live execution; sleeping"
         )
-    elif not is_us_regular_market_hours():
+        return states, ledger
+
+    if not is_us_regular_market_hours():
         print(
             "[GATE/RTH] Outside NY regular hours (09:30-16:00 ET) — "
-            "all signals blocked until RTH open"
+            "skipping API cycle until RTH open"
         )
-    else:
-        states, ledger = run_session_reconciliation(client, states)
-        FILL_MONITOR.resolve_all_pending(
-            client,
-            states,
-            WATCHLIST,
-            LiveSignalEngine,
-            cash_after=ledger.available_cash_usd,
-        )
-        save_persisted_states(states)
+        return states, ledger
+
+    states, ledger = run_session_reconciliation(client, states)
+    FILL_MONITOR.resolve_all_pending(
+        client,
+        states,
+        WATCHLIST,
+        LiveSignalEngine,
+        cash_after=ledger.available_cash_usd,
+    )
+    save_persisted_states(states)
 
     for index, ticker in enumerate(WATCHLIST):
         try:
@@ -1698,6 +1715,7 @@ def main() -> None:
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
     print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
+    print(f"KIS Request Timeout : {KIS_REQUEST_TIMEOUT_SECONDS}s")
     print(
         f"Telegram Alerts     : "
         f"{'ON' if _telegram_enabled() else 'OFF (USE_TELEGRAM_ALERTS=false)'}"
@@ -1763,6 +1781,20 @@ def main() -> None:
                     f"Sleeping {MARKET_CLOSED_SLEEP_SECONDS} seconds..."
                 )
                 time.sleep(MARKET_CLOSED_SLEEP_SECONDS)
+                continue
+
+            if not is_us_regular_market_hours(cycle_started):
+                sleep_seconds = seconds_until_us_rth_open(cycle_started)
+                print()
+                print(
+                    f"--- Cycle {cycle_count} skipped at "
+                    f"{cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---"
+                )
+                print(
+                    "[GATE/RTH] Outside NY regular hours (09:30-16:00 ET) — "
+                    f"no KIS API calls; sleeping {sleep_seconds}s until next RTH window"
+                )
+                time.sleep(sleep_seconds)
                 continue
 
             print()

@@ -335,6 +335,55 @@ def is_us_regular_market_hours(current_dt: datetime | None = None) -> bool:
     return US_REGULAR_MARKET_OPEN <= current_clock < US_REGULAR_MARKET_CLOSE
 
 
+def seconds_until_us_rth_open(
+    current_dt: datetime | None = None,
+    *,
+    min_sleep: int = 60,
+    max_sleep: int = 3600,
+) -> int:
+    """
+    Seconds until the next NYSE regular session open (09:30 ET).
+
+    Capped at ``max_sleep`` so the outer loop can re-check clocks periodically.
+    """
+    if is_us_regular_market_hours(current_dt):
+        return 0
+
+    ny_dt = _to_ny_datetime(current_dt)
+    candidate_day = ny_dt.date()
+    if ny_dt.time() >= US_REGULAR_MARKET_CLOSE:
+        candidate_day += timedelta(days=1)
+
+    open_dt: datetime | None = None
+    for _ in range(366):
+        if candidate_day.weekday() >= 5:
+            candidate_day += timedelta(days=1)
+            continue
+        if candidate_day in us_market_holidays_for_year(candidate_day.year):
+            candidate_day += timedelta(days=1)
+            continue
+
+        open_dt = ny_dt.replace(
+            year=candidate_day.year,
+            month=candidate_day.month,
+            day=candidate_day.day,
+            hour=US_REGULAR_MARKET_OPEN.hour,
+            minute=US_REGULAR_MARKET_OPEN.minute,
+            second=0,
+            microsecond=0,
+        )
+        if open_dt <= ny_dt:
+            candidate_day += timedelta(days=1)
+            continue
+        break
+
+    if open_dt is None or open_dt <= ny_dt:
+        return max_sleep
+
+    seconds = int((open_dt - ny_dt).total_seconds())
+    return min(max(seconds, min_sleep), max_sleep)
+
+
 def ny_regular_session_elapsed_fraction(current_dt: datetime | None = None) -> float:
     """
     Fraction of the NY regular session elapsed (09:30-16:00 ET).
