@@ -8,9 +8,9 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
-| **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS Sandbox Deployment) |
-| **Anchor Account** | CANO: `50191906` \| ACNT_PRDT_CD: `01` (Unified Portfolio Suffix) — override via `.env` |
-| **Execution Loop** | 60-Second Real-Time Polling Loop with Asymmetric Network Bypass |
+| **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
+| **Account** | Set in `.env` — `KIS_CANO`, `KIS_ACNT_PRDT_CD` (never commit) |
+| **Execution Loop** | 60s watchlist cycle **during NY RTH only** (09:30–16:00 ET); sleeps off-hours |
 | **Data Architecture** | Bootstrap 756 bars once → 1-bar micro-fetch per open-session cycle |
 | **Session Gate** | NYSE holiday registry + **`is_us_regular_market_hours()`** (09:30–16:00 ET via `pytz`) |
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
@@ -22,38 +22,147 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
+**Latest production commits:** `46767be` (RTH-only polling) · `872f7d2` (Telegram) · `66951a6` (fill verification)
+
+---
+
+## Start Here
+
+Use this guide to find the right section without reading all ~2,000 lines.
+
+| I want to… | Go to |
+|---|---|
+| Run or monitor the live bot | [Quick Operations Cheatsheet](#quick-operations-cheatsheet) |
+| Deploy to AWS EC2 | [EC2 Deployment (systemd)](#d2-aws-ec2-deployment-systemd) |
+| Configure `.env` | [Appendix C — Environment Variables](#appendix-c-configuration-externalization-matrix) |
+| Understand RTH / off-hours behavior | [Phase 7.1 — RTH-Only Polling](#phase-71-rth-only-polling--alert-hardening) |
+| Set up Telegram alerts | [Phase 7 — Telegram](#phase-7-telegram-mobile-alerts) |
+| Debug VTS quirks | [Appendix A — Incident Ledger](#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses) |
+| Strategy / backtest math | Sections [2](#2-dedicated-section-same-bar-look-ahead-bias-eradication)–[5](#5-dedicated-section-nyse-holiday-registry--loop-suppression), [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering) |
+
+---
+
+## Quick Operations Cheatsheet
+
+Copy/paste commands for day-to-day production work.
+
+### When the bot runs (Phase 7.1)
+
+| Calendar | NY time (ET) | KIS API calls |
+|---|---|---|
+| Weekend / holiday | any | **None** — sleeps 3600s |
+| Weekday | Outside 09:30–16:00 | **None** — sleeps until RTH |
+| Weekday | 09:30–16:00 (RTH) | **Active** — 15 tickers every 60s |
+
+Key log lines: `[GATE] US market closed` · `[GATE/RTH] ... no KIS API calls` · `--- Cycle N started ---` (RTH only)
+
+### Check the bot is running
+
+| Where | Command |
+|---|---|
+| **Already on EC2** (`ubuntu@ip-...`) | `systemctl is-active toss-bot` |
+| **Windows PowerShell** | `ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "systemctl is-active toss-bot"` |
+
+Expected output: `active`
+
+> **SSH tip:** If your prompt is already `ubuntu@ip-...`, you are **on the server** — run `systemctl` directly. Do **not** nest `ssh` with a Windows `C:\...` key path from inside EC2.
+
+### Deploy latest code (EC2)
+
+```bash
+cd ~/toss-trading-bot
+git fetch origin && git reset --hard origin/main
+.venv/bin/pip install -r requirements.txt
+sudo systemctl restart toss-bot
+systemctl is-active toss-bot
+```
+
+### Watch logs
+
+```bash
+# On EC2
+tail -f ~/toss-trading-bot/project_metrics.log
+grep RECONCILE project_metrics.log | tail -5
+```
+
+```powershell
+# From Windows PowerShell
+ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "tail -f ~/toss-trading-bot/project_metrics.log"
+```
+
+### Capital: broker app vs bot logs
+
+| Source | Typical value | Meaning |
+|---|---|---|
+| KIS mock app “orderable USD” | ~$100,000 | Real sandbox buying power |
+| `.env` `CAPITAL_AT_RISK` | e.g. `100000` | Cap the **strategy** uses for sizing |
+| Log `Deployable Cash` | matches `CAPITAL_AT_RISK` | What the bot actually deploys |
+| Log `broker_cash_usd = 0` | API parse gap | **Not** zero balance — VTS often omits USD fields; bot falls back to `CAPITAL_AT_RISK` |
+
+### Telegram alerts (what to expect)
+
+| Alert | Telegram? | Notes |
+|---|---|---|
+| Trade fill (BUY/SELL) | Yes (if enabled) | RTH fills only |
+| WARNING timeout | **RTH only** | Off-hours → log file only |
+| CRITICAL reconcile `500` | Yes | Usually transient VTS error; bot keeps running |
+| CRITICAL crash / auth | Yes | Investigate immediately |
+
+Test setup: `python telegram_notifier.py --diagnose` then `--verbose`
+
+### Rotate a large log file (EC2)
+
+```bash
+cd ~/toss-trading-bot
+sudo cp project_metrics.log project_metrics.log.bak
+sudo truncate -s 0 project_metrics.log
+```
+
 ---
 
 ## Table of Contents
 
-1. [Project Evolution & Development Chronology](#1-project-evolution--development-chronology)
-1A. [Phase 3 Architecture: Ticker-Specific Configuration & Macro Regime Filtering](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)
-1B. [Phase 3: Infrastructure Hardening & Live Parity Architecture](#phase-3-infrastructure-hardening--live-parity-architecture)
-2. [Dedicated Section: Same-Bar Look-Ahead Bias Eradication](#2-dedicated-section-same-bar-look-ahead-bias-eradication)
-3. [Dedicated Section: RSI Crossdown Exit Engine](#3-dedicated-section-rsi-crossdown-exit-engine)
-4. [Dedicated Section: Dual-Clamp Position Sizing](#4-dedicated-section-dual-clamp-position-sizing)
-5. [Dedicated Section: NYSE Holiday Registry & Loop Suppression](#5-dedicated-section-nyse-holiday-registry--loop-suppression)
-6. [System Architecture & Core Topologies](#6-system-architecture--core-topologies)
-7. [Operational Hardening & Production Safeguards](#7-operational-hardening--production-safeguards)
-8. [Strategy Configurations & Parameters](#8-strategy-configurations--parameters)
-9. [Operational Guidelines & Verification Suite](#9-operational-guidelines--verification-suite)
-10. [KIS OpenAPI Interface Gateway Reference Mapping](#10-kis-openapi-interface-gateway-reference-mapping)
-11. [Core Risks & Worst-Case Operational Scenarios](#11-core-risks--worst-case-operational-scenarios)
-12. [Pre-Deployment Critical Architectural Flaws & Hardening Vectors](#12-pre-deployment-critical-architectural-flaws--hardening-vectors)
-13. [High-Priority Telemetry Channels (Live Monitoring Matrix)](#13-high-priority-telemetry-channels-live-monitoring-matrix)
-14. [Final Operational Directives & Action Plan](#14-final-operational-directives--action-plan)
+**Start here**
+
+- [Start Here — Reading Guide](#start-here)
+- [Quick Operations Cheatsheet](#quick-operations-cheatsheet)
+
+**Live production (Phase 6–7.1)**
+
+- [Phase 6: Fill Verification & Risk Gates](#phase-6-fill-verification-trade-log-and-risk-gates)
+- [Phase 7: Telegram Alerts](#phase-7-telegram-mobile-alerts)
+- [Phase 7.1: RTH-Only Polling](#phase-71-rth-only-polling--alert-hardening)
+- [EC2 Deployment (systemd)](#d2-aws-ec2-deployment-systemd)
+
+**Architecture & chronology**
+
+1. [Project Evolution](#1-project-evolution--development-chronology)
+- [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)
+- [Phase 3 Infrastructure (P3)](#phase-3-infrastructure-hardening--live-parity-architecture)
+2. [Same-Bar Look-Ahead Fix](#2-dedicated-section-same-bar-look-ahead-bias-eradication)
+3. [RSI Crossdown Exit](#3-dedicated-section-rsi-crossdown-exit-engine)
+4. [Dual-Clamp Sizing](#4-dedicated-section-dual-clamp-position-sizing)
+5. [NYSE Holiday & Sleep Logic](#5-dedicated-section-nyse-holiday-registry--loop-suppression)
+6. [System Architecture](#6-system-architecture--core-topologies)
+7. [Production Safeguards](#7-operational-hardening--production-safeguards)
+8. [Strategy Parameters](#8-strategy-configurations--parameters)
+9. [Operational Guidelines & Tests](#9-operational-guidelines--verification-suite)
+
+**Reference**
+
+10. [KIS API Mapping](#10-kis-openapi-interface-gateway-reference-mapping)
+11. [Core Risks](#11-core-risks--worst-case-operational-scenarios)
+12. [Hardening Vectors](#12-pre-deployment-critical-architectural-flaws--hardening-vectors)
+13. [Telemetry Matrix](#13-high-priority-telemetry-channels-live-monitoring-matrix)
+14. [Action Plan & Checklist](#14-final-operational-directives--action-plan)
 
 **Appendices**
 
-- [A. Infrastructure Patch Ledger (VTS Mock API Bypasses)](#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses)
-- [B. Signal Priority & Execution Rules](#appendix-b-signal-priority--execution-rules)
-- [C. Configuration Externalization Matrix](#appendix-c-configuration-externalization-matrix)
+- [A. VTS Incident Ledger](#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses)
+- [B. Signal Priority Rules](#appendix-b-signal-priority--execution-rules)
+- [C. Environment Variables](#appendix-c-configuration-externalization-matrix)
 - [D. Project Structure](#appendix-d-project-structure)
-- [E. Academic Regime Mapping (Watchlist Design)](#appendix-e-academic-regime-mapping-watchlist-design)
-- [Phase 6: Fill Verification, Trade Log & Risk Gates](#phase-6-fill-verification-trade-log-and-risk-gates)
-- [Phase 7: Telegram Mobile Alerts](#phase-7-telegram-mobile-alerts)
-- [Phase 7.1: RTH-Only Polling & Alert Hardening](#phase-71-rth-only-polling--alert-hardening)
-- [Quick Operations Cheatsheet](#quick-operations-cheatsheet)
+- [E. Watchlist Regime Map](#appendix-e-academic-regime-mapping-watchlist-design)
 - [License & Disclaimer](#license--disclaimer)
 
 ---
@@ -1175,6 +1284,8 @@ Live monitoring showed persistent `Liquidity OK: False` during RTH because parti
 
 ## 9. Operational Guidelines & Verification Suite
 
+> **Production operators:** Prefer the [Quick Operations Cheatsheet](#quick-operations-cheatsheet) for deploy, logs, and monitoring. This section covers local dev setup and test runners.
+
 ### A. Environment Initialization (`.env`)
 
 Create a localized state configuration file named `.env` in the project root directory. Ensure it is listed within your `.gitignore` to prevent leaking active portal credentials to public repositories:
@@ -1183,21 +1294,27 @@ Create a localized state configuration file named `.env` in the project root dir
 # KIS OpenAPI VTS Sandbox Credentials
 KIS_APP_KEY=your_app_key_here
 KIS_APP_SECRET=your_app_secret_here
-KIS_CANO=50191906
+KIS_CANO=your_account_number
 KIS_ACNT_PRDT_CD=01
 
 # Production Strategic Risk Configuration Parameters
 WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
 USE_SPY_MARKET_FILTER=true
-CAPITAL_AT_RISK=10000
+CAPITAL_AT_RISK=100000
 RISK_PER_TRADE=0.01
 LOOP_COOLDOWN_SECONDS=60
 TICKER_SLEEP_SECONDS=1
 MARKET_CLOSED_SLEEP_SECONDS=3600
+KIS_REQUEST_TIMEOUT_SECONDS=30
 
 # VTS mock: limit orders required for many US tickers (AMD/TSLA etc.)
 KIS_ORDER_TYPE=limit
 KIS_LIMIT_PRICE_BUFFER_BPS=10
+
+# Telegram (optional)
+USE_TELEGRAM_ALERTS=false
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
 
 # Signal parameters are NOT configured here — see config.py (StrategyConfigMapper)
 ```
@@ -1218,6 +1335,7 @@ matplotlib
 numpy
 pandas
 python-dotenv
+python-telegram-bot>=21.0
 pytz
 requests
 yfinance
@@ -1263,6 +1381,8 @@ Portfolio Equity     : $11,234.50
 ```
 
 ### D2. AWS EC2 Deployment (systemd)
+
+> Deploy commands are summarized in the [Quick Operations Cheatsheet](#quick-operations-cheatsheet). Details below.
 
 Production runs on a Linux VM (e.g. AWS EC2 `t3.micro`) with **systemd** keeping `main.py` alive after SSH disconnect.
 
@@ -1671,10 +1791,12 @@ During live integration deployment, several severe sandbox anomalies within the 
 
 ## Phase 6: Fill Verification, Trade Log, and Risk Gates
 
-Production loop order:
+Production loop order (RTH only — no KIS calls off-hours):
 
 ```
-reconcile -> fill poll -> RTH/risk/data gates -> dispatch (accept only) -> fill poll -> trade_log.csv
+RTH open → reconcile → fill poll → RTH/risk/data gates → dispatch (accept) → fill poll → trade_log.csv
+Off-hours → sleep (no API)
+Weekend/holiday → sleep 3600s (no API)
 ```
 
 | Component | File | Purpose |
@@ -1804,60 +1926,7 @@ KIS_REQUEST_TIMEOUT_SECONDS=30   # was hard-coded 15s
 
 ---
 
-## Quick Operations Cheatsheet
-
-Day-to-day commands — copy/paste friendly.
-
-### Check bot is running
-
-| Where | Command |
-|---|---|
-| **Already on EC2** (`ubuntu@ip-...`) | `systemctl is-active toss-bot` |
-| **Windows PowerShell** | `ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "systemctl is-active toss-bot"` |
-
-Expected: `active`
-
-### Deploy latest code (EC2)
-
-```bash
-cd ~/toss-trading-bot
-git fetch origin && git reset --hard origin/main
-.venv/bin/pip install -r requirements.txt
-sudo systemctl restart toss-bot
-```
-
-### Watch live logs
-
-```bash
-tail -f ~/toss-trading-bot/project_metrics.log    # on EC2
-```
-
-### Capital model vs broker app
-
-| Field | Meaning |
-|---|---|
-| **Hankook app “orderable USD”** | Real mock-account buying power (often **$100,000**) |
-| **`CAPITAL_AT_RISK` in `.env`** | Strategy cap the bot uses for sizing (e.g. `100000`) |
-| **`broker_cash_usd = 0` in logs** | VTS API often returns empty USD fields — **not** broke; bot falls back to `CAPITAL_AT_RISK` |
-
-### Telegram alert expectations
-
-| Alert | When you see it |
-|---|---|
-| 🟢/🔴 Trade report | Confirmed fill during RTH |
-| ⚠️ WARNING timeout | KIS slow **during RTH only** (off-hours → log only) |
-| 🚨 CRITICAL reconcile | KIS `500` on balance API — usually transient VTS glitch |
-| 🚨 CRITICAL crash | Loop died — check `systemctl status toss-bot` |
-
-### Log rotation (EC2)
-
-```bash
-cd ~/toss-trading-bot
-sudo cp project_metrics.log project_metrics.log.bak
-sudo truncate -s 0 project_metrics.log
-```
-
----
+> **Operations reference:** See [Quick Operations Cheatsheet](#quick-operations-cheatsheet) at the top of this document for deploy, logs, capital model, and Telegram expectations.
 
 ## Appendix B: Signal Priority & Execution Rules
 
