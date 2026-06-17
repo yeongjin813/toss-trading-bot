@@ -4,7 +4,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 7 Active — Fill Verification + Telegram Alerts (Phase 6 execution hardening) |
+| **System Status** | Phase 7.1 — RTH-only polling, Telegram alert hardening, 30s KIS timeout |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
@@ -52,6 +52,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 - [E. Academic Regime Mapping (Watchlist Design)](#appendix-e-academic-regime-mapping-watchlist-design)
 - [Phase 6: Fill Verification, Trade Log & Risk Gates](#phase-6-fill-verification-trade-log-and-risk-gates)
 - [Phase 7: Telegram Mobile Alerts](#phase-7-telegram-mobile-alerts)
+- [Phase 7.1: RTH-Only Polling & Alert Hardening](#phase-71-rth-only-polling--alert-hardening)
+- [Quick Operations Cheatsheet](#quick-operations-cheatsheet)
 - [License & Disclaimer](#license--disclaimer)
 
 ---
@@ -100,11 +102,17 @@ An automated, production-grade quantitative trading infrastructure and empirical
 - **Gates**: RTH open/close BUY blocks, yfinance fallback BUY block, stale `pending_order` release.
 - **Commit**: `66951a6` — see [Phase 6 detail](#phase-6-fill-verification-trade-log-and-risk-gates).
 
-### Phase 7: Telegram Mobile Alerts *(2026-06 — current)*
+### Phase 7: Telegram Mobile Alerts *(2026-06)*
 
 - **Architecture**: `telegram_notifier.py` sends async push notifications when trades fill and when the live loop hits critical failures. Integrated into `main.py` via fill callbacks in `execution_engine.py`. Gated by `USE_TELEGRAM_ALERTS=true`.
 - **Session model**: Each message uses `async with Bot(token=...) as bot:` (python-telegram-bot v21+) — one HTTP session per dispatch, no long-lived singleton bot.
 - **Commit**: `872f7d2` — see [Phase 7 detail](#phase-7-telegram-mobile-alerts).
+
+### Phase 7.1: RTH-Only Polling & Alert Hardening *(2026-06)*
+
+- **Problem**: VTS API timeouts and reconcile `500` errors during **off-hours** produced log noise and Telegram WARNING spam — even though orders were already RTH-gated.
+- **Fix**: `main.py` skips the entire watchlist cycle (zero KIS HTTP calls) outside NY RTH; sleeps until the next session window via `seconds_until_us_rth_open()`. WARNING-level Telegram alerts are **log-only** off-hours; CRITICAL alerts still push. KIS HTTP timeout default raised **15s → 30s** (`KIS_REQUEST_TIMEOUT_SECONDS`).
+- **Commit**: `46767be` — see [Phase 7.1 detail](#phase-71-rth-only-polling--alert-hardening).
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -125,6 +133,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **P3 Portfolio Reconciliation** | `session_manager.py` + `main.py` | KIS `VTRP6504R` broker override + deployable cash refresh |
 | **P6 Fill Verification** | `execution_engine.py` + `main.py` | ccnl/nccs poll; partial fills; `trade_log.csv`; risk gates |
 | **P7 Telegram Alerts** | `telegram_notifier.py` + `main.py` | Trade reports on fill; CRITICAL/WARNING system alerts |
+| **P7.1 RTH-Only Loop** | `main.py` + `analytics.py` | No KIS API off-hours; suppress WARNING Telegram off-hours; 30s timeout |
 
 Additional Phase 4 safeguards preserved from prior milestones:
 
@@ -883,11 +892,11 @@ def is_us_regular_market_hours(current_dt=None) -> bool:
     return time(9, 30) <= ny_dt.time() < time(16, 0)
 ```
 
-**Pre-market / post-market behavior (P3 hardened):**
+**Pre-market / post-market behavior (P3 + P7.1):**
 
-- `should_allow_crossover_signals(..., regular_market_hours=False)` → **Crossover Allowed = False**
-- **All dispatchable signals** (`BUY`, `SELL`, `DYNAMIC_ATR_SELL`) → **`HOLD`** — blocked in `LiveExecutionGatekeeper`, `evaluate_trading_cycle()`, and `process_ticker()`
-- Telemetry and state persistence continue; no KIS orders are transmitted outside RTH
+- **Orders**: All dispatchable signals (`BUY`, `SELL`, `DYNAMIC_ATR_SELL`) → **`HOLD`** — blocked in gatekeeper, analytics, and `process_ticker()`.
+- **API calls (P7.1)**: The main loop **does not run** `run_watchlist_cycle()` outside NY RTH — no price fetch, no reconcile, no fill poll. Log tag: `[GATE/RTH] ... no KIS API calls; sleeping ...s`.
+- **Weekends / holidays**: Full skip — `[GATE] US market closed (...). Sleeping 3600 seconds...`
 
 ### E. Extended Sleep Logic Behavior
 
@@ -902,7 +911,7 @@ When `is_us_market_holiday()` or weekend validations return `True`, the orchestr
 [GATE] US market closed (Christmas). Sleeping 3600 seconds...
 ```
 
-During NY calendar-open sessions, `LOOP_COOLDOWN_SECONDS = 60` applies. On **weekends and holidays**, the full cycle skip prevents all broker queries. On **weekday pre/post-market**, the loop runs for telemetry only — **all dispatchable signals remain blocked** until RTH.
+During NY **regular hours**, `LOOP_COOLDOWN_SECONDS = 60` applies between watchlist cycles. On **weekends and holidays**, the loop sleeps `MARKET_CLOSED_SLEEP_SECONDS` (default 3600) with **no broker queries**. On **weekday pre/post-market**, the loop sleeps until RTH (capped wake-ups every ≤3600s) — **no KIS API calls** until 09:30 ET.
 
 ---
 
@@ -1333,6 +1342,8 @@ sudo systemctl status toss-bot
 ```
 
 **From Windows PowerShell (remote):**
+
+```powershell
 # Service health
 ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "sudo systemctl status toss-bot --no-pager"
 
@@ -1651,6 +1662,11 @@ During live integration deployment, several severe sandbox anomalies within the 
 - **Symptom**: `BadRequest: Chat not found` despite correct-looking `TELEGRAM_CHAT_ID`; token validates via `getMe`.
 - **Resolution**: User must `/start` the **exact bot** matching `TELEGRAM_BOT_TOKEN` (not a similarly named bot). Run `python telegram_notifier.py --diagnose` to compare `.env` chat id vs `getUpdates`. Use `.venv/bin/pip` on Ubuntu EC2 (PEP 668). Keep Telegram credentials in each host's `.env` separately (PC vs EC2).
 
+### Incident 9: Off-Hours API Timeout & Telegram Spam (Phase 7.1)
+
+- **Symptom**: Overnight Telegram WARNING floods (`Read timed out`) and unnecessary KIS calls every 60s on weekday pre/post-market — orders were already RTH-blocked.
+- **Resolution**: `46767be` — main loop sleeps outside NY RTH with **zero** watchlist/API work; WARNING Telegram suppressed off-hours; `KIS_REQUEST_TIMEOUT_SECONDS=30`.
+
 ---
 
 ## Phase 6: Fill Verification, Trade Log, and Risk Gates
@@ -1711,12 +1727,14 @@ _dispatch_system_alert() → send_system_alert()
 | BUY/SELL fill (full or partial) | Trade report | `OrderFillMonitor` after ccnl confirms qty |
 | KIS auth failure at startup | CRITICAL | `get_access_token()` exception |
 | Broker reconcile failure | CRITICAL | `ReconciliationReport.reconciled == False` |
-| Per-ticker timeout | WARNING | `requests.Timeout` in watchlist cycle |
+| Per-ticker timeout | WARNING (Telegram **RTH only**) | `requests.Timeout` in watchlist cycle |
 | KIS network / 401 auth | WARNING or CRITICAL | `requests.RequestException`; auth → CRITICAL |
 | Unhandled ticker error / loop crash | CRITICAL | `process_ticker` / main loop outer `except` |
-| Fill poll inquiry failure | WARNING | ccnl/nccs exception inside `OrderFillMonitor` |
+| Fill poll inquiry failure | WARNING (Telegram **RTH only**) | ccnl/nccs exception inside `OrderFillMonitor` |
 
 When `USE_TELEGRAM_ALERTS=false`, messages are **logged locally only** — no Telegram API calls.
+
+**Off-hours rule (P7.1):** WARNING alerts (timeouts, transient network blips) are written to `project_metrics.log` but **not** sent to Telegram outside NY RTH. CRITICAL alerts (auth failure, reconcile `500`, loop crash) still push at any hour.
 
 ### Setup (one-time)
 
@@ -1745,6 +1763,99 @@ python telegram_notifier.py --verbose
 | `git pull` blocked by `data/*.csv` | On server: `git fetch origin && git reset --hard origin/main` (CSV caches are regenerated at runtime). |
 
 **Security:** Never commit `.env` or paste bot tokens in chat. Revoke and reissue via @BotFather if exposed.
+
+---
+
+## Phase 7.1: RTH-Only Polling & Alert Hardening
+
+Commit `46767be` — reduces VTS noise and Telegram spam without changing strategy logic.
+
+### Main Loop Schedule
+
+| Calendar state | NY clock | Bot behavior | KIS HTTP |
+|---|---|---|---|
+| Weekend / holiday | any | Sleep `MARKET_CLOSED_SLEEP_SECONDS` (3600s) | **None** |
+| Weekday | Outside 09:30–16:00 ET | Sleep until RTH (≤3600s wake-ups) | **None** |
+| Weekday | 09:30–16:00 ET | Full watchlist cycle every 60s | **Active** |
+
+Log tags:
+
+```
+[GATE] US market closed (weekend). Sleeping 3600 seconds...
+[GATE/RTH] Outside NY regular hours — no KIS API calls; sleeping 3600s until next RTH window
+--- Cycle N started at ... ---   ← only during RTH
+```
+
+### Code Touchpoints
+
+| Change | Location |
+|---|---|
+| `seconds_until_us_rth_open()` | `analytics.py` — DST-safe sleep until next 09:30 ET |
+| RTH gate in main loop | `main.py` — skip `run_watchlist_cycle()` off-hours |
+| Early return in cycle | `main.py` — defensive no-op if called outside RTH |
+| WARNING Telegram suppress | `main.py` → `_dispatch_system_alert()` |
+| HTTP timeout default 30s | `main.py` → `KIS_REQUEST_TIMEOUT_SECONDS` on all KIS `requests` |
+
+### Environment
+
+```env
+KIS_REQUEST_TIMEOUT_SECONDS=30   # was hard-coded 15s
+```
+
+---
+
+## Quick Operations Cheatsheet
+
+Day-to-day commands — copy/paste friendly.
+
+### Check bot is running
+
+| Where | Command |
+|---|---|
+| **Already on EC2** (`ubuntu@ip-...`) | `systemctl is-active toss-bot` |
+| **Windows PowerShell** | `ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "systemctl is-active toss-bot"` |
+
+Expected: `active`
+
+### Deploy latest code (EC2)
+
+```bash
+cd ~/toss-trading-bot
+git fetch origin && git reset --hard origin/main
+.venv/bin/pip install -r requirements.txt
+sudo systemctl restart toss-bot
+```
+
+### Watch live logs
+
+```bash
+tail -f ~/toss-trading-bot/project_metrics.log    # on EC2
+```
+
+### Capital model vs broker app
+
+| Field | Meaning |
+|---|---|
+| **Hankook app “orderable USD”** | Real mock-account buying power (often **$100,000**) |
+| **`CAPITAL_AT_RISK` in `.env`** | Strategy cap the bot uses for sizing (e.g. `100000`) |
+| **`broker_cash_usd = 0` in logs** | VTS API often returns empty USD fields — **not** broke; bot falls back to `CAPITAL_AT_RISK` |
+
+### Telegram alert expectations
+
+| Alert | When you see it |
+|---|---|
+| 🟢/🔴 Trade report | Confirmed fill during RTH |
+| ⚠️ WARNING timeout | KIS slow **during RTH only** (off-hours → log only) |
+| 🚨 CRITICAL reconcile | KIS `500` on balance API — usually transient VTS glitch |
+| 🚨 CRITICAL crash | Loop died — check `systemctl status toss-bot` |
+
+### Log rotation (EC2)
+
+```bash
+cd ~/toss-trading-bot
+sudo cp project_metrics.log project_metrics.log.bak
+sudo truncate -s 0 project_metrics.log
+```
 
 ---
 
@@ -1806,6 +1917,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
 | `TICKER_SLEEP_SECONDS` | No | `1` | Inter-ticker pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | No | `3600` | Holiday/weekend sleep |
+| `KIS_REQUEST_TIMEOUT_SECONDS` | No | `30` | KIS HTTP read timeout (all API calls) |
 | `USE_SPY_MARKET_FILTER` | No | `true` | Block BUY when SPY ≤ 200MA |
 | `KIS_ORDER_TYPE` | No | `limit` on VTS URL | `limit` or `market` |
 | `KIS_LIMIT_PRICE_BUFFER_BPS` | No | `10` | Default limit buffer vs reference close |
