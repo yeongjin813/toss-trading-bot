@@ -26,113 +26,22 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 ---
 
-## Start Here
+## Documentation Map
 
-Use this guide to find the right section without reading all ~2,000 lines.
-
-| I want to… | Go to |
-|---|---|
-| Run or monitor the live bot | [Quick Operations Cheatsheet](#quick-operations-cheatsheet) |
-| Deploy to AWS EC2 | [EC2 Deployment (systemd)](#d2-aws-ec2-deployment-systemd) |
-| Configure `.env` | [Appendix C — Environment Variables](#appendix-c-configuration-externalization-matrix) |
-| Understand RTH / off-hours behavior | [Phase 7.1 — RTH-Only Polling](#phase-71-rth-only-polling--alert-hardening) |
-| Set up Telegram alerts | [Phase 7 — Telegram](#phase-7-telegram-mobile-alerts) |
-| Debug VTS quirks | [Appendix A — Incident Ledger](#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses) |
-| Strategy / backtest math | Sections [2](#2-dedicated-section-same-bar-look-ahead-bias-eradication)–[5](#5-dedicated-section-nyse-holiday-registry--loop-suppression), [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering) |
-
----
-
-## Quick Operations Cheatsheet
-
-Copy/paste commands for day-to-day production work.
-
-### When the bot runs (Phase 7.1)
-
-| Calendar | NY time (ET) | KIS API calls |
+| Document | Audience | Contents |
 |---|---|---|
-| Weekend / holiday | any | **None** — sleeps 3600s |
-| Weekday | Outside 09:30–16:00 | **None** — sleeps until RTH |
-| Weekday | 09:30–16:00 (RTH) | **Active** — 15 tickers every 60s |
+| **[docs/OPERATIONS.md](docs/OPERATIONS.md)** | **Operators** | Deploy, monitor, `.env`, EC2, Telegram, troubleshooting |
+| **README.md** (this file) | Engineers / researchers | Strategy math, architecture, backtest parity, API reference |
 
-Key log lines: `[GATE] US market closed` · `[GATE/RTH] ... no KIS API calls` · `--- Cycle N started ---` (RTH only)
-
-### Check the bot is running
-
-| Where | Command |
-|---|---|
-| **Already on EC2** (`ubuntu@ip-...`) | `systemctl is-active toss-bot` |
-| **Windows PowerShell** | `ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "systemctl is-active toss-bot"` |
-
-Expected output: `active`
-
-> **SSH tip:** If your prompt is already `ubuntu@ip-...`, you are **on the server** — run `systemctl` directly. Do **not** nest `ssh` with a Windows `C:\...` key path from inside EC2.
-
-### Deploy latest code (EC2)
-
-```bash
-cd ~/toss-trading-bot
-git fetch origin && git reset --hard origin/main
-.venv/bin/pip install -r requirements.txt
-sudo systemctl restart toss-bot
-systemctl is-active toss-bot
-```
-
-### Watch logs
-
-```bash
-# On EC2
-tail -f ~/toss-trading-bot/project_metrics.log
-grep RECONCILE project_metrics.log | tail -5
-```
-
-```powershell
-# From Windows PowerShell
-ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "tail -f ~/toss-trading-bot/project_metrics.log"
-```
-
-### Capital: broker app vs bot logs
-
-| Source | Typical value | Meaning |
-|---|---|---|
-| KIS mock app “orderable USD” | ~$100,000 | Real sandbox buying power |
-| `.env` `CAPITAL_AT_RISK` | e.g. `100000` | Cap the **strategy** uses for sizing |
-| Log `Deployable Cash` | matches `CAPITAL_AT_RISK` | What the bot actually deploys |
-| Log `broker_cash_usd = 0` | API parse gap | **Not** zero balance — VTS often omits USD fields; bot falls back to `CAPITAL_AT_RISK` |
-
-### Telegram alerts (what to expect)
-
-| Alert | Telegram? | Notes |
-|---|---|---|
-| Trade fill (BUY/SELL) | Yes (if enabled) | RTH fills only |
-| WARNING timeout | **RTH only** | Off-hours → log file only |
-| CRITICAL reconcile `500` | Yes | Usually transient VTS error; bot keeps running |
-| CRITICAL crash / auth | Yes | Investigate immediately |
-
-Test setup: `python telegram_notifier.py --diagnose` then `--verbose`
-
-### Rotate a large log file (EC2)
-
-```bash
-cd ~/toss-trading-bot
-sudo cp project_metrics.log project_metrics.log.bak
-sudo truncate -s 0 project_metrics.log
-```
+**Quick links:** [Run the bot](docs/OPERATIONS.md#local-setup) · [EC2 deploy](docs/OPERATIONS.md#deploy-to-ec2) · [When API runs](docs/OPERATIONS.md#when-the-bot-runs) · [Env vars](#appendix-c-configuration-externalization-matrix)
 
 ---
 
 ## Table of Contents
 
-**Start here**
+**Operations (start here for live trading)**
 
-- [Start Here — Reading Guide](#start-here)
-- [Quick Operations Cheatsheet](#quick-operations-cheatsheet)
-
-**Live production (Phase 6–7.1)**
-
-- [Phase 6: Fill Verification & Risk Gates](#phase-6-fill-verification-trade-log-and-risk-gates)
-- [Phase 7: Telegram Alerts](#phase-7-telegram-mobile-alerts)
-- [Phase 7.1: RTH-Only Polling](#phase-71-rth-only-polling--alert-hardening)
-- [EC2 Deployment (systemd)](#d2-aws-ec2-deployment-systemd)
+- **[Production Operations Guide](docs/OPERATIONS.md)** — deploy, monitor, Telegram, EC2, troubleshooting
 
 **Architecture & chronology**
 
@@ -209,19 +118,19 @@ sudo truncate -s 0 project_metrics.log
 
 - **Architecture**: Order acceptance (`rt_cd=0`) no longer mutates `held_quantity`. `OrderFillMonitor` polls KIS `inquire-ccnl` / `inquire-nccs` until fills confirm (including partial). All events append to `trade_log.csv`. `RiskGuard` enforces daily loss, max open positions, and per-ticker exposure caps.
 - **Gates**: RTH open/close BUY blocks, yfinance fallback BUY block, stale `pending_order` release.
-- **Commit**: `66951a6` — see [Phase 6 detail](#phase-6-fill-verification-trade-log-and-risk-gates).
+- **Commit**: `66951a6` — see [OPERATIONS.md — Phase 6](docs/OPERATIONS.md#phase-6--fills--risk).
 
 ### Phase 7: Telegram Mobile Alerts *(2026-06)*
 
 - **Architecture**: `telegram_notifier.py` sends async push notifications when trades fill and when the live loop hits critical failures. Integrated into `main.py` via fill callbacks in `execution_engine.py`. Gated by `USE_TELEGRAM_ALERTS=true`.
 - **Session model**: Each message uses `async with Bot(token=...) as bot:` (python-telegram-bot v21+) — one HTTP session per dispatch, no long-lived singleton bot.
-- **Commit**: `872f7d2` — see [Phase 7 detail](#phase-7-telegram-mobile-alerts).
+- **Commit**: `872f7d2` — see [OPERATIONS.md — Phase 7](docs/OPERATIONS.md#phase-7--telegram-integration).
 
 ### Phase 7.1: RTH-Only Polling & Alert Hardening *(2026-06)*
 
 - **Problem**: VTS API timeouts and reconcile `500` errors during **off-hours** produced log noise and Telegram WARNING spam — even though orders were already RTH-gated.
 - **Fix**: `main.py` skips the entire watchlist cycle (zero KIS HTTP calls) outside NY RTH; sleeps until the next session window via `seconds_until_us_rth_open()`. WARNING-level Telegram alerts are **log-only** off-hours; CRITICAL alerts still push. KIS HTTP timeout default raised **15s → 30s** (`KIS_REQUEST_TIMEOUT_SECONDS`).
-- **Commit**: `46767be` — see [Phase 7.1 detail](#phase-71-rth-only-polling--alert-hardening).
+- **Commit**: `46767be` — see [OPERATIONS.md — Phase 7.1](docs/OPERATIONS.md#phase-71--rth-only-polling).
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -1284,201 +1193,21 @@ Live monitoring showed persistent `Liquidity OK: False` during RTH because parti
 
 ## 9. Operational Guidelines & Verification Suite
 
-> **Production operators:** Prefer the [Quick Operations Cheatsheet](#quick-operations-cheatsheet) for deploy, logs, and monitoring. This section covers local dev setup and test runners.
+> **Production operators:** Use **[docs/OPERATIONS.md](docs/OPERATIONS.md)** for `.env` setup, `python main.py`, EC2/systemd, logs, and Telegram.
 
-### A. Environment Initialization (`.env`)
-
-Create a localized state configuration file named `.env` in the project root directory. Ensure it is listed within your `.gitignore` to prevent leaking active portal credentials to public repositories:
-
-```ini
-# KIS OpenAPI VTS Sandbox Credentials
-KIS_APP_KEY=your_app_key_here
-KIS_APP_SECRET=your_app_secret_here
-KIS_CANO=your_account_number
-KIS_ACNT_PRDT_CD=01
-
-# Production Strategic Risk Configuration Parameters
-WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
-USE_SPY_MARKET_FILTER=true
-CAPITAL_AT_RISK=100000
-RISK_PER_TRADE=0.01
-LOOP_COOLDOWN_SECONDS=60
-TICKER_SLEEP_SECONDS=1
-MARKET_CLOSED_SLEEP_SECONDS=3600
-KIS_REQUEST_TIMEOUT_SECONDS=30
-
-# VTS mock: limit orders required for many US tickers (AMD/TSLA etc.)
-KIS_ORDER_TYPE=limit
-KIS_LIMIT_PRICE_BUFFER_BPS=10
-
-# Telegram (optional)
-USE_TELEGRAM_ALERTS=false
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_chat_id_here
-
-# Signal parameters are NOT configured here — see config.py (StrategyConfigMapper)
-```
-
-The system automatically triggers `load_dotenv(override=True)` to ensure localized parameter configurations take absolute precedence over stale shell environments.
-
-Copy from `.env.example` as a starting template. **Never commit `.env` to version control.**
-
-### B. Dependency Installation
+### A. Verification Tests
 
 ```powershell
-pip install -r requirements.txt
+python test_analytics.py
+python test_execution_engine.py
+python test_telegram_notifier.py
 ```
 
-```
-backtrader
-matplotlib
-numpy
-pandas
-python-dotenv
-python-telegram-bot>=21.0
-pytz
-requests
-yfinance
-```
+`test_analytics.py` covers Wilder indicators, O(1) state replay, 3-step ATR transitions, serialization, trend filter, SPY gate, and phantom SELL guard.
 
-### C. Launch Continuous Monitor
+### B. Log Redirection
 
-```powershell
-python main.py
-```
-
-Expected startup sequence:
-
-1. `validate_environment()` — KIS credentials + `MARKET_META` routing
-2. KIS OAuth token (cached in `kis_token_cache.json`)
-3. `MarketDataCache.bootstrap()` — ~756 bars per ticker, once
-4. Load `trading_state.json` (empty file → `[WARN]` + fresh `{}` registry; no crash)
-5. `try_print_mock_account_balance()` — optional, non-blocking
-6. `log_configured_capital_model()` — confirms `CAPITAL_AT_RISK`
-7. `run_session_reconciliation(force=True)` — P3 startup broker sync
-8. Infinite watchlist loop with `[METRICS]` emission
-
-Expected runtime log markers:
-
-```
-Order pipeline: reconcile -> RTH gate -> intraday ATR scan -> dispatch -> persist
-[P3] Running startup portfolio reconciliation...
-[RECONCILE] Starting broker portfolio synchronization...
-[RECONCILE] Broker holdings match local ledger — no override required
-[RECONCILE/MISMATCH] NVDA local=10 broker=12 delta=+2 — overriding local ledger
---- Cycle 12 skipped at 2026-12-25 09:00:00 ---
-[GATE] US market closed (Christmas). Sleeping 3600 seconds...
-[GATE/RTH] Outside NY regular hours (09:30-16:00 ET) — all signals blocked until RTH open
-[GATE/RTH] NVDA — BUY blocked outside NY regular session (09:30-16:00 ET). Matching daily backtest session boundary.
-Intraday ATR Scan    : ACTIVE (session_low vs prior trigger_floor)
-Deployable Cash      : $9,750.00
-Portfolio Equity     : $11,234.50
-[LOCK] NVDA pending_order=True — signal suppressed
-[KIS ORDER] BUY  AMD | qty=1 | limit order @497.15 | tr_id=VTTT1002U
-[ORDER/REJECTED] AMD BUY qty=1 — Order rejected for AMD: 40650000 | ...
-[ORDER/SKIP] AMD — prior rejection on BUY:2026-06-12; waiting for new bar
-[SKIP] NVDA SELL suppressed — held_qty=0 (no broker shares)
-```
-
-### D2. AWS EC2 Deployment (systemd)
-
-> Deploy commands are summarized in the [Quick Operations Cheatsheet](#quick-operations-cheatsheet). Details below.
-
-Production runs on a Linux VM (e.g. AWS EC2 `t3.micro`) with **systemd** keeping `main.py` alive after SSH disconnect.
-
-**Typical layout on server:**
-
-```
-/home/ubuntu/toss-trading-bot/
-├── .venv/
-├── .env              # credentials + WATCHLIST (never commit)
-├── main.py
-├── project_metrics.log
-└── trading_state.json
-```
-
-**systemd unit** (`/etc/systemd/system/toss-bot.service`):
-
-```ini
-[Unit]
-Description=Toss Trading Bot (KIS VTS)
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/toss-trading-bot
-Environment=PATH=/home/ubuntu/toss-trading-bot/.venv/bin
-ExecStart=/home/ubuntu/toss-trading-bot/.venv/bin/python main.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Enable and start:**
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable toss-bot
-sudo systemctl start toss-bot
-sudo systemctl status toss-bot
-```
-
-**After code changes on your PC:**
-
-```bash
-cd ~/toss-trading-bot
-git fetch origin && git reset --hard origin/main   # use if local data/*.csv blocks pull
-.venv/bin/pip install -r requirements.txt          # never use bare `pip` on Ubuntu 24+ (PEP 668)
-sudo systemctl restart toss-bot
-sudo systemctl status toss-bot --no-pager
-```
-
-> **Ubuntu PEP 668:** System Python rejects `pip install` outside a venv. Production uses `/home/ubuntu/toss-trading-bot/.venv/bin/python` (see systemd unit below). Create the venv once with `python3 -m venv .venv` if missing.
-
-**Telegram on EC2:** `.env` on the server is separate from your PC. After `git pull`, add these keys to `~/toss-trading-bot/.env` if not present:
-
-```env
-USE_TELEGRAM_ALERTS=true
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_numeric_user_id
-```
-
-Verify before restart:
-
-```bash
-.venv/bin/python telegram_notifier.py --diagnose
-.venv/bin/python telegram_notifier.py --verbose
-```
-
-**Monitor logs:**
-
-```bash
-# Inside EC2 SSH session (you are already on the server — do not run ssh again):
-tail -f ~/toss-trading-bot/project_metrics.log
-sudo systemctl status toss-bot
-```
-
-**From Windows PowerShell (remote):**
-
-```powershell
-# Service health
-ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "sudo systemctl status toss-bot --no-pager"
-
-# Live log tail
-ssh -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP "tail -f ~/toss-trading-bot/project_metrics.log"
-
-# Download full log for Cursor analysis
-scp -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP:~/toss-trading-bot/project_metrics.log "C:\path\to\Toss Trading Bot\project_metrics_aws.log"
-```
-
-Log growth is ~10–15 MB per US trading day (60s cycles × 15 tickers). Rotate or truncate `project_metrics.log` periodically on long-running instances.
-
-### D. Empirical Log Redirection Command
-
-To operate the pipeline in a clean background configuration while piping telemetry records into an isolated analytics log for visualization processing:
+To pipe telemetry to a file while running in the background:
 
 **PowerShell:**
 
@@ -1492,7 +1221,7 @@ python main.py *> project_metrics.log
 python main.py > project_metrics.log 2>&1
 ```
 
-### E. Sample Pipe-Delimited Telemetry Output (`[METRICS]`)
+### C. Sample Pipe-Delimited Telemetry Output (`[METRICS]`)
 
 ```
 [METRICS] NVDA | 2026-06-10 15:45:02 | Close=142.50 | SMA20=138.20 | RSI=58.32 | ATR_Wilder=4.2150 | Volume=45,230,000/38,100,000 (1.187x)
@@ -1513,7 +1242,7 @@ Runtime Registry     : pending=False | held_qty=40 | last_processed=2026-06-05
 ATR Stop Telemetry   : peak=$145.80 | floor=$137.37 | session_low=$138.42
 ```
 
-### F. Portfolio Backtest Runner
+### D. Portfolio Backtest Runner
 
 ```powershell
 # Default — consolidated portfolio (shared $10k cash pool)
@@ -1532,20 +1261,7 @@ python run_backtest.py --walk-forward
 python run_backtest.py --no-spy-filter
 ```
 
-### G. Verification Suite
-
-```powershell
-python test_analytics.py
-```
-
-Runs unit tests against `LiveSignalEngine`:
-
-- Wilder RSI/ATR/SMA indicator computation (Test 1)
-- O(1) state replay determinism (Test 2)
-- **3-step bar transitions** — look-ahead-free DYNAMIC_ATR_SELL (Test 3)
-- External state serialization round-trip (Test 4)
-
-### H. Graceful Thread Termination
+### E. Graceful Thread Termination
 
 To halt the continuous polling routine safely, dispatch a SIGINT termination signal via **Ctrl + C**. The orchestrator intercepts the termination hook, finishes the active processing sequence, and dumps the transactional matrix to `./trading_state.json` to prevent data loss.
 
@@ -1789,144 +1505,17 @@ During live integration deployment, several severe sandbox anomalies within the 
 
 ---
 
-## Phase 6: Fill Verification, Trade Log, and Risk Gates
+## Phase 6–7.1: Production Operations *(summary)*
 
-Production loop order (RTH only — no KIS calls off-hours):
+Fill verification, Telegram alerts, and RTH-only polling are **operational features** — setup, env vars, deploy, and troubleshooting live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
 
-```
-RTH open → reconcile → fill poll → RTH/risk/data gates → dispatch (accept) → fill poll → trade_log.csv
-Off-hours → sleep (no API)
-Weekend/holiday → sleep 3600s (no API)
-```
-
-| Component | File | Purpose |
-|---|---|---|
-| `OrderFillMonitor` | `execution_engine.py` | Poll ccnl/nccs; partial fill support; stale `pending_order` release |
-| `TradeLogWriter` | `execution_engine.py` | Append `trade_log.csv` audit trail |
-| `RiskGuard` | `execution_engine.py` | `MAX_DAILY_LOSS_USD`, `MAX_OPEN_POSITIONS`, `MAX_TICKER_EXPOSURE_USD` |
-| RTH open/close BUY block | `execution_engine.py` | Block new BUY 09:30–09:40 ET and last 5m before close |
-| yfinance BUY block | `main.py` | Fallback OHLCV may inform HOLD/SELL only — **never new BUY** |
-
-**Trade log columns:** `timestamp,ticker,signal,qty,order_price,fill_price,status,reason,cash_after,held_qty`
-
-**Statuses:** `ACCEPTED`, `PARTIAL`, `FILLED`, `REJECTED`, `RELEASED`
-
----
-
-## Phase 7: Telegram Mobile Alerts
-
-Optional push notifications to your phone when the bot fills orders or hits infrastructure failures.
-
-### Architecture
-
-```
-OrderFillMonitor (FILLED/PARTIAL)
-        │ on_fill callback
-        ▼
-main.py → _dispatch_trade_report() → send_trade_report()
-                                              │
-                                              ▼
-                              telegram_notifier._send_message_safe()
-                              async with Bot(token) as bot: ...
-
-main.py exception paths / reconcile failure
-        ▼
-_dispatch_system_alert() → send_system_alert()
-```
-
-| Component | File | Purpose |
-|---|---|---|
-| `TelegramNotifier` | `telegram_notifier.py` | Thin facade; formats MarkdownV2 messages |
-| `_send_message_safe()` | `telegram_notifier.py` | `async with Bot` per message; 3 retries; exponential backoff |
-| `diagnose_telegram_setup()` | `telegram_notifier.py` | Read-only `getMe` + `getUpdates` chat-id match check |
-| Fill callback | `execution_engine.py` | `OrderFillMonitor(on_fill=..., on_alert=...)` |
-| Sync bridge | `main.py` | `asyncio.run(send_*())` from the 60s polling loop |
-
-### Alert Types
-
-| Event | Level / Type | Trigger |
-|---|---|---|
-| BUY/SELL fill (full or partial) | Trade report | `OrderFillMonitor` after ccnl confirms qty |
-| KIS auth failure at startup | CRITICAL | `get_access_token()` exception |
-| Broker reconcile failure | CRITICAL | `ReconciliationReport.reconciled == False` |
-| Per-ticker timeout | WARNING (Telegram **RTH only**) | `requests.Timeout` in watchlist cycle |
-| KIS network / 401 auth | WARNING or CRITICAL | `requests.RequestException`; auth → CRITICAL |
-| Unhandled ticker error / loop crash | CRITICAL | `process_ticker` / main loop outer `except` |
-| Fill poll inquiry failure | WARNING (Telegram **RTH only**) | ccnl/nccs exception inside `OrderFillMonitor` |
-
-When `USE_TELEGRAM_ALERTS=false`, messages are **logged locally only** — no Telegram API calls.
-
-**Off-hours rule (P7.1):** WARNING alerts (timeouts, transient network blips) are written to `project_metrics.log` but **not** sent to Telegram outside NY RTH. CRITICAL alerts (auth failure, reconcile `500`, loop crash) still push at any hour.
-
-### Setup (one-time)
-
-1. Create a bot via [@BotFather](https://t.me/BotFather) → copy token to `.env` as `TELEGRAM_BOT_TOKEN`.
-2. Open **your bot** in Telegram (must match the token) → tap **Start** → send `/start`.
-3. Set `TELEGRAM_CHAT_ID` to your numeric user id (from [@userinfobot](https://t.me/userinfobot) or `--diagnose` output).
-4. Install dependency: `pip install -r requirements.txt` (`python-telegram-bot>=21.0`).
-
-### Verification Commands
-
-```bash
-# Read-only: bot username, recent chat ids, env match
-python telegram_notifier.py --diagnose
-
-# Send sample trade + summary + INFO alert
-python telegram_notifier.py --verbose
-```
-
-### Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `Chat not found` | `/start` was sent to a **different** bot than the token in `.env`. Open the bot shown by `--diagnose` and `/start` again. |
-| `externally-managed-environment` (EC2) | Use `.venv/bin/pip install -r requirements.txt`, not system `pip`. |
-| Alerts on PC but not EC2 | EC2 `~/toss-trading-bot/.env` needs its own `USE_TELEGRAM_ALERTS` + token + chat id. |
-| `git pull` blocked by `data/*.csv` | On server: `git fetch origin && git reset --hard origin/main` (CSV caches are regenerated at runtime). |
-
-**Security:** Never commit `.env` or paste bot tokens in chat. Revoke and reissue via @BotFather if exposed.
-
----
-
-## Phase 7.1: RTH-Only Polling & Alert Hardening
-
-Commit `46767be` — reduces VTS noise and Telegram spam without changing strategy logic.
-
-### Main Loop Schedule
-
-| Calendar state | NY clock | Bot behavior | KIS HTTP |
+| Phase | Commit | One-line summary | Detail |
 |---|---|---|---|
-| Weekend / holiday | any | Sleep `MARKET_CLOSED_SLEEP_SECONDS` (3600s) | **None** |
-| Weekday | Outside 09:30–16:00 ET | Sleep until RTH (≤3600s wake-ups) | **None** |
-| Weekday | 09:30–16:00 ET | Full watchlist cycle every 60s | **Active** |
-
-Log tags:
-
-```
-[GATE] US market closed (weekend). Sleeping 3600 seconds...
-[GATE/RTH] Outside NY regular hours — no KIS API calls; sleeping 3600s until next RTH window
---- Cycle N started at ... ---   ← only during RTH
-```
-
-### Code Touchpoints
-
-| Change | Location |
-|---|---|
-| `seconds_until_us_rth_open()` | `analytics.py` — DST-safe sleep until next 09:30 ET |
-| RTH gate in main loop | `main.py` — skip `run_watchlist_cycle()` off-hours |
-| Early return in cycle | `main.py` — defensive no-op if called outside RTH |
-| WARNING Telegram suppress | `main.py` → `_dispatch_system_alert()` |
-| HTTP timeout default 30s | `main.py` → `KIS_REQUEST_TIMEOUT_SECONDS` on all KIS `requests` |
-
-### Environment
-
-```env
-KIS_REQUEST_TIMEOUT_SECONDS=30   # was hard-coded 15s
-```
+| **6** | `66951a6` | ccnl/nccs fill poll, `trade_log.csv`, risk gates | [Fills & Risk](docs/OPERATIONS.md#phase-6--fills--risk) |
+| **7** | `872f7d2` | Telegram trade reports + system alerts | [Telegram Integration](docs/OPERATIONS.md#phase-7--telegram-integration) |
+| **7.1** | `46767be` | No KIS API off-hours; WARNING Telegram RTH-only; 30s timeout | [RTH-Only Polling](docs/OPERATIONS.md#phase-71--rth-only-polling) |
 
 ---
-
-> **Operations reference:** See [Quick Operations Cheatsheet](#quick-operations-cheatsheet) at the top of this document for deploy, logs, capital model, and Telegram expectations.
 
 ## Appendix B: Signal Priority & Execution Rules
 
@@ -2027,6 +1616,8 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 
 ```
 Toss Trading Bot/
+├── docs/
+│   └── OPERATIONS.md       # Production ops: deploy, EC2, Telegram, troubleshooting
 ├── main.py                 # KIS orchestrator, reconciliation, RTH gate, Telegram dispatch, state-gated orders
 ├── execution_engine.py     # P6: OrderFillMonitor, TradeLogWriter, RiskGuard, fill callbacks
 ├── telegram_notifier.py    # P7: async Telegram alerts (trade reports + system alerts)
