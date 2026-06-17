@@ -20,6 +20,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 9. [Phase 7.1 — RTH-Only Polling](#phase-71--rth-only-polling)
 10. [Log Management](#log-management)
 11. [Troubleshooting](#troubleshooting)
+12. [Phase 8 — Hardening](#phase-8--hardening)
 
 ---
 
@@ -41,6 +42,10 @@ CAPITAL_AT_RISK=100000
 RISK_PER_TRADE=0.01
 LOOP_COOLDOWN_SECONDS=60
 KIS_REQUEST_TIMEOUT_SECONDS=30
+KIS_SLOW_API_MS=3000
+KIS_ORDER_MAX_RETRIES=3
+KIS_ORDER_RETRY_BACKOFF_SECONDS=2.0
+USE_EOD_ATR_STOPS=false
 KIS_ORDER_TYPE=limit
 
 USE_TELEGRAM_ALERTS=false
@@ -300,6 +305,20 @@ sudo truncate -s 0 project_metrics.log
 | Alerts on PC but not EC2 | Add Telegram vars to server `.env` and restart |
 
 VTS incident history: [README Appendix A](../README.md#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses).
+
+---
+
+## Phase 8 — Hardening
+
+| Feature | Env / file | What it does |
+|---|---|---|
+| NYSE calendar merge | `holidays` package | Adds Good Friday etc.; logs `[CALENDAR]` drift |
+| API latency | `KIS_SLOW_API_MS` | `[KIS/HTTP] … api_response_time=…ms` on every KIS call |
+| Order retry | `KIS_ORDER_MAX_RETRIES`, `order_retry_queue.json` | Inline retry + next-cycle queue for transient failures |
+| Backtest ATR parity | `USE_EOD_ATR_STOPS=true` | Daily bar low stops (matches backtest); default keeps intraday stops |
+| CI | `.github/workflows/ci.yml` | Runs all `test_*.py` on push/PR |
+
+Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-hardening--readme-improvement-log).
 
 ---
 

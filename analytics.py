@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -9,11 +10,32 @@ import pytz
 
 from config import StrategyConfig, StrategyConfigMapper
 
+try:
+    import holidays as holidays_lib
+except ImportError:  # pragma: no cover - optional until pip install
+    holidays_lib = None
+
 StrategyConfigRegistry = StrategyConfigMapper
 
 NY_TZ = pytz.timezone("America/New_York")
 US_REGULAR_MARKET_OPEN = time(hour=9, minute=30)
 US_REGULAR_MARKET_CLOSE = time(hour=16, minute=0)
+
+_holiday_cross_check_years: set[int] = set()
+
+
+def use_eod_atr_stops() -> bool:
+    """
+    When true, live ATR stops use the static daily bar low only (backtest parity).
+
+    Default false preserves legacy intraday ``session_low`` scanning.
+    """
+    return os.getenv("USE_EOD_ATR_STOPS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class IndicatorAnalytics:
@@ -286,9 +308,44 @@ def _thanksgiving_day(year: int) -> date:
     return observed + timedelta(weeks=3)
 
 
+def _nyse_library_holidays(year: int) -> dict[date, str]:
+    if holidays_lib is None:
+        return {}
+    calendar = holidays_lib.NYSE(years=year)
+    return {day: str(name) for day, name in sorted(calendar.items())}
+
+
+def _cross_check_holiday_calendars(
+    year: int,
+    internal: dict[date, str],
+    library: dict[date, str],
+) -> dict[date, str]:
+    """Merge ``holidays.NYSE`` closures and log calendar drift once per year."""
+    if year in _holiday_cross_check_years:
+        return {}
+
+    _holiday_cross_check_years.add(year)
+    if not library:
+        print(f"[CALENDAR/WARN] holidays.NYSE unavailable — internal registry only ({year})")
+        return {}
+
+    added = sorted(day for day in library if day not in internal)
+    for day in added:
+        print(f"[CALENDAR] Added NYSE closure from library: {day} ({library[day]})")
+
+    internal_only = sorted(day for day in internal if day not in library)
+    for day in internal_only:
+        print(
+            f"[CALENDAR/WARN] Internal holiday not in holidays.NYSE: "
+            f"{day} ({internal[day]})"
+        )
+
+    return {day: library[day] for day in added}
+
+
 def us_market_holidays_for_year(year: int) -> dict[date, str]:
     """Return NYSE full-day closure dates for a calendar year."""
-    holidays = {
+    internal = {
         _observed_fixed_holiday(year, 1, 1): "New Year's Day",
         _memorial_day(year): "Memorial Day",
         _observed_fixed_holiday(year, 7, 4): "Independence Day",
@@ -296,7 +353,11 @@ def us_market_holidays_for_year(year: int) -> dict[date, str]:
         _thanksgiving_day(year): "Thanksgiving",
         _observed_fixed_holiday(year, 12, 25): "Christmas",
     }
-    return holidays
+    library = _nyse_library_holidays(year)
+    _cross_check_holiday_calendars(year, internal, library)
+    merged = dict(internal)
+    merged.update(library)
+    return merged
 
 
 def is_us_market_holiday(day: date | datetime | None = None) -> bool:
@@ -961,7 +1022,9 @@ class LiveSignalEngine:
         regular_market_hours = is_us_regular_market_hours(now)
 
         mark_price = current_price if current_price is not None else today.close
-        if regular_market_hours:
+        if use_eod_atr_stops():
+            session_low = float(today.low)
+        elif regular_market_hours:
             bar_date_str = current_bar_date
             tick_low = min(float(today.low), float(mark_price))
             if runtime.latest_bar_date != bar_date_str:
@@ -971,7 +1034,13 @@ class LiveSignalEngine:
                 runtime.session_low = tick_low
             else:
                 runtime.session_low = min(float(runtime.session_low), tick_low)
-        session_low = float(runtime.session_low if runtime.session_low is not None else today.low)
+            session_low = float(
+                runtime.session_low if runtime.session_low is not None else today.low
+            )
+        else:
+            session_low = float(
+                runtime.session_low if runtime.session_low is not None else today.low
+            )
         allow_crossover = should_allow_crossover_signals(
             current_bar_date,
             runtime.last_processed_date,
@@ -1072,6 +1141,7 @@ class LiveSignalEngine:
             "position_size": position_size,
             "current_bar_date": current_bar_date,
             "session_low": session_low,
+            "eod_atr_stops": use_eod_atr_stops(),
             "allow_crossover": allow_crossover,
             "market_bullish": market_bullish,
             "calendar_open": calendar_open,

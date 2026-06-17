@@ -7,3 +7,4 @@ requests
 python-dotenv
 pytz
 python-telegram-bot>=21.0
+holidays>=0.40

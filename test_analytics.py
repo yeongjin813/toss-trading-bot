@@ -5,8 +5,9 @@ Run: python test_analytics.py
 
 from __future__ import annotations
 
+import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,8 @@ from analytics import (
     calculate_atr,
     calculate_rsi,
     calculate_sma,
+    us_market_holidays_for_year,
+    use_eod_atr_stops,
 )
 from config import StrategyConfigMapper
 
@@ -409,6 +412,40 @@ def verify_phantom_sell_guard() -> None:
     print()
 
 
+def verify_nyse_holiday_library_merge() -> None:
+    print("=" * 88)
+    print("TEST 8: NYSE HOLIDAY LIBRARY MERGE (Good Friday coverage)")
+    print("=" * 88)
+
+    merged = us_market_holidays_for_year(2026)
+    assert date(2026, 1, 1) in merged or any(d.year == 2026 for d in merged)
+    assert date(2026, 4, 3) in merged, "Good Friday 2026 should be merged from holidays.NYSE"
+    print(f"2026 closure count                      : {len(merged)}")
+    print("Good Friday 2026 present                 : PASS")
+    print()
+
+
+def verify_use_eod_atr_stops_env() -> None:
+    print("=" * 88)
+    print("TEST 9: USE_EOD_ATR_STOPS ENV FLAG")
+    print("=" * 88)
+
+    prior = os.environ.get("USE_EOD_ATR_STOPS")
+    try:
+        os.environ["USE_EOD_ATR_STOPS"] = "true"
+        assert use_eod_atr_stops() is True
+        os.environ["USE_EOD_ATR_STOPS"] = "false"
+        assert use_eod_atr_stops() is False
+    finally:
+        if prior is None:
+            os.environ.pop("USE_EOD_ATR_STOPS", None)
+        else:
+            os.environ["USE_EOD_ATR_STOPS"] = prior
+
+    print("USE_EOD_ATR_STOPS toggles correctly      : PASS")
+    print()
+
+
 def main() -> int:
     engine = LiveSignalEngine("PLTR")
 
@@ -422,6 +459,8 @@ def main() -> int:
     verify_config_registry()
     verify_spy_market_filter_blocks_buy()
     verify_phantom_sell_guard()
+    verify_nyse_holiday_library_merge()
+    verify_use_eod_atr_stops_env()
 
     print("=" * 88)
     print("ALL ANALYTICS TESTS PASSED")

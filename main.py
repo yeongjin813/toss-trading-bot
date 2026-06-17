@@ -42,6 +42,7 @@ from analytics import (
     is_us_regular_market_hours,
     seconds_until_us_rth_open,
     spy_regime_snapshot,
+    use_eod_atr_stops,
 )
 from config import StrategyConfigMapper
 from market_registry import (
@@ -74,6 +75,8 @@ from telegram_notifier import (
     send_system_alert,
     send_trade_report,
 )
+from kis_http import is_retryable_request_error, kis_request, last_api_response_ms
+from order_retry_queue import OrderRetryQueue, PendingOrderRetry
 
 load_dotenv(override=True)
 
@@ -119,6 +122,9 @@ TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
 KIS_REQUEST_TIMEOUT_SECONDS = int(os.getenv("KIS_REQUEST_TIMEOUT_SECONDS", "30"))
+KIS_ORDER_MAX_RETRIES = max(1, int(os.getenv("KIS_ORDER_MAX_RETRIES", "3")))
+KIS_ORDER_RETRY_BACKOFF_SECONDS = float(os.getenv("KIS_ORDER_RETRY_BACKOFF_SECONDS", "2.0"))
+KIS_SLOW_API_MS = int(os.getenv("KIS_SLOW_API_MS", "3000"))
 
 
 def _resolve_kis_order_type() -> str:
@@ -135,6 +141,7 @@ KIS_ORDER_TYPE = _resolve_kis_order_type()
 EXECUTION_SETTINGS = ExecutionSettings.from_env()
 TRADE_LOG = TradeLogWriter(TRADE_LOG_FILE)
 RISK_GUARD = RiskGuard(EXECUTION_SETTINGS)
+ORDER_RETRY_QUEUE = OrderRetryQueue()
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +350,13 @@ class KISApiClient:
             "appkey": APP_KEY,
             "appsecret": APP_SECRET,
         }
-        response = requests.post(url, json=body, timeout=KIS_REQUEST_TIMEOUT_SECONDS)
+        response = kis_request(
+            "POST",
+            url,
+            label="token",
+            json=body,
+            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
+        )
         response.raise_for_status()
         payload = response.json()
 
@@ -378,8 +391,10 @@ class KISApiClient:
     def get_hashkey(self, body: dict[str, Any]) -> str:
         url = f"{BASE_URL}{HASHKEY_PATH}"
         token = self.get_access_token()
-        response = requests.post(
+        response = kis_request(
+            "POST",
             url,
+            label="hashkey",
             headers={
                 "content-type": "application/json; charset=utf-8",
                 "authorization": f"Bearer {token}",
@@ -417,8 +432,10 @@ class KISApiClient:
         last_error: requests.RequestException | None = None
         for attempt in range(max_retries):
             try:
-                response = requests.get(
+                response = kis_request(
+                    "GET",
                     url,
+                    label=f"dailyprice:{ticker}",
                     headers=self._build_headers(TR_ID_DAILY_PRICE),
                     params=params,
                     timeout=KIS_REQUEST_TIMEOUT_SECONDS,
@@ -533,8 +550,10 @@ class KISApiClient:
 
         hashkey = self.get_hashkey(order_body)
         url = f"{BASE_URL}{ORDER_PATH}"
-        response = requests.post(
+        response = kis_request(
+            "POST",
             url,
+            label=f"order:{side}:{ticker}",
             headers=self._build_headers(tr_id, include_hashkey=True, hashkey=hashkey),
             json=order_body,
             timeout=KIS_REQUEST_TIMEOUT_SECONDS,
@@ -567,8 +586,10 @@ class KISApiClient:
             "TR_MKET_CD": tr_mket_cd,
             "INQR_DVSN_CD": inqr_dvsn_cd,
         }
-        response = requests.get(
+        response = kis_request(
+            "GET",
             url,
+            label="present-balance",
             headers=self._build_headers(TR_ID_US_PRESENT_BALANCE),
             params=params,
             timeout=KIS_REQUEST_TIMEOUT_SECONDS,
@@ -611,8 +632,10 @@ class KISApiClient:
             "CTX_AREA_NK200": "",
             "CTX_AREA_FK200": "",
         }
-        response = requests.get(
+        response = kis_request(
+            "GET",
             url,
+            label=f"ccnl:{pdno or 'all'}",
             headers=self._build_headers(TR_ID_US_CCNL),
             params=params,
             timeout=KIS_REQUEST_TIMEOUT_SECONDS,
@@ -646,8 +669,10 @@ class KISApiClient:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        response = requests.get(
+        response = kis_request(
+            "GET",
             url,
+            label=f"nccs:{ovrs_excg_cd}",
             headers=self._build_headers(TR_ID_US_NCCS),
             params=params,
             timeout=KIS_REQUEST_TIMEOUT_SECONDS,
@@ -688,8 +713,10 @@ class KISApiClient:
         }
         hashkey = self.get_hashkey(order_body)
         url = f"{BASE_URL}{ORDER_RVSECNCL_PATH}"
-        response = requests.post(
+        response = kis_request(
+            "POST",
             url,
+            label=f"cancel:{ticker}",
             headers=self._build_headers(TR_ID_US_CANCEL, include_hashkey=True, hashkey=hashkey),
             json=order_body,
             timeout=KIS_REQUEST_TIMEOUT_SECONDS,
@@ -1089,12 +1116,13 @@ def execute_broker_order(
             f"[KIS ORDER] BUY  {ticker} | qty={quantity} | {order_kind}{price_suffix} | "
             f"tr_id={TR_ID_US_BUY}"
         )
-        return client.place_us_order(
+        return _place_order_with_retries(
+            client,
             side="BUY",
             ticker=ticker,
             ovrs_excg_cd=ovrs_excg_cd,
             quantity=quantity,
-            price=order_price,
+            order_price=order_price,
         )
 
     if signal in {"SELL", "DYNAMIC_ATR_SELL"} and quantity > 0:
@@ -1102,16 +1130,110 @@ def execute_broker_order(
             f"[KIS ORDER] SELL {ticker} | qty={quantity} | close-position | "
             f"{order_kind}{price_suffix} | tr_id={TR_ID_US_SELL}"
         )
-        return client.place_us_order(
+        return _place_order_with_retries(
+            client,
             side="SELL",
             ticker=ticker,
             ovrs_excg_cd=ovrs_excg_cd,
             quantity=quantity,
-            price=order_price,
+            order_price=order_price,
         )
 
     print(f"[KIS ORDER] NO ACTION | {ticker} | signal={signal} | qty={quantity}")
     return {"rt_cd": "0", "skipped": True}
+
+
+def _place_order_with_retries(
+    client: KISApiClient,
+    *,
+    side: str,
+    ticker: str,
+    ovrs_excg_cd: str,
+    quantity: int,
+    order_price: float,
+) -> dict[str, Any]:
+    last_exc: BaseException | None = None
+    for attempt in range(KIS_ORDER_MAX_RETRIES):
+        try:
+            return client.place_us_order(
+                side=side,
+                ticker=ticker,
+                ovrs_excg_cd=ovrs_excg_cd,
+                quantity=quantity,
+                price=order_price,
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            last_exc = exc
+            if not is_retryable_request_error(exc) or attempt >= KIS_ORDER_MAX_RETRIES - 1:
+                raise
+            wait_seconds = KIS_ORDER_RETRY_BACKOFF_SECONDS * (2**attempt)
+            print(
+                f"[ORDER/RETRY] {ticker} {side} attempt {attempt + 2}/"
+                f"{KIS_ORDER_MAX_RETRIES} in {wait_seconds:.1f}s — {exc}"
+            )
+            time.sleep(wait_seconds)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Order placement failed for {ticker}")
+
+
+def _finalize_order_acceptance(
+    *,
+    ticker: str,
+    signal: str,
+    execution_qty: int,
+    reference_price: float,
+    order_payload: dict[str, Any],
+    runtime: PositionState,
+    engine: LiveSignalEngine,
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+) -> None:
+    odno = extract_order_odno(order_payload)
+    side = "BUY" if signal == "BUY" else "SELL"
+    buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
+    order_price = (
+        limit_order_price(side, reference_price, buffer_bps)
+        if KIS_ORDER_TYPE == "limit"
+        else 0.0
+    )
+    submitted_at = datetime.now().isoformat(timespec="seconds")
+    if odno:
+        assign_open_order(
+            runtime,
+            odno=odno,
+            side=side,
+            qty=execution_qty,
+            price=order_price,
+            submitted_at=submitted_at,
+        )
+    else:
+        runtime.pending_order = True
+        runtime.open_order_side = side
+        runtime.open_order_qty = execution_qty
+        runtime.open_order_price = order_price
+        runtime.open_order_submitted_at = submitted_at
+        print(f"[ORDER/WARN] {ticker} accepted without odno — fill poll via ccnl/broker")
+
+    runtime.last_failed_order_key = None
+    states[ticker] = engine.dump_state(runtime)
+    save_persisted_states(states)
+    TRADE_LOG.append(
+        ticker=ticker,
+        signal=signal,
+        qty=execution_qty,
+        order_price=order_price or None,
+        fill_price=None,
+        status="ACCEPTED",
+        reason=f"odno={odno or 'unknown'}",
+        cash_after=ledger.available_cash_usd,
+        held_qty=int(runtime.held_quantity or 0),
+    )
+    print(
+        f"  -> Order accepted (rt_cd=0). Awaiting fill confirmation for {ticker}: "
+        f"odno={odno or 'unknown'}, side={side}, qty={execution_qty}"
+    )
 
 
 def dispatch_order_with_state_machine(
@@ -1180,6 +1302,18 @@ def dispatch_order_with_state_machine(
             held_qty=int(runtime.held_quantity or 0),
         )
         print(f"[ORDER/REJECTED] {ticker} {signal} qty={execution_qty} — {exc}")
+        if is_retryable_request_error(exc):
+            ORDER_RETRY_QUEUE.enqueue(
+                PendingOrderRetry(
+                    ticker=ticker,
+                    signal=signal,
+                    quantity=execution_qty,
+                    reference_price=reference_price,
+                    fail_key=fail_key,
+                    current_bar_date=current_bar_date,
+                    last_error=str(exc),
+                )
+            )
         return "HOLD"
 
     if order_payload.get("skipped"):
@@ -1207,48 +1341,16 @@ def dispatch_order_with_state_machine(
         return "HOLD"
 
     odno = extract_order_odno(order_payload)
-    side = "BUY" if signal == "BUY" else "SELL"
-    buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
-    order_price = (
-        limit_order_price(side, reference_price, buffer_bps)
-        if KIS_ORDER_TYPE == "limit"
-        else 0.0
-    )
-    submitted_at = datetime.now().isoformat(timespec="seconds")
-    if odno:
-        assign_open_order(
-            runtime,
-            odno=odno,
-            side=side,
-            qty=execution_qty,
-            price=order_price,
-            submitted_at=submitted_at,
-        )
-    else:
-        runtime.pending_order = True
-        runtime.open_order_side = side
-        runtime.open_order_qty = execution_qty
-        runtime.open_order_price = order_price
-        runtime.open_order_submitted_at = submitted_at
-        print(f"[ORDER/WARN] {ticker} accepted without odno — fill poll via ccnl/broker")
-
-    runtime.last_failed_order_key = None
-    states[ticker] = engine.dump_state(runtime)
-    save_persisted_states(states)
-    TRADE_LOG.append(
+    _finalize_order_acceptance(
         ticker=ticker,
         signal=signal,
-        qty=execution_qty,
-        order_price=order_price or None,
-        fill_price=None,
-        status="ACCEPTED",
-        reason=f"odno={odno or 'unknown'}",
-        cash_after=ledger.available_cash_usd,
-        held_qty=int(runtime.held_quantity or 0),
-    )
-    print(
-        f"  -> Order accepted (rt_cd=0). Awaiting fill confirmation for {ticker}: "
-        f"odno={odno or 'unknown'}, side={side}, qty={execution_qty}"
+        execution_qty=execution_qty,
+        reference_price=reference_price,
+        order_payload=order_payload,
+        runtime=runtime,
+        engine=engine,
+        states=states,
+        ledger=ledger,
     )
     return "PENDING"
 
@@ -1275,12 +1377,14 @@ def print_session_telemetry(
     volume_ratio = volume / volume_avg_20 if volume_avg_20 > 0 else 0.0
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    api_ms = last_api_response_ms()
+    api_suffix = f" | api_response_time={api_ms:.0f}ms" if api_ms is not None else ""
     print("-" * 88)
     print(
         f"[METRICS] {ticker} | {timestamp} | "
         f"Close={close:.2f} | SMA20={sma_20:.2f} | RSI={rsi:.2f} | "
         f"ATR_Wilder={atr:.4f} | Volume={volume:,.0f}/{volume_avg_20:,.0f} "
-        f"({volume_ratio:.3f}x)"
+        f"({volume_ratio:.3f}x){api_suffix}"
     )
     print(
         f"[{ticker}] Current Close | 20 SMA | Standard RSI | Wilder's ATR | "
@@ -1316,6 +1420,21 @@ def print_session_telemetry(
         f"held_qty={runtime.get('held_quantity')} | "
         f"last_processed={runtime.get('last_processed_date')}"
     )
+
+    trigger_floor = runtime.get("trigger_floor")
+    if trigger_floor is not None:
+        try:
+            floor_value = float(trigger_floor)
+            distance = close - floor_value
+            print(
+                f"Trigger Floor Dist   : {distance:.4f} "
+                f"(close={close:.2f} - floor={floor_value:.2f})"
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if cycle.get("eod_atr_stops"):
+        print("ATR Stop Mode        : EOD (USE_EOD_ATR_STOPS=true — backtest parity)")
 
     if signal == "DYNAMIC_ATR_SELL":
         stop = cycle["signal_result"].get("dynamic_atr_stop") or {}
@@ -1606,6 +1725,42 @@ def process_ticker(
     return final_signal
 
 
+def process_order_retry_queue(
+    client: KISApiClient,
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+) -> None:
+    """Retry queued orders from prior transient KIS failures."""
+
+    def _executor(item: PendingOrderRetry) -> dict[str, Any]:
+        engine = LiveSignalEngine(item.ticker)
+        runtime = engine.load_state(states.get(item.ticker, {}))
+        payload = execute_broker_order(
+            client,
+            item.ticker,
+            item.signal,
+            item.quantity,
+            item.reference_price,
+        )
+        if str(payload.get("rt_cd", "")) == "0" and not payload.get("skipped"):
+            _finalize_order_acceptance(
+                ticker=item.ticker,
+                signal=item.signal,
+                execution_qty=item.quantity,
+                reference_price=item.reference_price,
+                order_payload=payload,
+                runtime=runtime,
+                engine=engine,
+                states=states,
+                ledger=ledger,
+            )
+        return payload
+
+    retried = ORDER_RETRY_QUEUE.process_due(_executor)
+    if retried:
+        print(f"[ORDER/QUEUE] Completed {retried} queued retry submission(s)")
+
+
 def run_watchlist_cycle(
     client: KISApiClient,
     cache: MarketDataCache,
@@ -1638,6 +1793,7 @@ def run_watchlist_cycle(
         cash_after=ledger.available_cash_usd,
     )
     save_persisted_states(states)
+    process_order_retry_queue(client, states, ledger)
 
     for index, ticker in enumerate(WATCHLIST):
         try:
@@ -1716,6 +1872,15 @@ def main() -> None:
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
     print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
     print(f"KIS Request Timeout : {KIS_REQUEST_TIMEOUT_SECONDS}s")
+    print(f"KIS Slow API Warn   : {KIS_SLOW_API_MS}ms")
+    print(
+        f"Order Retry Policy  : inline={KIS_ORDER_MAX_RETRIES}x, "
+        f"queue={ORDER_RETRY_QUEUE.path}, backoff={KIS_ORDER_RETRY_BACKOFF_SECONDS}s"
+    )
+    print(
+        f"ATR Stop Mode       : "
+        f"{'EOD (backtest parity)' if use_eod_atr_stops() else 'Intraday session_low'}"
+    )
     print(
         f"Telegram Alerts     : "
         f"{'ON' if _telegram_enabled() else 'OFF (USE_TELEGRAM_ALERTS=false)'}"

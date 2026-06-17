@@ -5,3 +5,4 @@ __pycache__/
 project_metrics.log
 trade_log.csv
 trading_state.json
+order_retry_queue.json

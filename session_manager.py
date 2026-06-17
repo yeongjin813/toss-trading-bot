@@ -14,6 +14,7 @@ from analytics import (
     LiveSignalEngine,
     PositionState,
     is_us_regular_market_hours,
+    use_eod_atr_stops,
 )
 from config import StrategyConfigMapper
 
@@ -99,7 +100,12 @@ class IntradaySessionTracker:
 
         During RTH: session_low = min(prior, bar.low, current_price).
         Outside RTH: session_low is frozen (no pre/post-market stop triggers).
+
+        When ``USE_EOD_ATR_STOPS=true``, returns the static daily bar low only.
         """
+        if use_eod_atr_stops():
+            return float(bar.low)
+
         bar_date_str = (
             bar.date.strftime("%Y-%m-%d")
             if hasattr(bar.date, "strftime")
@@ -141,6 +147,8 @@ class IntradaySessionTracker:
 
         Returns DYNAMIC_ATR_SELL payload when session_low <= trigger_floor.
         """
+        if use_eod_atr_stops():
+            return None
         if not regular_market_hours:
             return None
         if not (runtime.in_position or runtime.held_quantity > 0):

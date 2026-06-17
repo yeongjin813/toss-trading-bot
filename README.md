@@ -4,7 +4,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 7.1 — RTH-only polling, Telegram alert hardening, 30s KIS timeout |
+| **System Status** | Phase 8 — Hardening: NYSE calendar merge, API latency telemetry, order retry queue, EOD ATR parity mode, CI |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
 | **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
@@ -22,7 +22,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** `46767be` (RTH-only polling) · `872f7d2` (Telegram) · `66951a6` (fill verification)
+**Latest production commits:** Phase 8 hardening · `a45f7b6` (ops doc split) · `46767be` (RTH-only) · `872f7d2` (Telegram)
 
 ---
 
@@ -33,7 +33,36 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **[docs/OPERATIONS.md](docs/OPERATIONS.md)** | **Operators** | Deploy, monitor, `.env`, EC2, Telegram, troubleshooting |
 | **README.md** (this file) | Engineers / researchers | Strategy math, architecture, backtest parity, API reference |
 
-**Quick links:** [Run the bot](docs/OPERATIONS.md#local-setup) · [EC2 deploy](docs/OPERATIONS.md#deploy-to-ec2) · [When API runs](docs/OPERATIONS.md#when-the-bot-runs) · [Env vars](#appendix-c-configuration-externalization-matrix)
+**Quick links:** [Improvement journey (why & how)](#improvement-journey--what-changed-and-why) · [Run the bot](docs/OPERATIONS.md#local-setup) · [EC2 deploy](docs/OPERATIONS.md#deploy-to-ec2) · [Env vars](#appendix-c-configuration-externalization-matrix)
+
+---
+
+## Improvement Journey — What Changed and Why
+
+Read this top-to-bottom for a **single narrative** of every major fix. Each row is one decision: what broke or fell short, why it mattered, what we shipped, and how to verify.
+
+| Step | Problem (why change was needed) | What we did | How to verify |
+|---|---|---|---|
+| **1** | Fixed 20-day SMA on one ticker whipsawed in sideways markets; no live path. | Built CSV backtest baseline on `AAPL`; measured +0.99% over 3y. | `python run_backtest.py --isolated` |
+| **2** | Grid-stacked RSI + volume filters blocked entries; return fell to +0.52%. | Ran SMA grid search; kept 10-day SMA + RSI gate as Phase 2 baseline. | Compare Phase 1 vs 2 in Section 1 chronology |
+| **3** | Backtest used static files; live needed KIS API + persisted state. | Live ingestion, `.env` credentials, OAuth cache, English telemetry. | `python main.py` startup + `trading_state.json` |
+| **4** | Look-ahead bias, duplicate orders, holiday crashes, 15-ticker scale. | Same-bar ATR sequence, `MarketDataCache`, pending lock, NYSE calendar, liquidity gate. | `python test_analytics.py` Tests 1–4 |
+| **5** | One global `.env` strategy hurt NVDA (−16.9% vs B&H +426%). | `config.py` ticker regimes (NVDA / PLTR / DEFAULT); dual MA + conditional RSI exit. | `python run_backtest.py`; NVDA row in Phase 5 table |
+| **3-infra** | Daily backtest vs intraday live could drift; broker vs local qty could diverge. | P3: RTH gate, `session_low` ATR scan, `PortfolioReconciliationEngine` (`VTRP6504R`). | `[RECONCILE]` logs; Section [P3](#phase-3-infrastructure-hardening--live-parity-architecture) |
+| **6** | `rt_cd=0` updated `held_quantity` before fill → phantom SELLs. | `OrderFillMonitor`, `trade_log.csv`, `RiskGuard`, RTH BUY windows. | `python test_execution_engine.py`; `trade_log.csv` |
+| **7** | No mobile signal when fills/errors happened on EC2. | `telegram_notifier.py`, fill callbacks, `--diagnose`; one Bot session per message. | `python telegram_notifier.py --diagnose` |
+| **7.1** | Off-hours KIS polls caused timeout spam + useless Telegram WARNINGs. | Zero API off-hours; WARNING Telegram RTH-only; timeout 15s→30s. | `[GATE/RTH]` in logs outside 09:30–16:00 ET |
+| **8.0** | ~2k-line README mixed ops commands with strategy math. | Split [docs/OPERATIONS.md](docs/OPERATIONS.md) for deploy/monitor; slim README. | Documentation Map above |
+| **8.1** | Manual NYSE calendar missed **Good Friday** → bot could poll on closed days. | Merge `holidays.NYSE`; log `[CALENDAR]` when library adds a date. | `python test_analytics.py` Test 8 |
+| **8.2** | Could not see slow KIS calls in production logs. | `kis_http.py`: every call logs `api_response_time`; `[KIS/SLOW]` > `KIS_SLOW_API_MS`. | `[KIS/HTTP]` lines in `project_metrics.log` |
+| **8.3** | Transient timeout dropped orders with no retry. | Inline `KIS_ORDER_MAX_RETRIES` + `order_retry_queue.json` each RTH cycle. | `[ORDER/RETRY]` / `[ORDER/QUEUE]` logs |
+| **8.4** | Live intraday `session_low` ≠ backtest daily `Low` → false confidence in backtest P&L. | `USE_EOD_ATR_STOPS=true` switches to daily bar low (backtest parity). | Set in `.env`; log `ATR Stop Mode : EOD` |
+| **8.5** | Stop proximity visible only on `DYNAMIC_ATR_SELL` banner. | `Trigger Floor Dist` every cycle when positioned. | `[METRICS]` block in Section 9 |
+| **8.6** | Tests only run manually before deploy. | GitHub Actions runs all `test_*.py` on push/PR. | `.github/workflows/ci.yml` |
+| **—** | *Still open:* strategy alpha vs buy-and-hold, VTS≠real account, 60s poll latency. | Documented in Phase 8 footer + Section 11; not auto-fixable in one patch. | Track in Section 14 checklist |
+
+> **Operator path:** after Step 8.0, day-to-day commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.  
+> **Researcher path:** strategy math stays in Sections 2–8 below.
 
 ---
 
@@ -41,13 +70,14 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Operations (start here for live trading)**
 
+- **[Improvement Journey — what changed & why](#improvement-journey--what-changed-and-why)**
 - **[Production Operations Guide](docs/OPERATIONS.md)** — deploy, monitor, Telegram, EC2, troubleshooting
 
 **Architecture & chronology**
 
 1. [Project Evolution](#1-project-evolution--development-chronology)
 - [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)
-- [Phase 3 Infrastructure (P3)](#phase-3-infrastructure-hardening--live-parity-architecture)
+- [Phase 8 Hardening](#phase-8-production-hardening--readme-improvement-log)
 2. [Same-Bar Look-Ahead Fix](#2-dedicated-section-same-bar-look-ahead-bias-eradication)
 3. [RSI Crossdown Exit](#3-dedicated-section-rsi-crossdown-exit-engine)
 4. [Dual-Clamp Sizing](#4-dedicated-section-dual-clamp-position-sizing)
@@ -116,14 +146,16 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 ### Phase 6: Fill Verification, Trade Log & Risk Gates *(2026-06)*
 
-- **Architecture**: Order acceptance (`rt_cd=0`) no longer mutates `held_quantity`. `OrderFillMonitor` polls KIS `inquire-ccnl` / `inquire-nccs` until fills confirm (including partial). All events append to `trade_log.csv`. `RiskGuard` enforces daily loss, max open positions, and per-ticker exposure caps.
-- **Gates**: RTH open/close BUY blocks, yfinance fallback BUY block, stale `pending_order` release.
+- **Problem**: KIS returned `rt_cd=0` (accepted) before shares filled — local state showed positions that did not exist → invalid SELL orders.
+- **Why it mattered**: Any sizing or stop logic built on phantom `held_quantity` is unsafe for live capital.
+- **Fix**: Poll `inquire-ccnl` / `inquire-nccs` until fill confirms; append `trade_log.csv`; `RiskGuard` caps loss/exposure; block new BUY near open/close.
 - **Commit**: `66951a6` — see [OPERATIONS.md — Phase 6](docs/OPERATIONS.md#phase-6--fills--risk).
 
 ### Phase 7: Telegram Mobile Alerts *(2026-06)*
 
-- **Architecture**: `telegram_notifier.py` sends async push notifications when trades fill and when the live loop hits critical failures. Integrated into `main.py` via fill callbacks in `execution_engine.py`. Gated by `USE_TELEGRAM_ALERTS=true`.
-- **Session model**: Each message uses `async with Bot(token=...) as bot:` (python-telegram-bot v21+) — one HTTP session per dispatch, no long-lived singleton bot.
+- **Problem**: Bot ran headless on EC2 — no push notification on fills or crashes.
+- **Why it mattered**: Operator had to SSH + `tail -f` to learn the bot failed or traded.
+- **Fix**: `telegram_notifier.py` + fill callbacks; `async with Bot` per message; gated by `USE_TELEGRAM_ALERTS`.
 - **Commit**: `872f7d2` — see [OPERATIONS.md — Phase 7](docs/OPERATIONS.md#phase-7--telegram-integration).
 
 ### Phase 7.1: RTH-Only Polling & Alert Hardening *(2026-06)*
@@ -131,6 +163,23 @@ An automated, production-grade quantitative trading infrastructure and empirical
 - **Problem**: VTS API timeouts and reconcile `500` errors during **off-hours** produced log noise and Telegram WARNING spam — even though orders were already RTH-gated.
 - **Fix**: `main.py` skips the entire watchlist cycle (zero KIS HTTP calls) outside NY RTH; sleeps until the next session window via `seconds_until_us_rth_open()`. WARNING-level Telegram alerts are **log-only** off-hours; CRITICAL alerts still push. KIS HTTP timeout default raised **15s → 30s** (`KIS_REQUEST_TIMEOUT_SECONDS`).
 - **Commit**: `46767be` — see [OPERATIONS.md — Phase 7.1](docs/OPERATIONS.md#phase-71--rth-only-polling).
+
+### Phase 8: Production Hardening & README Improvement Log *(2026-06)*
+
+Closed gaps from [Section 12](#12-pre-deployment-critical-architectural-flaws--hardening-vectors). Full timeline: [Improvement Journey](#improvement-journey--what-changed-and-why). Detail by patch:
+
+| Step | Problem (why) | Fix | Module |
+|---|---|---|---|
+| **8.1** | Manual calendar missed **Good Friday** — bot could call KIS on closed days | Merge `holidays.NYSE`; `[CALENDAR]` drift logs | `analytics.py` |
+| **8.2** | No latency visibility — slow VTS looked like “random HOLD” | `[KIS/HTTP]` + `api_response_time`; `[KIS/SLOW]` threshold | `kis_http.py` |
+| **8.3** | One timeout = lost order intent | Inline retry + `order_retry_queue.json` per RTH cycle | `order_retry_queue.py` |
+| **8.4** | Live intraday stops ≠ backtest daily `Low` | `USE_EOD_ATR_STOPS=true` for parity (default keeps legacy) | `analytics.py`, `session_manager.py` |
+| **8.5** | Stop distance only logged on sell signal | `Trigger Floor Dist` every cycle when positioned | `main.py` |
+| **8.6** | Regressions caught only manually | GitHub Actions CI on all `test_*.py` | `.github/workflows/ci.yml` |
+| **8.7** | Ops mixed into 2k-line README | Split [docs/OPERATIONS.md](docs/OPERATIONS.md) | `docs/` |
+
+**Recommended for backtest-aligned live runs:** set `USE_EOD_ATR_STOPS=true` in `.env`.  
+**Still open (not auto-fixable):** strategy alpha vs buy-and-hold, VTS→real-account migration, 60s polling latency, per-ticker parameter tuning.
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -152,6 +201,11 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **P6 Fill Verification** | `execution_engine.py` + `main.py` | ccnl/nccs poll; partial fills; `trade_log.csv`; risk gates |
 | **P7 Telegram Alerts** | `telegram_notifier.py` + `main.py` | Trade reports on fill; CRITICAL/WARNING system alerts |
 | **P7.1 RTH-Only Loop** | `main.py` + `analytics.py` | No KIS API off-hours; suppress WARNING Telegram off-hours; 30s timeout |
+| **P8 NYSE Calendar Merge** | `analytics.py` | `holidays.NYSE` cross-check; Good Friday + drift logs |
+| **P8 API Latency Telemetry** | `kis_http.py` | `api_response_time` on all KIS HTTP calls |
+| **P8 Order Retry Queue** | `order_retry_queue.py` + `main.py` | Inline + persistent retry for transient failures |
+| **P8 EOD ATR Parity Mode** | `analytics.py` + `session_manager.py` | `USE_EOD_ATR_STOPS` aligns live stops with backtest |
+| **P8 CI** | `.github/workflows/ci.yml` | Automated verification suite on push/PR |
 
 Additional Phase 4 safeguards preserved from prior milestones:
 
@@ -1200,6 +1254,8 @@ Live monitoring showed persistent `Liquidity OK: False` during RTH because parti
 ```powershell
 python test_analytics.py
 python test_execution_engine.py
+python test_kis_http.py
+python test_order_retry_queue.py
 python test_telegram_notifier.py
 ```
 
@@ -1351,28 +1407,22 @@ $$
 | `deployable = capital_at_risk` (100%) | `shares_by_capital = int((deployable × 0.95) / entry_price)` |
 | No fee deduction in sizing | Commission still modeled at execution (`0.1%` default); sizing reserves 5% cash headroom |
 
-### ③ Intraday vs. EOD Timeframe Non-Invertibility
+### ③ Intraday vs. EOD Timeframe Non-Invertibility — **MITIGATED (P8)**
 
-- **The Defect**: The live script logs real-time macro-ticks through `update_session_low()`, while the backtester utilizes uniform flat daily candles. Evaluating real-time intraday tick feeds against an EOD daily bar backtest is mathematically invalid for path-dependent stop logic.
-- **The Hardening Patches**: Establish absolute structural clarity. If the system executes as a true real-time engine, the backtesting infrastructure inside `strategy.py` must be entirely refactored to ingest high-frequency 1-minute or 5-minute intraday bars instead of daily vectors to preserve structural consistency — **or** the live engine must downgrade to pure EOD evaluation (eliminating `session_low` intraday scanning).
+- **The Defect**: The live script tracks running `session_low()` while the backtester uses daily `Low_t` only.
+- **P8 Mitigation**: Set `USE_EOD_ATR_STOPS=true` to disable intraday ATR scanning and match backtest bar logic. Default `false` keeps legacy intraday behavior.
+- **Full fix (future)**: 1-minute / 5-minute backtest bars for invertible intraday parity (Section 14 P3).
 
-| Mode | Data Granularity | Stop Path Fidelity |
+| Mode | Env | Stop Path |
 |---|---|---|
-| Current live | Daily bar + `session_low` overlay | Intraday reactive |
-| Current backtest | Daily OHLCV only | EOD reactive |
-| Target parity | Matched granularity (1m/5m or pure EOD) | Invertible |
+| Legacy live (default) | `USE_EOD_ATR_STOPS=false` | Intraday `session_low` |
+| Backtest parity live | `USE_EOD_ATR_STOPS=true` | Daily bar `Low` only |
+| Backtest | — | Daily `Low_t` (EOD) |
 
-### ④ Hardcoded Holiday Computation Risk
+### ④ Hardcoded Holiday Computation Risk — **RESOLVED (P8)**
 
-- **The Defect**: While mathematical calculation helpers like `_memorial_day()` and `_thanksgiving_day()` resolve floating holiday offsets dynamically, they cannot catch emergency market adjustments (e.g., unexpected national mourning closures) or volatile lunisolar dates like **Good Friday**.
-- **The Hardening Patches**: Integrate Python's `holidays` library mapped to the `NYSE` market definition, forcing a multi-layer cross-check against the internal arithmetic calendar to shield the network interface from processing payloads on closure dates:
-
-```python
-import holidays
-nyse_calendar = holidays.NYSE(years=range(current_year - 1, current_year + 2))
-# Cross-check: if date in nyse_calendar AND is_us_market_holiday(date) → sleep
-# If nyse_calendar marks closed but internal registry misses → log CRITICAL + sleep
-```
+- **The Defect**: Internal calendar missed floating closures such as **Good Friday**.
+- **P8 Implementation**: `holidays.NYSE` merged into `us_market_holidays_for_year()`; library-only dates logged as `[CALENDAR] Added …`; internal-only dates logged as `[CALENDAR/WARN]`.
 
 ---
 
@@ -1398,8 +1448,8 @@ real_vs_local_position_mismatch=0 | api_response_time=842ms | Signal=HOLD
 | Channel | Inject Location | Status |
 |---|---|---|
 | `real_vs_local_position_mismatch` | Pre-cycle reconciliation in `main.py` | **Implemented (P3)** — `[RECONCILE/MISMATCH]` auto-override |
-| `api_response_time` | `KISApiClient` request wrapper | **Planned** |
-| `trigger_floor_distance` | `print_session_telemetry()` in `main.py` | Partially available via ATR Stop Telemetry block |
+| `api_response_time` | `kis_http.kis_request()` wrapper | **Implemented (P8)** — appended to `[METRICS]`; `[KIS/SLOW]` when > threshold |
+| `trigger_floor_distance` | `print_session_telemetry()` in `main.py` | **Implemented (P8)** — `Trigger Floor Dist` every cycle when positioned |
 
 Existing per-cycle fields already emitted (Section 9):
 
@@ -1427,10 +1477,10 @@ $$
 | **P0** | Portfolio Reconciliation Layer | `session_manager.py` + `main.py` | **Done (P3)** — `VTRP6504R` sync at startup + daily RTH; auto-override on $\Delta \text{Shares} \neq 0$ |
 | **P0** | Backtest Timing Alignment | `strategy.py` / Backtrader init | **Done** — `configure_backtest_broker()` calls `cerebro.broker.set_coc(True)` (Cheat-on-Close at $\text{Close}_t$). |
 | **P1** | Capital Deploy Buffer | `analytics.py` + `portfolio_backtest.py` | **Done** — `calculate_position_size()` / `dual_clamp_portfolio_size()` apply the $0.95$ deployable haircut (Section 12②). |
-| **P1** | NYSE Calendar Cross-Check | `analytics.py` | Integrate `holidays.NYSE` multi-layer validation (Section 12④). |
-| **P2** | API Exception Handling Queue | `main.py` | Build standardized asynchronous retry queue for failed order transmissions. |
+| **P1** | NYSE Calendar Cross-Check | `analytics.py` | **Done (P8)** — `holidays.NYSE` merge + drift logs (Section 12④). |
+| **P2** | API Exception Handling Queue | `main.py` | **Done (P8)** — `kis_http.py` latency + `order_retry_queue.py` inline/cycle retries. |
 | **P2** | Telegram Alert Webhook | `telegram_notifier.py` + `main.py` | **Done (P7)** — trade reports on `PARTIAL`/`FILLED`; system alerts on auth/reconcile/API/crash paths; `USE_TELEGRAM_ALERTS` gate |
-| **P3** | Intraday Backtest Parity | `strategy.py` | Refactor to 1-minute / 5-minute bars **or** downgrade live to pure EOD (Section 12③). |
+| **P3** | Intraday Backtest Parity | `analytics.py` | **Mitigated (P8)** — `USE_EOD_ATR_STOPS=true` for daily-bar parity; intraday backtest refactor still optional. |
 
 ### Cheat-on-Close Reference Implementation
 
@@ -1447,10 +1497,11 @@ cerebro.broker.set_coc(True)   # Execute at current bar close — aligns with an
 - [x] Backtrader `set_coc(True)` verified — `strategy.configure_backtest_broker()`; fills at $\text{Close}_t$, not $\text{Open}_{t+1}$
 - [x] $\Delta \text{Shares}$ reconciliation active — local `held_quantity` overridden to match broker registry (P3)
 - [x] Capital deploy buffer (95%) applied in `calculate_position_size()` and `dual_clamp_portfolio_size()`
-- [ ] `holidays.NYSE` cross-check integrated alongside internal calendar
-- [ ] `api_response_time` logged; Retry Queue wired for timeout events
+- [x] `holidays.NYSE` cross-check integrated alongside internal calendar **(P8)**
+- [x] `api_response_time` logged; Retry Queue wired for transient order failures **(P8)**
 - [x] Telegram alerts wired — `telegram_notifier.py`; fill callbacks; `--diagnose` CLI; requires `/start` on your bot + `.env` on each host
-- [ ] Backtest vs. live granularity decision documented (EOD-only or intraday bars)
+- [x] Backtest vs. live granularity decision documented — use `USE_EOD_ATR_STOPS=true` for EOD parity **(P8)**
+- [x] CI runs `test_*.py` on push/PR **(P8)**
 
 ---
 
@@ -1514,6 +1565,7 @@ Fill verification, Telegram alerts, and RTH-only polling are **operational featu
 | **6** | `66951a6` | ccnl/nccs fill poll, `trade_log.csv`, risk gates | [Fills & Risk](docs/OPERATIONS.md#phase-6--fills--risk) |
 | **7** | `872f7d2` | Telegram trade reports + system alerts | [Telegram Integration](docs/OPERATIONS.md#phase-7--telegram-integration) |
 | **7.1** | `46767be` | No KIS API off-hours; WARNING Telegram RTH-only; 30s timeout | [RTH-Only Polling](docs/OPERATIONS.md#phase-71--rth-only-polling) |
+| **8** | *(this release)* | Calendar merge, API latency, retry queue, EOD ATR mode, CI | [Phase 8 log](#phase-8-production-hardening--readme-improvement-log) |
 
 ---
 
@@ -1587,6 +1639,11 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `RTH_BUY_BLOCK_OPEN_MINUTES` | No | `10` | No new BUY after 09:30 ET open |
 | `RTH_BUY_BLOCK_CLOSE_MINUTES` | No | `5` | No new BUY before 16:00 ET close |
 | `PENDING_ORDER_STALE_MINUTES` | No | `120` | Release pending lock if zero fill |
+| `USE_EOD_ATR_STOPS` | No | `false` | `true` = daily bar low ATR stops (backtest parity); `false` = intraday `session_low` |
+| `KIS_SLOW_API_MS` | No | `3000` | Log `[KIS/SLOW]` when `api_response_time` exceeds threshold |
+| `KIS_ORDER_MAX_RETRIES` | No | `3` | Inline + queued order retry attempts for transient failures |
+| `KIS_ORDER_RETRY_BACKOFF_SECONDS` | No | `2.0` | Base exponential backoff between order retries |
+| `ORDER_RETRY_QUEUE_FILE` | No | `./order_retry_queue.json` | Persistent retry queue (auto-generated) |
 
 #### Telegram Alerts (Phase 7)
 
@@ -1618,11 +1675,16 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 Toss Trading Bot/
 ├── docs/
 │   └── OPERATIONS.md       # Production ops: deploy, EC2, Telegram, troubleshooting
+├── .github/workflows/ci.yml # P8: automated test_*.py on push/PR
+├── kis_http.py             # P8: KIS HTTP wrapper + api_response_time telemetry
+├── order_retry_queue.py    # P8: persistent order retry queue
 ├── main.py                 # KIS orchestrator, reconciliation, RTH gate, Telegram dispatch, state-gated orders
 ├── execution_engine.py     # P6: OrderFillMonitor, TradeLogWriter, RiskGuard, fill callbacks
 ├── telegram_notifier.py    # P7: async Telegram alerts (trade reports + system alerts)
 ├── test_telegram_notifier.py
 ├── test_execution_engine.py
+├── test_kis_http.py
+├── test_order_retry_queue.py
 ├── session_manager.py      # P3: RegularHoursGate, IntradaySessionTracker, PortfolioReconciliationEngine
 ├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
 ├── market_registry.py      # DEFAULT_WATCHLIST (15) + KIS MARKET_META routing + parse/validate helpers
@@ -1636,6 +1698,7 @@ Toss Trading Bot/
 ├── .gitignore              # Excludes .env, kis_token_cache.json, trading_state.json
 ├── trading_state.json      # Multi-ticker PositionState registry (auto-generated)
 ├── trade_log.csv           # P6: append-only fill audit log (auto-generated)
+├── order_retry_queue.json  # P8: queued order retries (auto-generated)
 ├── kis_token_cache.json    # OAuth token cache (auto-generated)
 ├── project_metrics.log     # Example redirected telemetry output
 └── data/
