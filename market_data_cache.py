@@ -123,7 +123,9 @@ class MarketDataCache:
             "yes",
             "on",
         }
-        self._refresh_stagger_seconds = float(os.getenv("KIS_REFRESH_STAGGER_SECONDS", "0.35"))
+        self._refresh_stagger_seconds = float(os.getenv("KIS_REFRESH_STAGGER_SECONDS", "1.0"))
+        self._min_refresh_seconds = float(os.getenv("OHLCV_MIN_REFRESH_SECONDS", "120"))
+        self._last_bulk_refresh_at: datetime | None = None
 
     def data_path_for_ticker(self, ticker: str) -> str:
         return os.path.join(self._data_dir, f"{ticker.lower()}_daily.csv")
@@ -228,26 +230,43 @@ class MarketDataCache:
         unique = list(dict.fromkeys(tickers))
         if not unique:
             return {}
-        if not self._parallel_refresh or len(unique) == 1:
-            return self._refresh_sequential(unique, now=now)
 
-        results: dict[str, tuple[pd.DataFrame, bool]] = {}
-        workers = min(self._max_refresh_workers, len(unique))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(self.refresh_latest, ticker, now=now): ticker
-                for ticker in unique
-            }
-            for future in as_completed(futures):
-                ticker = futures[future]
-                try:
-                    results[ticker] = future.result()
-                except Exception as exc:
-                    print(
-                        f"[CACHE/WARN] {ticker} parallel refresh failed ({exc}) — "
-                        "using last good bars"
-                    )
-                    results[ticker] = (self.evaluation_frame(ticker), False)
+        now_dt = now or datetime.now()
+        if (
+            self._min_refresh_seconds > 0
+            and self._last_bulk_refresh_at is not None
+            and (now_dt - self._last_bulk_refresh_at).total_seconds()
+            < self._min_refresh_seconds
+        ):
+            print(
+                f"[CACHE] Skipping KIS OHLCV refresh "
+                f"(last {int((now_dt - self._last_bulk_refresh_at).total_seconds())}s ago, "
+                f"min interval {self._min_refresh_seconds:.0f}s)"
+            )
+            return {t: (self.evaluation_frame(t), False) for t in unique}
+
+        if not self._parallel_refresh or len(unique) == 1:
+            results = self._refresh_sequential(unique, now=now)
+        else:
+            results: dict[str, tuple[pd.DataFrame, bool]] = {}
+            workers = min(self._max_refresh_workers, len(unique))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self.refresh_latest, ticker, now=now): ticker
+                    for ticker in unique
+                }
+                for future in as_completed(futures):
+                    ticker = futures[future]
+                    try:
+                        results[ticker] = future.result()
+                    except Exception as exc:
+                        print(
+                            f"[CACHE/WARN] {ticker} parallel refresh failed ({exc}) — "
+                            "using last good bars"
+                        )
+                        results[ticker] = (self.evaluation_frame(ticker), False)
+
+        self._last_bulk_refresh_at = now_dt
         return results
 
     def _refresh_sequential(

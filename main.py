@@ -167,7 +167,7 @@ MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600
 KIS_REQUEST_TIMEOUT_SECONDS = int(os.getenv("KIS_REQUEST_TIMEOUT_SECONDS", "30"))
 KIS_ORDER_MAX_RETRIES = max(1, int(os.getenv("KIS_ORDER_MAX_RETRIES", "3")))
 KIS_ORDER_RETRY_BACKOFF_SECONDS = float(os.getenv("KIS_ORDER_RETRY_BACKOFF_SECONDS", "2.0"))
-KIS_SLOW_API_MS = int(os.getenv("KIS_SLOW_API_MS", "3000"))
+RECONCILE_RETRY_COOLDOWN_SECONDS = int(os.getenv("RECONCILE_RETRY_COOLDOWN_SECONDS", "900"))
 TELEGRAM_ALERT_THROTTLE_SECONDS = int(os.getenv("TELEGRAM_ALERT_THROTTLE_SECONDS", "900"))
 _alert_last_sent: dict[str, float] = {}
 
@@ -570,7 +570,9 @@ class KISApiClient:
                 last_error = exc
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status is not None and status >= 500 and attempt < max_retries - 1:
-                    wait_seconds = 1.0 * (attempt + 1)
+                    wait_seconds = float(
+                        os.getenv("KIS_DAILYPRICE_RETRY_BACKOFF_SECONDS", "2.0")
+                    ) * (2**attempt)
                     print(
                         f"[WARN] KIS dailyprice {status} for {ticker} "
                         f"(BYMD={bymd}) - retry {attempt + 2}/{max_retries} in {wait_seconds:.0f}s"
@@ -1448,13 +1450,23 @@ def _estimate_portfolio_equity(
 
 
 def _should_run_session_reconciliation(states: dict[str, Any], now: datetime) -> bool:
-    """Reconcile once per calendar day at the first RTH cycle."""
+    """Reconcile once per calendar day; on failure retry at most every 15 minutes."""
     if not is_us_regular_market_hours(now):
         return False
     portfolio_meta = states.get("_portfolio", {})
-    last_session_date = portfolio_meta.get("last_reconcile_session_date")
     today = now.strftime("%Y-%m-%d")
-    return last_session_date != today
+    if portfolio_meta.get("last_reconcile_session_date") == today:
+        return False
+    last_attempt = portfolio_meta.get("last_reconcile_attempt_at")
+    if last_attempt:
+        try:
+            attempted = datetime.fromisoformat(str(last_attempt))
+            elapsed = (now - attempted).total_seconds()
+            if elapsed < RECONCILE_RETRY_COOLDOWN_SECONDS:
+                return False
+        except ValueError:
+            pass
+    return True
 
 
 def run_session_reconciliation(
@@ -1477,6 +1489,7 @@ def run_session_reconciliation(
         return states, ledger
 
     print("[RECONCILE] Starting broker portfolio synchronization...")
+    states.setdefault("_portfolio", {})["last_reconcile_attempt_at"] = now.isoformat()
     states, ledger, report = _reconciliation_engine.reconcile(
         client,
         states,
