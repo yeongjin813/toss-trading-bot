@@ -4,8 +4,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 9 — Strategy overhaul: momentum Top-N, dual entry/staged exits, SPY+QQQ regime, dry-run, EOD Telegram, walk-forward benchmarks |
-| **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM entry regimes |
+| **System Status** | Phase 10 — Breakout-only entries, min-hold soft exits, Top-3 momentum, regime-specific trails, exit-reason telemetry |
+| **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM / DEFAULT (all `breakout`) |
 | **Universe Filter** | `momentum_ranker.py` — weekly Top-N from 15-ticker watchlist; gates **new BUY only** |
 | **Regime Filter** | SPY 200MA gate + optional QQQ half-size when SPY bear / QQQ bull (`USE_QQQ_REGIME_FILTER`) |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
@@ -24,7 +24,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Phase 9 strategy overhaul · `9dcea21` (dry-run, EOD, benchmarks) · `09bedda` (momentum, staged exits) · `5ed98ac` (fill sync fix)
+**Latest production commits:** Phase 10 trend-hold overhaul · `770d2b4` · Phase 9 · `9dcea21` (dry-run, EOD, benchmarks)
 
 ---
 
@@ -256,6 +256,25 @@ python run_backtest.py --walk-forward --yfinance
 python test_momentum_ranker.py
 python test_backtest_benchmarks.py
 python test_daily_report.py
+```
+
+### Phase 10: Trend Hold & Exit Discipline *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **Breakout-only entries** | `config.py` | All regimes use `entry_mode=breakout` (20-day high); dual/pullback removed |
+| **Wider hard stop** | `config.py` | `stop_loss_pct=0.08` (−8%) + 2× ATR floor across regimes |
+| **Min-hold gate** | `analytics.py` | `min_hold_days=5` blocks soft exits (trail, trend, RSI, crossover) |
+| **Regime trend exits** | `config.py` | MEGA/DEFAULT: 5-day below 50MA; HIGH_BETA/MOMENTUM: disabled + `skip_trend_exit_when_ranked` |
+| **Profit trails** | `config.py` | MEGA 18%/15%; HIGH_BETA 20%/15%; MOMENTUM 25%/18% |
+| **Top-3 momentum** | `momentum_ranker.py` | `MOMENTUM_TOP_N` default **3** (concentrated capital) |
+| **Exit telemetry** | `analytics.py` + `portfolio_backtest.py` | `exit_reason` on SELL; backtest summary table by trigger |
+
+**Verify:**
+
+```powershell
+python run_backtest.py --walk-forward --yfinance --momentum-top-n 3
+python test_analytics.py
 ```
 
 | Upgrade | Module | Summary |
@@ -1280,30 +1299,32 @@ Implemented in `analytics.py` (`LiveSignalEngine`); Backtrader twin in `strategy
 ## 8. Strategy Configurations & Parameters
 
 Signal execution parameters are **ticker-isolated** via `config.py` → `StrategyConfigMapper.for_ticker()`.  
-Phase 9 expanded the Phase 5 NVDA/PLTR/DEFAULT matrix into four **entry regimes** with **staged exits**. See [Phase 9](#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06) and [Appendix E](#appendix-e-academic-regime-mapping-watchlist-design).
+Phase 10 unified all regimes to **breakout-only** entry with **min-hold** soft exits and regime-specific profit trails. See [Phase 10](#phase-10-trend-hold--exit-discipline-2026-06), [Phase 9](#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06), and [Appendix E](#appendix-e-academic-regime-mapping-watchlist-design).
 
 `.env` controls **credentials, watchlist, capital, momentum rank, and loop timing** — not SMA/RSI/ATR signal thresholds.
 
-#### Entry Regimes (Hardcoded in `config.py`)
+#### Entry Regimes (Hardcoded in `config.py` — Phase 10)
 
-| Regime | Tickers | `entry_mode` | `sma` | `use_trend_filter` | Notes |
+| Regime | Tickers | `entry_mode` | `sma` | `trend_exit_days` | Profit trail (arm / drawdown) |
 |---|---|---|---|---|---|
-| **MEGA_CAP** | AAPL, MSFT, GOOGL, AMZN | `dual` | 20 | True | Breakout + pullback + golden cross |
-| **HIGH_BETA** | NVDA, META, AVGO, NFLX | `dual` | 10 | True | Wider ATR (3.0×), profit trail −12% |
-| **MOMENTUM** | PLTR, TSLA, CRWD, AMD | `breakout` | 10 | False | 20-day high breakout only |
-| **DEFAULT** | TSM, SHOP, UBER, others | `dual` | 20 | True | Conservative large-cap baseline |
+| **MEGA_CAP** | AAPL, MSFT, GOOGL, AMZN | `breakout` | 20 | 5 | 18% / 15% |
+| **HIGH_BETA** | NVDA, META, AVGO, NFLX | `breakout` | 10 | 0 (skip when ranked) | 20% / 15% |
+| **MOMENTUM** | PLTR, TSLA, CRWD, AMD | `breakout` | 10 | 0 (skip when ranked) | 25% / 18% |
+| **DEFAULT** | TSM, SHOP, UBER, others | `breakout` | 20 | 5 | 15% / 15% |
 
-**Dual entry** (`entry_mode=dual`): any of (a) 20-day high breakout, (b) pullback to short SMA with RSI 40–60, (c) golden cross with volume gate.
+All regimes: **20-day high breakout** + volume/RSI gates. `min_hold_days=5` blocks soft exits for the first five bars held.
 
-#### Staged Exit Stack (Phase 9 — all regimes)
+#### Staged Exit Stack (Phase 10 — all regimes)
 
 | Priority | Exit | Trigger |
 |---|---|---|
-| 1 | Hard stop | −5% from entry **or** 2× ATR below entry |
-| 2 | Profit trail | After +15% gain (MOMENTUM: +12%), sell on −10–12% drawdown from peak |
-| 3 | Trend break | 2 consecutive closes below 50MA |
+| 1 | Hard stop | −8% from entry **or** 2× ATR below entry (always fires; ignores min-hold) |
+| 2 | Profit trail | Regime-specific arm % then drawdown from peak (see table above) |
+| 3 | Trend break | MEGA/DEFAULT: 5 consecutive closes below 50MA; HIGH_BETA/MOMENTUM: off while momentum-ranked |
 | 4 | ATR trail | Only after profit trail armed; same-bar prior-floor check |
 | 5 | Legacy | Death cross, RSI crossdown (regime-conditional), liquidity gate |
+
+Soft exits (rows 2–5) are suppressed until `bars_held ≥ min_hold_days`. Backtests and live logs tag SELL triggers via `exit_reason` (`hard_stop`, `profit_trail`, `trend_exit`, `atr_trail`, `crossover`, `rsi_exit`).
 
 #### Macro Regime Sizing (`.env`)
 
@@ -1315,7 +1336,7 @@ Phase 9 expanded the Phase 5 NVDA/PLTR/DEFAULT matrix into four **entry regimes*
 
 #### Momentum Universe (`.env`)
 
-Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default 5) receive new BUY signals. Held positions always get exit evaluation regardless of rank. Rebalance every Friday (`MOMENTUM_REBALANCE_WEEKDAY=4`).
+Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) receive new BUY signals. Held positions always get exit evaluation regardless of rank. Rebalance every Friday (`MOMENTUM_REBALANCE_WEEKDAY=4`).
 
 #### Shared Infrastructure Constants
 
@@ -1760,7 +1781,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `MOMENTUM_RANK_ENABLED` | No | `true` | Enable weekly Top-N universe filter |
-| `MOMENTUM_TOP_N` | No | `5` | Number of tickers eligible for new BUY |
+| `MOMENTUM_TOP_N` | No | `3` | Number of tickers eligible for new BUY |
 | `MOMENTUM_REBALANCE_WEEKDAY` | No | `4` | Rebalance day (0=Mon … 4=Fri) |
 | `MOMENTUM_WEIGHT_3M` | No | `0.4` | 3-month return weight |
 | `MOMENTUM_WEIGHT_6M` | No | `0.3` | 6-month return weight |

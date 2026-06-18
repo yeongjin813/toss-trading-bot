@@ -22,6 +22,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 11. [Troubleshooting](#troubleshooting)
 12. [Phase 8 — Hardening](#phase-8--hardening)
 13. [Phase 9 — Momentum, Dry-Run & EOD Report](#phase-9--momentum-dry-run--eod-report)
+14. [Phase 10 — Trend Hold & Exit Discipline](#phase-10--trend-hold--exit-discipline)
 
 ---
 
@@ -52,7 +53,7 @@ KIS_ORDER_TYPE=limit
 
 # Momentum Top-N (new BUY only)
 MOMENTUM_RANK_ENABLED=true
-MOMENTUM_TOP_N=5
+MOMENTUM_TOP_N=3
 
 # Safety & reporting
 KIS_DRY_RUN=false
@@ -354,7 +355,7 @@ Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-ha
 
 ```ini
 MOMENTUM_RANK_ENABLED=true
-MOMENTUM_TOP_N=5
+MOMENTUM_TOP_N=3
 USE_QQQ_REGIME_FILTER=true
 KIS_DRY_RUN=false
 USE_DAILY_TELEGRAM_REPORT=true
@@ -363,6 +364,38 @@ USE_DAILY_TELEGRAM_REPORT=true
 **Safe signal testing on EC2:** set `KIS_DRY_RUN=true`, restart `toss-bot`, confirm startup banner shows `*** KIS DRY-RUN MODE ***`, then set back to `false` before real orders.
 
 Full architecture: [README Live System Flow](../README.md#live-system-flow) · [Phase 9](../README.md#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06).
+
+---
+
+## Phase 10 — Trend Hold & Exit Discipline
+
+| Feature | Env / file | What it does |
+|---|---|---|
+| Breakout-only entry | `config.py` | All regimes: 20-day high breakout (`entry_mode=breakout`) |
+| Min-hold soft exits | `config.py` + `analytics.py` | `min_hold_days=5` — blocks trail/trend/RSI/crossover for first 5 bars held |
+| Wider hard stop | `config.py` | `stop_loss_pct=0.08` (−8%) + 2× ATR (always fires, ignores min-hold) |
+| Regime trend exits | `config.py` | MEGA/DEFAULT: 5-day below 50MA; HIGH_BETA/MOMENTUM: off + skip when momentum-ranked |
+| Profit trails | `config.py` | MEGA 18%/15%; HIGH_BETA 20%/15%; MOMENTUM 25%/18% |
+| Top-3 momentum | `MOMENTUM_TOP_N=3` | Concentrated capital on highest-scoring names |
+| Exit telemetry | `portfolio_backtest.py` | Backtest summary prints SELL counts by `exit_reason` |
+
+**Production EC2 defaults (Phase 10):**
+
+```ini
+MOMENTUM_RANK_ENABLED=true
+MOMENTUM_TOP_N=3
+USE_QQQ_REGIME_FILTER=true
+KIS_DRY_RUN=false
+USE_DAILY_TELEGRAM_REPORT=true
+```
+
+**Walk-forward validation (Phase 10 params):**
+
+```powershell
+python run_backtest.py --walk-forward --yfinance --momentum-top-n 3
+```
+
+Full strategy matrix: [README Section 8](../README.md#8-strategy-configurations--parameters) · [Phase 10](../README.md#phase-10-trend-hold--exit-discipline-2026-06).
 
 ---
 
