@@ -23,6 +23,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 12. [Phase 8 — Hardening](#phase-8--hardening)
 13. [Phase 9 — Momentum, Dry-Run & EOD Report](#phase-9--momentum-dry-run--eod-report)
 14. [Phase 10 — Trend Hold & Exit Discipline](#phase-10--trend-hold--exit-discipline)
+15. [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases)
 
 ---
 
@@ -351,10 +352,12 @@ Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-ha
 | Dry-run | `KIS_DRY_RUN=true` | Simulate instant fills; logs `DRY_RUN` in `trade_log.csv` |
 | EOD report | `USE_DAILY_TELEGRAM_REPORT=true` | Telegram summary after 16:00 ET once per session |
 
-**Production EC2 defaults (live trading):**
+**Production EC2 defaults (Phase 1 — legacy only):**
 
 ```ini
-MOMENTUM_RANK_ENABLED=true
+DEPLOYMENT_PHASE=1
+STRATEGY_MODE=legacy
+MOMENTUM_RANK_ENABLED=false
 MOMENTUM_TOP_N=3
 USE_QQQ_REGIME_FILTER=true
 KIS_DRY_RUN=false
@@ -364,6 +367,37 @@ USE_DAILY_TELEGRAM_REPORT=true
 **Safe signal testing on EC2:** set `KIS_DRY_RUN=true`, restart `toss-bot`, confirm startup banner shows `*** KIS DRY-RUN MODE ***`, then set back to `false` before real orders.
 
 Full architecture: [README Live System Flow](../README.md#live-system-flow) · [Phase 9](../README.md#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06).
+
+---
+
+## Dual-Strategy Deployment Phases
+
+Four-phase rollout separating the **legacy signal engine** (breakout + ATR trail + regime exits) from the **Top3 momentum rebalance** strategy (equal-weight Top-N, Friday rebalance, exit when dropped).
+
+| Phase | Goal | `.env` keys | Live | Backtest |
+|---|---|---|---|---|
+| **1** | Operate improved legacy only | `DEPLOYMENT_PHASE=1`, `STRATEGY_MODE=legacy`, `MOMENTUM_RANK_ENABLED=false` | Legacy engine | `python run_backtest.py --yfinance` |
+| **2** | Compare Top3 offline | `TOP3_BACKTEST_ONLY=true` (optional flag) | Unchanged | `python run_backtest.py --strategy compare --yfinance` |
+| **3** | Parallel shadow | `DEPLOYMENT_PHASE=3`, `STRATEGY_MODE=dual`, `TOP3_DRY_RUN_ENABLED=true` | Legacy + Top3 shadow logs/Telegram | Re-run compare before enabling |
+| **4** | Live capital split | `DEPLOYMENT_PHASE=4`, `STRATEGY_MODE=dual`, `LEGACY_CAPITAL_PCT=60`, `TOP3_CAPITAL_PCT=40` | 60/40 sizing; Top3 orders via KIS (respects `KIS_DRY_RUN`) | Monitor live vs shadow |
+
+**Phase 2 backtest examples:**
+
+```powershell
+# 1-year window (approx)
+python run_backtest.py --strategy compare --yfinance --start 2025-06-01
+
+# 2024–2026 window
+python run_backtest.py --strategy compare --yfinance --start 2024-01-01 --end 2026-06-01
+```
+
+**Advance checklist (2 → 3 → 4):**
+
+1. Phase 2: Top3 total return beats legacy on same window (1Y and 2024–2026).
+2. Phase 3: Set env vars above, restart bot, confirm `[TOP3/SHADOW]` logs on Fridays; no KIS Top3 orders.
+3. Phase 4: After 2+ weeks shadow review, set `DEPLOYMENT_PHASE=4`; verify startup shows `capital=60/40` and `top3=live-split`.
+
+**Limitations:** KIS VTS does not tag orders by strategy. Top3 shadow state lives in `trading_state.json` → `_portfolio._top3_shadow`. Phase 4 uses capital-slice sizing; broker positions are shared — reconcile carefully before advancing.
 
 ---
 
@@ -379,17 +413,19 @@ Full architecture: [README Live System Flow](../README.md#live-system-flow) · [
 | Top-3 momentum | `MOMENTUM_TOP_N=3` | Concentrated capital on highest-scoring names |
 | Exit telemetry | `portfolio_backtest.py` | Backtest summary prints SELL counts by `exit_reason` |
 
-**Production EC2 defaults (Phase 10):**
+**Production EC2 defaults (Phase 1):**
 
 ```ini
-MOMENTUM_RANK_ENABLED=true
+DEPLOYMENT_PHASE=1
+STRATEGY_MODE=legacy
+MOMENTUM_RANK_ENABLED=false
 MOMENTUM_TOP_N=3
 USE_QQQ_REGIME_FILTER=true
 KIS_DRY_RUN=false
 USE_DAILY_TELEGRAM_REPORT=true
 ```
 
-**Walk-forward validation (Phase 10 params):**
+**Walk-forward validation (legacy engine, no Top-N overlay):**
 
 ```powershell
 python run_backtest.py --walk-forward --yfinance --momentum-top-n 3
@@ -408,4 +444,6 @@ python test_momentum_ranker.py
 python test_backtest_benchmarks.py
 python test_daily_report.py
 python test_telegram_notifier.py
+python test_deployment_config.py
+python test_top3_backtest.py
 ```

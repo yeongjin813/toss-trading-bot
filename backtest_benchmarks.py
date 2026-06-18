@@ -97,6 +97,30 @@ def spy_buy_hold_return_pct(
     return (last / first - 1.0) * 100.0
 
 
+def compare_legacy_vs_top3(
+    legacy_return_pct: float,
+    top3_return_pct: float,
+    *,
+    window_label: str = "",
+) -> dict[str, float | str]:
+    """Lightweight comparison payload for walk-forward / benchmark tables."""
+    delta = top3_return_pct - legacy_return_pct
+    if abs(delta) < 0.01:
+        winner = "tie"
+    elif delta > 0:
+        winner = "top3"
+    else:
+        winner = "legacy"
+    label = window_label or "window"
+    return {
+        "window": label,
+        "legacy_return_pct": legacy_return_pct,
+        "top3_return_pct": top3_return_pct,
+        "delta_pct": delta,
+        "winner": winner,
+    }
+
+
 def summarize_strategy_vs_benchmarks(
     strategy_return_pct: float,
     ohlcv_by_ticker: Mapping[str, pd.DataFrame],

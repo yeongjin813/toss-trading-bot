@@ -95,6 +95,12 @@ from daily_report import (
     should_send_eod_report,
     use_daily_telegram_report,
 )
+from deployment_config import DeploymentConfig, scaled_capital
+from top3_strategy import (
+    compute_top3_rebalance_orders,
+    load_top3_state,
+    save_top3_state,
+)
 
 load_dotenv(override=True)
 
@@ -125,7 +131,20 @@ ORDER_RVSECNCL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
 USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
 USE_QQQ_REGIME_FILTER = StrategyConfigMapper.use_qqq_regime_filter()
-MOMENTUM_SETTINGS = MomentumRankSettings.from_env()
+DEPLOYMENT = DeploymentConfig.from_env()
+_MOMENTUM_RAW = MomentumRankSettings.from_env()
+MOMENTUM_SETTINGS = MomentumRankSettings(
+    enabled=DEPLOYMENT.legacy_momentum_rank_enabled(_MOMENTUM_RAW.enabled),
+    top_n=_MOMENTUM_RAW.top_n,
+    rebalance_weekday=_MOMENTUM_RAW.rebalance_weekday,
+    weight_3m=_MOMENTUM_RAW.weight_3m,
+    weight_6m=_MOMENTUM_RAW.weight_6m,
+    weight_12m=_MOMENTUM_RAW.weight_12m,
+    weight_volume=_MOMENTUM_RAW.weight_volume,
+    require_above_sma50=_MOMENTUM_RAW.require_above_sma50,
+    require_above_sma200=_MOMENTUM_RAW.require_above_sma200,
+    min_bars=_MOMENTUM_RAW.min_bars,
+)
 
 ANALYTICS_SMA_PERIOD = 20
 MIN_DATA_BARS = 22
@@ -137,6 +156,9 @@ TOKEN_CACHE_FILE = "./kis_token_cache.json"
 LOOKBACK_YEARS = 3
 TARGET_BARS = LOOKBACK_YEARS * 252
 CAPITAL_AT_RISK = float(os.getenv("CAPITAL_AT_RISK", "10000"))
+LEGACY_CAPITAL_AT_RISK = scaled_capital(
+    CAPITAL_AT_RISK, DEPLOYMENT.legacy_capital_fraction()
+)
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
@@ -994,6 +1016,16 @@ def log_configured_capital_model() -> None:
     print("CAPITAL MODEL - TICKER-ISOLATED REGIMES".center(88))
     print("-" * 88)
     print(f"Capital At Risk      : ${CAPITAL_AT_RISK:,.2f}")
+    if DEPLOYMENT.is_dual:
+        print(
+            f"Legacy Capital Slice : ${LEGACY_CAPITAL_AT_RISK:,.2f} "
+            f"({DEPLOYMENT.legacy_capital_pct:.0f}%)"
+        )
+        print(
+            f"Top3 Capital Slice   : "
+            f"${scaled_capital(CAPITAL_AT_RISK, DEPLOYMENT.top3_capital_fraction()):,.2f} "
+            f"({DEPLOYMENT.top3_capital_pct:.0f}%)"
+        )
     print(f"Risk Per Trade       : {RISK_PER_TRADE * 100:.1f}%")
     for ticker in WATCHLIST:
         cfg = StrategyConfigMapper.for_ticker(ticker)
@@ -1727,6 +1759,16 @@ def process_ticker(
     portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
     RISK_GUARD.update_daily_equity_anchor(states, portfolio_equity)
 
+    legacy_fraction = DEPLOYMENT.legacy_capital_fraction()
+    effective_capital = (
+        LEGACY_CAPITAL_AT_RISK if DEPLOYMENT.is_dual else CAPITAL_AT_RISK
+    )
+    effective_cash = (
+        ledger.available_cash_usd * legacy_fraction
+        if DEPLOYMENT.is_dual
+        else ledger.available_cash_usd
+    )
+
     market_bullish = True
     position_size_multiplier = 1.0
     market_regime_label = "normal"
@@ -1756,11 +1798,13 @@ def process_ticker(
     cycle = engine.evaluate_trading_cycle(
         df,
         runtime_state=states.get(ticker, ticker_state if isinstance(ticker_state, dict) else {}),
-        capital_at_risk=CAPITAL_AT_RISK,
+        capital_at_risk=effective_capital,
         risk_per_trade=RISK_PER_TRADE,
         now=datetime.now(),
-        available_capital=ledger.available_cash_usd,
-        portfolio_equity=portfolio_equity,
+        available_capital=effective_cash,
+        portfolio_equity=portfolio_equity * legacy_fraction
+        if DEPLOYMENT.is_dual
+        else portfolio_equity,
         current_price=current_price,
         market_bullish=market_bullish,
         position_size_multiplier=position_size_multiplier,
@@ -1770,8 +1814,10 @@ def process_ticker(
     cycle["position_size_multiplier"] = position_size_multiplier
     cycle["spy_close"] = spy_close
     cycle["spy_sma"] = spy_sma
-    cycle["available_capital"] = ledger.available_cash_usd
-    cycle["portfolio_equity"] = portfolio_equity
+    cycle["available_capital"] = effective_cash
+    cycle["portfolio_equity"] = (
+        portfolio_equity * legacy_fraction if DEPLOYMENT.is_dual else portfolio_equity
+    )
 
     runtime = engine.load_state(cycle["runtime_state"])
     _execution_gatekeeper.evaluate_live_signals(
@@ -1943,6 +1989,67 @@ def process_order_retry_queue(
         print(f"[ORDER/QUEUE] Completed {retried} queued retry submission(s)")
 
 
+def run_top3_shadow_cycle(
+    client: KISApiClient,
+    cache: MarketDataCache,
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+) -> None:
+    """Phase 3 shadow or Phase 4 live-split Top3 momentum rebalance."""
+    if not DEPLOYMENT.top3_shadow_active:
+        return
+
+    portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
+    shadow = load_top3_state(states)
+    shadow, orders, logs = compute_top3_rebalance_orders(
+        cache,
+        WATCHLIST,
+        shadow,
+        total_equity_usd=portfolio_equity,
+        deploy=DEPLOYMENT,
+        now=datetime.now(),
+        settings=_MOMENTUM_RAW,
+    )
+
+    if not logs and not orders:
+        return
+
+    print()
+    print("-" * 88)
+    print("TOP3 STRATEGY CYCLE".center(88))
+    print("-" * 88)
+    for line in logs:
+        print(line)
+
+    if DEPLOYMENT.top3_live_orders:
+        for order in orders:
+            execute_broker_order(
+                client,
+                order.ticker,
+                order.side,
+                order.shares,
+                order.reference_price,
+            )
+    elif orders:
+        print(
+            f"[TOP3/SHADOW] {len(orders)} simulated order(s) — "
+            "no KIS dispatch (Phase 3 dry-run)"
+        )
+        if _telegram_enabled():
+            summary = ", ".join(
+                f"{o.side} {o.shares} {o.ticker}" for o in orders[:5]
+            )
+            _run_telegram(
+                send_system_alert(
+                    "INFO",
+                    f"Top3 shadow rebalance: {summary}",
+                )
+            )
+
+    save_top3_state(states, shadow)
+    print("-" * 88)
+
+
 def run_watchlist_cycle(
     client: KISApiClient,
     cache: MarketDataCache,
@@ -2032,6 +2139,9 @@ def run_watchlist_cycle(
         if index < len(cycle_tickers) - 1:
             time.sleep(TICKER_SLEEP_SECONDS)
 
+    run_top3_shadow_cycle(client, cache, states, ledger)
+    save_persisted_states(states)
+
     print()
     print("=" * 88)
     print("WATCHLIST CYCLE SUMMARY".center(88))
@@ -2083,6 +2193,7 @@ def main() -> None:
 
     print("KIS Mock Trading - Production Execution Engine")
     print(f"Execution Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Deployment          : {DEPLOYMENT.describe()}")
     print(f"Base URL            : {BASE_URL}")
     print(f"Account             : {CANO}-{ACNT_PRDT_CD}")
     print(f"Watchlist           : {', '.join(WATCHLIST)}")
@@ -2099,6 +2210,12 @@ def main() -> None:
         f"{'ON (half size when SPY<200MA & QQQ>200MA)' if USE_QQQ_REGIME_FILTER else 'OFF'}"
     )
     print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
+    if DEPLOYMENT.is_dual:
+        print(f"Legacy Sizing Pool  : ${LEGACY_CAPITAL_AT_RISK:,.2f}")
+        print(
+            f"Top3 Strategy       : "
+            f"{'shadow dry-run' if DEPLOYMENT.phase == 3 else 'live split'}"
+        )
     print(
         f"KIS Order Type      : {KIS_ORDER_TYPE.upper()} "
         f"(default buffer={EXECUTION_SETTINGS.default_limit_buffer_bps} bps, "

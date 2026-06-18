@@ -1336,7 +1336,27 @@ Soft exits (rows 2–5) are suppressed until `bars_held ≥ min_hold_days`. Back
 
 #### Momentum Universe (`.env`)
 
-Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) receive new BUY signals. Held positions always get exit evaluation regardless of rank. Rebalance every Friday (`MOMENTUM_REBALANCE_WEEKDAY=4`).
+Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) receive new BUY signals when `MOMENTUM_RANK_ENABLED=true`. **Phase 1 default is `false`** — the legacy signal engine runs without Top-N gating; Top3 is evaluated separately in phases 2–4. Held positions always get exit evaluation regardless of rank. Rebalance every Friday (`MOMENTUM_REBALANCE_WEEKDAY=4`).
+
+#### Dual-Strategy Deployment Phases (`.env`)
+
+| Phase | `DEPLOYMENT_PHASE` | Live behavior | Backtest |
+|---|---|---|---|
+| **1** (now) | `1` | Legacy signal engine only; `MOMENTUM_RANK_ENABLED=false` | `python run_backtest.py` |
+| **2** | `2` | Same as phase 1 live | `python run_backtest.py --strategy compare --yfinance` |
+| **3** | `3` + `STRATEGY_MODE=dual` + `TOP3_DRY_RUN_ENABLED=true` | Legacy live + Top3 shadow (log/Telegram, no KIS for Top3) | Compare first |
+| **4** | `4` + `STRATEGY_MODE=dual` | 60% legacy / 40% Top3 capital split (`LEGACY_CAPITAL_PCT` / `TOP3_CAPITAL_PCT`) | N/A |
+
+| Parameter | Default | Description |
+|---|---|---|
+| `DEPLOYMENT_PHASE` | **1** | Active rollout phase (1–4) |
+| `STRATEGY_MODE` | **legacy** | `legacy` or `dual` (dual activates at phase ≥ 3) |
+| `TOP3_BACKTEST_ONLY` | **false** | Phase 2 flag — Top3 evaluated in backtests only |
+| `TOP3_DRY_RUN_ENABLED` | **false** | Phase 3 — shadow Top3 orders without KIS |
+| `LEGACY_CAPITAL_PCT` | **60** | Phase 4 legacy sizing slice (%) |
+| `TOP3_CAPITAL_PCT` | **40** | Phase 4 Top3 sizing slice (%) |
+
+**Advance phases:** After phase 2 backtests favor Top3, set phase 3 env vars and observe shadow logs for 2+ weeks. If shadow P&L is acceptable, advance to phase 4 for live capital split. KIS does not tag orders by strategy — position tracking uses `trading_state.json` → `_portfolio._top3_shadow` for Top3 shadow state.
 
 #### Shared Infrastructure Constants
 

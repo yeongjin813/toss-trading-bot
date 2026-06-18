@@ -29,11 +29,17 @@ from dotenv import load_dotenv
 
 from backtest_benchmarks import summarize_strategy_vs_benchmarks
 from config import StrategyConfigMapper
+from deployment_config import DeploymentConfig
 from market_registry import BENCHMARK_TICKER, DEFAULT_WATCHLIST, SECONDARY_BENCHMARK_TICKER, parse_watchlist
 from momentum_ranker import MomentumRankSettings
 from portfolio_backtest import (
     PortfolioBacktestResult,
     run_portfolio_backtest,
+)
+from top3_backtest import (
+    Top3BacktestResult,
+    print_strategy_comparison_table,
+    run_top3_backtest,
 )
 from strategy import (
     DEFAULT_COMMISSION_RATE,
@@ -539,7 +545,116 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override MOMENTUM_TOP_N for this backtest run",
     )
+    parser.add_argument(
+        "--strategy",
+        choices=("legacy", "top3", "compare"),
+        default="legacy",
+        help="legacy=signal engine, top3=momentum rebalance, compare=both side-by-side",
+    )
     return parser
+
+
+def run_strategy_backtests(
+    args: argparse.Namespace,
+    loaded: list[str],
+    ohlcv: dict[str, pd.DataFrame],
+    use_spy_filter: bool,
+    spy_df: pd.DataFrame | None,
+    qqq_df: pd.DataFrame | None,
+    momentum_settings: MomentumRankSettings,
+    *,
+    window_label: str = "",
+    full_ohlcv: dict[str, pd.DataFrame] | None = None,
+) -> int:
+    legacy_momentum = momentum_settings
+    if args.strategy in {"legacy", "compare"}:
+        legacy_momentum = MomentumRankSettings(
+            enabled=False,
+            top_n=momentum_settings.top_n,
+            rebalance_weekday=momentum_settings.rebalance_weekday,
+            weight_3m=momentum_settings.weight_3m,
+            weight_6m=momentum_settings.weight_6m,
+            weight_12m=momentum_settings.weight_12m,
+            weight_volume=momentum_settings.weight_volume,
+            require_above_sma50=momentum_settings.require_above_sma50,
+            require_above_sma200=momentum_settings.require_above_sma200,
+            min_bars=momentum_settings.min_bars,
+        )
+
+    legacy_result: PortfolioBacktestResult | None = None
+    top3_result: Top3BacktestResult | None = None
+
+    if args.strategy in {"legacy", "compare"}:
+        legacy_result = run_portfolio_backtest(
+            tickers=loaded,
+            ohlcv_by_ticker=ohlcv,
+            initial_cash=args.cash,
+            risk_per_trade=args.risk_per_trade,
+            commission_rate=args.commission,
+            use_spy_market_filter=use_spy_filter,
+            spy_df=spy_df,
+            qqq_df=qqq_df,
+            momentum_settings=legacy_momentum,
+        )
+        print_portfolio_summary(
+            legacy_result,
+            loaded,
+            ohlcv,
+            commission_rate=args.commission,
+            risk_per_trade=args.risk_per_trade,
+            title_suffix=window_label or "LEGACY",
+        )
+
+    if args.strategy in {"top3", "compare"}:
+        if args.strategy == "compare":
+            print()
+        top3_settings = MomentumRankSettings(
+            enabled=True,
+            top_n=3,
+            rebalance_weekday=momentum_settings.rebalance_weekday,
+            weight_3m=momentum_settings.weight_3m,
+            weight_6m=momentum_settings.weight_6m,
+            weight_12m=momentum_settings.weight_12m,
+            weight_volume=momentum_settings.weight_volume,
+            require_above_sma50=momentum_settings.require_above_sma50,
+            require_above_sma200=momentum_settings.require_above_sma200,
+            min_bars=min(momentum_settings.min_bars, 60),
+        )
+        top3_ohlcv = full_ohlcv if full_ohlcv is not None else ohlcv
+        top3_result = run_top3_backtest(
+            tickers=loaded,
+            ohlcv_by_ticker=top3_ohlcv,
+            initial_cash=args.cash,
+            commission_rate=args.commission,
+            momentum_settings=top3_settings,
+            window_start=args.start,
+            window_end=args.end,
+        )
+        width = 88
+        title = "TOP3 MOMENTUM BACKTEST"
+        if window_label:
+            title = f"{title} - {window_label}"
+        print("=" * width)
+        print(title.center(width))
+        print("=" * width)
+        print(f"Initial Capital       : ${top3_result.initial_cash:,.2f}")
+        print(f"Final Portfolio Equity: ${top3_result.final_equity:,.2f}")
+        print(f"Total Return          : {top3_result.total_return_pct:+.2f}%")
+        print(f"Portfolio MaxDD       : {top3_result.max_drawdown_pct:.2f}%")
+        print(f"Portfolio Sharpe      : {top3_result.sharpe_ratio:.2f}")
+        print(f"Total Trades          : {top3_result.total_trades}")
+        print(f"Rebalance Events      : {top3_result.rebalance_count}")
+        print("=" * width)
+
+    if args.strategy == "compare" and legacy_result and top3_result:
+        print()
+        print_strategy_comparison_table(
+            legacy_result,
+            top3_result,
+            window_label=window_label,
+        )
+
+    return 0
 
 
 def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) -> int:
@@ -652,11 +767,16 @@ def main(argv: list[str] | None = None) -> int:
     momentum_settings = resolve_momentum_settings(args)
 
     if args.walk_forward:
+        if args.strategy != "legacy":
+            print("[WARN] --walk-forward uses legacy engine only; run --strategy compare per window separately.")
         return run_walk_forward_validation(args, tickers)
 
     print("=" * 88)
     print("Toss Trading Bot - Portfolio Backtest Engine (P2)".center(88))
     print("=" * 88)
+    deploy = DeploymentConfig.from_env()
+    print(f"Deployment phase   : {deploy.describe()}")
+    print(f"Strategy mode      : {args.strategy}")
     print(f"Tickers          : {', '.join(tickers)}")
     if args.random:
         print(f"Data source      : synthetic random ({args.random_bars} bars, seed={args.random_seed})")
@@ -704,6 +824,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.start or args.end:
         start = args.start or "1900-01-01"
         end = args.end or pd.Timestamp.today().strftime("%Y-%m-%d")
+        full_ohlcv = {ticker: df.copy() for ticker, df in ohlcv.items()}
         ohlcv = {
             ticker: slice_ohlcv_window(df, start, end)
             for ticker, df in ohlcv.items()
@@ -755,26 +876,16 @@ def main(argv: list[str] | None = None) -> int:
         print_isolated_table(rows, args.cash)
         return 0
 
-    result = run_portfolio_backtest(
-        tickers=loaded,
-        ohlcv_by_ticker=ohlcv,
-        initial_cash=args.cash,
-        risk_per_trade=args.risk_per_trade,
-        commission_rate=args.commission,
-        use_spy_market_filter=use_spy_filter,
-        spy_df=spy_df,
-        qqq_df=qqq_df,
-        momentum_settings=momentum_settings,
-    )
-
-    print_portfolio_summary(
-        result,
+    return run_strategy_backtests(
+        args,
         loaded,
         ohlcv,
-        commission_rate=args.commission,
-        risk_per_trade=args.risk_per_trade,
+        use_spy_filter,
+        spy_df,
+        qqq_df,
+        momentum_settings,
+        full_ohlcv=full_ohlcv if args.start or args.end else None,
     )
-    return 0
 
 
 if __name__ == "__main__":

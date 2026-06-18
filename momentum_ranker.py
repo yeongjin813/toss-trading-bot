@@ -47,7 +47,7 @@ class MomentumRankSettings:
             return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
         return cls(
-            enabled=_flag("MOMENTUM_RANK_ENABLED", "true"),
+            enabled=_flag("MOMENTUM_RANK_ENABLED", "false"),
             top_n=max(1, int(os.getenv("MOMENTUM_TOP_N", "3"))),
             rebalance_weekday=int(os.getenv("MOMENTUM_REBALANCE_WEEKDAY", "4")),
             weight_3m=float(os.getenv("MOMENTUM_WEIGHT_3M", "0.4")),
@@ -269,6 +269,21 @@ def should_rebalance_today(
     if ny.weekday() != rebalance_weekday:
         return False
     if last_rebalance_date == today:
+        return False
+    return True
+
+
+def should_rebalance_on_bar_date(
+    bar_date: str,
+    last_rebalance_date: str | None,
+    *,
+    rebalance_weekday: int,
+) -> bool:
+    """Backtest-safe rebalance gate using calendar date only (no TZ shift)."""
+    ts = pd.Timestamp(bar_date)
+    if ts.weekday() != rebalance_weekday:
+        return False
+    if last_rebalance_date == bar_date:
         return False
     return True
 
