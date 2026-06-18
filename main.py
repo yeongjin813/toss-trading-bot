@@ -1332,6 +1332,9 @@ def _apply_dry_run_fill(
     )
     if signal == "BUY":
         runtime.entry_price = fill_price
+        runtime.entry_bar_date = current_bar_date
+        runtime.bars_held = 0
+        runtime.hold_count_bar_date = current_bar_date
 
     runtime.last_failed_order_key = None
     states[ticker] = engine.dump_state(runtime)
@@ -1657,6 +1660,16 @@ def run_session_reconciliation(
     return states, ledger
 
 
+def _ticker_in_active_momentum(states: dict[str, Any], ticker: str) -> bool:
+    portfolio = states.get("_portfolio", {})
+    if not isinstance(portfolio, dict):
+        return False
+    active = portfolio.get("active_trade_tickers") or []
+    if not isinstance(active, list):
+        return False
+    return ticker.upper() in {str(t).upper() for t in active}
+
+
 def process_ticker(
     client: KISApiClient,
     cache: MarketDataCache,
@@ -1751,6 +1764,7 @@ def process_ticker(
         current_price=current_price,
         market_bullish=market_bullish,
         position_size_multiplier=position_size_multiplier,
+        momentum_ranked_hold=_ticker_in_active_momentum(states, ticker),
     )
     cycle["market_regime"] = market_regime_label
     cycle["position_size_multiplier"] = position_size_multiplier

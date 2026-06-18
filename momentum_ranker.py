@@ -31,7 +31,7 @@ class FrameProvider(Protocol):
 @dataclass(frozen=True)
 class MomentumRankSettings:
     enabled: bool = True
-    top_n: int = 5
+    top_n: int = 3
     rebalance_weekday: int = 4  # Friday (Mon=0)
     weight_3m: float = 0.4
     weight_6m: float = 0.3
@@ -48,7 +48,7 @@ class MomentumRankSettings:
 
         return cls(
             enabled=_flag("MOMENTUM_RANK_ENABLED", "true"),
-            top_n=max(1, int(os.getenv("MOMENTUM_TOP_N", "5"))),
+            top_n=max(1, int(os.getenv("MOMENTUM_TOP_N", "3"))),
             rebalance_weekday=int(os.getenv("MOMENTUM_REBALANCE_WEEKDAY", "4")),
             weight_3m=float(os.getenv("MOMENTUM_WEIGHT_3M", "0.4")),
             weight_6m=float(os.getenv("MOMENTUM_WEIGHT_6M", "0.3")),

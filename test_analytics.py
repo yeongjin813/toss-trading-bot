@@ -166,6 +166,7 @@ def verify_bar_transitions() -> None:
         rsi=58.0,
         atr=1.6,
         volume_sma=1_100_000.0,
+        high_breakout=100.0,
     )
 
     state = PositionState()
@@ -184,7 +185,7 @@ def verify_bar_transitions() -> None:
         open=101.0,
         high=122.0,
         low=118.5,
-        close=120.0,
+        close=122.0,
         volume=2_200_000.0,
         sma_short=100.0,
         sma_long=97.0,
@@ -199,14 +200,31 @@ def verify_bar_transitions() -> None:
     print(f"         Profit trail armed: {state.profit_trail_armed}")
 
     assert hold_result["signal"] == "HOLD"
-    assert state.highest_price_achieved == 120.0
+    assert state.highest_price_achieved == 122.0
     assert state.profit_trail_armed is True
-    assert state.trigger_floor == 120.0 - (2.0 * engine.config.atr_multiplier)
+    assert state.trigger_floor == 122.0 - (2.0 * engine.config.atr_multiplier)
 
     prev_bar = rise_bar
+    for offset, day in enumerate(range(4, 8), start=1):
+        hold_day = BarSnapshot(
+            date=datetime(2024, 6, day).date(),
+            open=122.0,
+            high=123.0,
+            low=121.0,
+            close=122.5,
+            volume=2_000_000.0,
+            sma_short=102.0,
+            sma_long=99.0,
+            rsi=61.0,
+            atr=2.0,
+            volume_sma=1_200_000.0,
+        )
+        engine.evaluate_bar(state, hold_day, prev_bar, mutate_state=True)
+        prev_bar = hold_day
+
     trigger_floor = float(state.trigger_floor)
     stop_bar = BarSnapshot(
-        date=datetime(2024, 6, 4).date(),
+        date=datetime(2024, 6, 8).date(),
         open=109.0,
         high=109.5,
         low=trigger_floor - 0.5,
@@ -243,6 +261,10 @@ def verify_trend_filter_and_conditional_rsi(engine: LiveSignalEngine) -> None:
     state.trigger_floor = 180.0
     state.current_atr = 5.0
     state.dynamic_stop_distance = 20.0
+    state.entry_price = 190.0
+    state.entry_bar_date = "2024-06-01"
+    state.bars_held = 5
+    state.hold_count_bar_date = "2024-07-01"
 
     prev_bar = BarSnapshot(
         date=datetime(2024, 7, 1).date(),
@@ -307,7 +329,8 @@ def verify_config_registry() -> None:
 
     assert nvda.sma_period == 10 and nvda.atr_multiplier == 3.0
     assert pltr.use_trend_filter is False
-    assert aapl.sma_period == 20 and aapl.use_trend_filter is True
+    assert pltr.entry_mode == "breakout"
+    assert aapl.sma_period == 20 and aapl.entry_mode == "breakout"
 
     nvda_df = IndicatorAnalytics.populate_indicators(
         build_synthetic_market_data(120), nvda
@@ -353,6 +376,7 @@ def verify_spy_market_filter_blocks_buy() -> None:
         rsi=engine.config.rsi_buy_threshold + 1.0,
         atr=2.0,
         volume_sma=1_000_000.0,
+        high_breakout=100.0,
     )
 
     allowed = engine.evaluate_bar(

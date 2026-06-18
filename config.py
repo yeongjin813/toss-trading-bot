@@ -15,6 +15,9 @@ from market_registry import BENCHMARK_SMA_PERIOD, BENCHMARK_TICKER
 
 EntryMode = Literal["dual", "breakout", "crossover"]
 
+# trend_exit_days <= 0 disables 50MA consecutive-day exit
+TREND_EXIT_DISABLED = 0
+
 
 @dataclass(frozen=True)
 class TickerConfig:
@@ -23,7 +26,7 @@ class TickerConfig:
 
     entry_mode:
       dual      — breakout OR pullback OR golden cross
-      breakout  — 20-day high breakout (momentum names)
+      breakout  — 20-day high breakout (trend leaders)
       crossover — legacy golden cross only
     """
 
@@ -32,13 +35,15 @@ class TickerConfig:
     volume_threshold: float
     atr_multiplier: float
     use_trend_filter: bool
-    entry_mode: EntryMode = "dual"
+    entry_mode: EntryMode = "breakout"
     breakout_lookback: int = 20
-    stop_loss_pct: float = 0.05
+    stop_loss_pct: float = 0.08
     hard_stop_atr_mult: float = 2.0
-    trend_exit_days: int = 2
+    trend_exit_days: int = 5
     profit_trail_activation_pct: float = 0.15
-    profit_trail_drawdown_pct: float = 0.10
+    profit_trail_drawdown_pct: float = 0.15
+    min_hold_days: int = 5
+    skip_trend_exit_when_ranked: bool = False
     pullback_rsi_low: float = 40.0
     pullback_rsi_high: float = 60.0
     pullback_ma_tolerance_pct: float = 3.0
@@ -61,6 +66,8 @@ class StrategyConfig:
     trend_exit_days: int
     profit_trail_activation_pct: float
     profit_trail_drawdown_pct: float
+    min_hold_days: int
+    skip_trend_exit_when_ranked: bool
     pullback_rsi_low: float
     pullback_rsi_high: float
     pullback_ma_tolerance_pct: float
@@ -87,6 +94,8 @@ class StrategyConfig:
             trend_exit_days=regime.trend_exit_days,
             profit_trail_activation_pct=regime.profit_trail_activation_pct,
             profit_trail_drawdown_pct=regime.profit_trail_drawdown_pct,
+            min_hold_days=regime.min_hold_days,
+            skip_trend_exit_when_ranked=regime.skip_trend_exit_when_ranked,
             pullback_rsi_low=regime.pullback_rsi_low,
             pullback_rsi_high=regime.pullback_rsi_high,
             pullback_ma_tolerance_pct=regime.pullback_ma_tolerance_pct,
@@ -97,11 +106,11 @@ class StrategyConfigMapper:
     """
     Parameter isolation matrix: ticker symbol -> StrategyConfig.
 
-    Regimes:
-      MEGA_CAP   — AAPL, MSFT, GOOGL, AMZN (dual entry, SMA 20)
-      HIGH_BETA  — NVDA, META, AVGO, NFLX (dual, SMA 10, wider ATR)
-      MOMENTUM   — PLTR, TSLA, CRWD, AMD (breakout-first, no 50MA gate)
-      DEFAULT    — TSM, SHOP, UBER and unlisted symbols
+    Regimes (Phase 10 — trend hold, fewer whipsaws):
+      MEGA_CAP   — breakout entry, 50MA exit after 5 days, moderate trail
+      HIGH_BETA  — breakout, no 50MA exit while ranked, wider trail
+      MOMENTUM   — breakout, hold winners longer (25% arm / 18% trail)
+      DEFAULT    — breakout baseline for TSM/SHOP/UBER
     """
 
     SMA_LONG_PERIOD: ClassVar[int] = 50
@@ -112,8 +121,12 @@ class StrategyConfigMapper:
         volume_threshold=0.65,
         atr_multiplier=2.5,
         use_trend_filter=True,
-        entry_mode="dual",
-        stop_loss_pct=0.05,
+        entry_mode="breakout",
+        stop_loss_pct=0.08,
+        trend_exit_days=5,
+        profit_trail_activation_pct=0.18,
+        profit_trail_drawdown_pct=0.15,
+        min_hold_days=5,
     )
 
     _HIGH_BETA: ClassVar[TickerConfig] = TickerConfig(
@@ -122,8 +135,13 @@ class StrategyConfigMapper:
         volume_threshold=0.55,
         atr_multiplier=3.0,
         use_trend_filter=True,
-        entry_mode="dual",
-        profit_trail_drawdown_pct=0.12,
+        entry_mode="breakout",
+        stop_loss_pct=0.08,
+        trend_exit_days=TREND_EXIT_DISABLED,
+        profit_trail_activation_pct=0.20,
+        profit_trail_drawdown_pct=0.15,
+        min_hold_days=5,
+        skip_trend_exit_when_ranked=True,
     )
 
     _MOMENTUM: ClassVar[TickerConfig] = TickerConfig(
@@ -133,8 +151,12 @@ class StrategyConfigMapper:
         atr_multiplier=3.5,
         use_trend_filter=False,
         entry_mode="breakout",
-        profit_trail_activation_pct=0.12,
-        profit_trail_drawdown_pct=0.12,
+        stop_loss_pct=0.08,
+        trend_exit_days=TREND_EXIT_DISABLED,
+        profit_trail_activation_pct=0.25,
+        profit_trail_drawdown_pct=0.18,
+        min_hold_days=5,
+        skip_trend_exit_when_ranked=True,
     )
 
     _DEFAULT: ClassVar[TickerConfig] = TickerConfig(
@@ -143,21 +165,21 @@ class StrategyConfigMapper:
         volume_threshold=0.65,
         atr_multiplier=2.0,
         use_trend_filter=True,
-        entry_mode="dual",
+        entry_mode="breakout",
+        stop_loss_pct=0.08,
+        trend_exit_days=5,
+        min_hold_days=5,
     )
 
     _EXPLICIT: ClassVar[Mapping[str, TickerConfig]] = {
-        # Mega-cap trend
         "AAPL": _MEGA,
         "MSFT": _MEGA,
         "GOOGL": _MEGA,
         "AMZN": _MEGA,
-        # High-beta trend
         "NVDA": _HIGH_BETA,
         "META": _HIGH_BETA,
         "AVGO": _HIGH_BETA,
         "NFLX": _HIGH_BETA,
-        # Speculative momentum
         "PLTR": _MOMENTUM,
         "TSLA": _MOMENTUM,
         "CRWD": _MOMENTUM,

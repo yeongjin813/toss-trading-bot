@@ -114,6 +114,9 @@ class PositionState:
     dynamic_stop_distance: float | None = None
     trigger_floor: float | None = None
     entry_price: float | None = None
+    entry_bar_date: str | None = None
+    bars_held: int = 0
+    hold_count_bar_date: str | None = None
     days_below_sma_long: int = 0
     profit_trail_armed: bool = False
 
@@ -151,6 +154,15 @@ class PositionState:
             filtered["days_below_sma_long"] = int(filtered["days_below_sma_long"] or 0)
         if "profit_trail_armed" in filtered:
             filtered["profit_trail_armed"] = bool(filtered["profit_trail_armed"])
+        if "entry_bar_date" in filtered and filtered["entry_bar_date"] in (None, ""):
+            filtered["entry_bar_date"] = None
+        if "bars_held" in filtered:
+            filtered["bars_held"] = int(filtered["bars_held"] or 0)
+        if "hold_count_bar_date" in filtered and filtered["hold_count_bar_date"] in (
+            None,
+            "",
+        ):
+            filtered["hold_count_bar_date"] = None
         if "open_order_price" in filtered and filtered["open_order_price"] not in (
             None,
             "",
@@ -852,8 +864,25 @@ class LiveSignalEngine:
         state.trigger_floor = None
         state.session_low = None
         state.entry_price = None
+        state.entry_bar_date = None
+        state.bars_held = 0
+        state.hold_count_bar_date = None
         state.days_below_sma_long = 0
         state.profit_trail_armed = False
+
+    def _advance_bars_held(self, state: PositionState, bar: BarSnapshot) -> None:
+        bar_date = _format_bar_date(bar.date)
+        if state.hold_count_bar_date == bar_date:
+            return
+        if state.entry_bar_date is None:
+            state.entry_bar_date = bar_date
+            state.bars_held = 0
+        elif bar_date != state.entry_bar_date:
+            state.bars_held = int(state.bars_held or 0) + 1
+        state.hold_count_bar_date = bar_date
+
+    def _soft_exit_blocked(self, state: PositionState) -> bool:
+        return int(state.bars_held or 0) < int(self.config.min_hold_days or 0)
 
     def _hard_stop_floor(self, state: PositionState, bar: BarSnapshot) -> float | None:
         entry = state.entry_price
@@ -861,7 +890,7 @@ class LiveSignalEngine:
             return None
         pct_floor = entry * (1.0 - self.config.stop_loss_pct)
         atr_floor = entry - (bar.atr * self.config.hard_stop_atr_mult)
-        return max(pct_floor, atr_floor)
+        return min(pct_floor, atr_floor)
 
     def _hard_stop_triggered(self, state: PositionState, bar: BarSnapshot) -> bool:
         floor = self._hard_stop_floor(state, bar)
@@ -881,8 +910,17 @@ class LiveSignalEngine:
             state.days_below_sma_long = 0
 
     def _trend_exit_triggered(
-        self, state: PositionState, bar: BarSnapshot, *, mutate: bool
+        self,
+        state: PositionState,
+        bar: BarSnapshot,
+        *,
+        mutate: bool,
+        momentum_ranked_hold: bool = False,
     ) -> bool:
+        if self.config.trend_exit_days <= 0:
+            return False
+        if self.config.skip_trend_exit_when_ranked and momentum_ranked_hold:
+            return False
         self._update_trend_exit_counter(state, bar, mutate=mutate)
         return int(state.days_below_sma_long or 0) >= self.config.trend_exit_days
 
@@ -915,7 +953,7 @@ class LiveSignalEngine:
             return False
         if bar.close <= bar.high_breakout:
             return False
-        if bar.close <= bar.sma_long:
+        if self.config.use_trend_filter and bar.close <= bar.sma_long:
             return False
         return True
 
@@ -1052,6 +1090,7 @@ class LiveSignalEngine:
         session_low: float | None = None,
         session_volume_fraction: float = 1.0,
         market_bullish: bool = True,
+        momentum_ranked_hold: bool = False,
     ) -> dict[str, Any]:
         """
         Evaluate one bar using unified priority:
@@ -1075,8 +1114,15 @@ class LiveSignalEngine:
         dynamic_atr_stop: dict[str, float] | None = None
 
         if self._has_active_position(working_state):
+            if mutate_state:
+                self._advance_bars_held(state, bar)
+                working_state.bars_held = state.bars_held
+                working_state.entry_bar_date = state.entry_bar_date
+                working_state.hold_count_bar_date = state.hold_count_bar_date
             self._update_trend_exit_counter(state, bar, mutate=True)
             working_state.days_below_sma_long = state.days_below_sma_long
+
+            soft_blocked = self._soft_exit_blocked(working_state)
 
             if self._hard_stop_triggered(working_state, bar):
                 if mutate_state:
@@ -1093,7 +1139,7 @@ class LiveSignalEngine:
             if mutate_state:
                 state.profit_trail_armed = working_state.profit_trail_armed
 
-            if self._profit_trail_triggered(working_state, bar):
+            if not soft_blocked and self._profit_trail_triggered(working_state, bar):
                 if mutate_state:
                     self._clear_position_fields(state)
                 return {
@@ -1106,7 +1152,12 @@ class LiveSignalEngine:
                     "state": working_state.to_dict(),
                 }
 
-            if self._trend_exit_triggered(working_state, bar, mutate=False):
+            if not soft_blocked and self._trend_exit_triggered(
+                working_state,
+                bar,
+                mutate=False,
+                momentum_ranked_hold=momentum_ranked_hold,
+            ):
                 if mutate_state:
                     self._clear_position_fields(state)
                 return {
@@ -1117,7 +1168,9 @@ class LiveSignalEngine:
                     "state": working_state.to_dict(),
                 }
 
-            if self._dynamic_atr_stop_triggered(working_state, effective_low):
+            if not soft_blocked and self._dynamic_atr_stop_triggered(
+                working_state, effective_low
+            ):
                 dynamic_atr_stop = self._build_dynamic_atr_payload(
                     working_state, bar, effective_low
                 )
@@ -1158,7 +1211,7 @@ class LiveSignalEngine:
                 self._rsi_exit_allowed(bar)
                 and self._rsi_crossdown_exit(bar.rsi, prev_bar.rsi)
             )
-            if cross_below or rsi_exit:
+            if not soft_blocked and (cross_below or rsi_exit):
                 if mutate_state:
                     self._clear_position_fields(state)
                 return {
@@ -1206,6 +1259,9 @@ class LiveSignalEngine:
             if mutate_state:
                 state.in_position = True
                 state.entry_price = bar.close
+                state.entry_bar_date = _format_bar_date(bar.date)
+                state.bars_held = 0
+                state.hold_count_bar_date = _format_bar_date(bar.date)
                 state.highest_price_achieved = bar.close
                 state.days_below_sma_long = 0
                 state.profit_trail_armed = False
@@ -1296,6 +1352,7 @@ class LiveSignalEngine:
         current_price: float | None = None,
         market_bullish: bool = True,
         position_size_multiplier: float = 1.0,
+        momentum_ranked_hold: bool = False,
     ) -> dict[str, Any]:
         """
         Evaluate one live monitoring cycle with bar-trailing and session gates.
@@ -1384,6 +1441,9 @@ class LiveSignalEngine:
         eval_state.held_quantity = runtime.held_quantity
         eval_state.session_low = runtime.session_low
         eval_state.entry_price = runtime.entry_price
+        eval_state.entry_bar_date = runtime.entry_bar_date
+        eval_state.bars_held = runtime.bars_held
+        eval_state.hold_count_bar_date = runtime.hold_count_bar_date
         eval_state.days_below_sma_long = runtime.days_below_sma_long
         eval_state.profit_trail_armed = runtime.profit_trail_armed
         if eval_state.held_quantity <= 0:
@@ -1421,11 +1481,14 @@ class LiveSignalEngine:
                 session_low=session_low,
                 session_volume_fraction=session_volume_fraction,
                 market_bullish=market_bullish,
+                momentum_ranked_hold=momentum_ranked_hold,
             )
             runtime.days_below_sma_long = eval_state.days_below_sma_long
             runtime.profit_trail_armed = eval_state.profit_trail_armed
-            if eval_state.entry_price is not None:
-                runtime.entry_price = eval_state.entry_price
+            runtime.entry_price = eval_state.entry_price
+            runtime.entry_bar_date = eval_state.entry_bar_date
+            runtime.bars_held = eval_state.bars_held
+            runtime.hold_count_bar_date = eval_state.hold_count_bar_date
 
         if (
             not regular_market_hours
@@ -1510,6 +1573,9 @@ class LiveSignalEngine:
             runtime.last_processed_date = current_bar_date
             if runtime.entry_price is None:
                 runtime.entry_price = runtime.open_order_price
+            runtime.entry_bar_date = current_bar_date
+            runtime.bars_held = 0
+            runtime.hold_count_bar_date = current_bar_date
             runtime.days_below_sma_long = 0
             runtime.profit_trail_armed = False
             return
@@ -1525,6 +1591,9 @@ class LiveSignalEngine:
                 runtime.trigger_floor = None
                 runtime.session_low = None
                 runtime.entry_price = None
+                runtime.entry_bar_date = None
+                runtime.bars_held = 0
+                runtime.hold_count_bar_date = None
                 runtime.days_below_sma_long = 0
                 runtime.profit_trail_armed = False
             runtime.pending_order = False

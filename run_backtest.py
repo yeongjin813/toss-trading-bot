@@ -281,6 +281,15 @@ def print_portfolio_summary(
     print(f"Risk Per Trade        : {risk_per_trade * 100:.1f}% of total equity")
     print(f"Commission            : {commission_rate * 100:.1f}%")
     print(f"Sizing Model          : Dual-clamp (risk + 95% deploy cap on free cash)")
+    if result.exit_reason_counts:
+        print("-" * width)
+        print("Exit reasons (SELL count by trigger):")
+        for reason, count in sorted(
+            result.exit_reason_counts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            print(f"  {reason:<16} {count:>4}")
     print("-" * width)
     print(f"{'Ticker':<6} {'Buys':>5} {'Sells':>5} {'Open Sh':>8} {'Position':>10} {'B&H':>8}")
     print("-" * width)

@@ -45,6 +45,7 @@ class TradeRecord:
     cash_after: float
     equity_after: float
     signal: str
+    exit_reason: str = ""
 
 
 @dataclass
@@ -70,6 +71,7 @@ class PortfolioBacktestResult:
     equity_curve: pd.DataFrame
     trades: list[TradeRecord]
     per_ticker_summary: dict[str, dict[str, Any]]
+    exit_reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 def dual_clamp_portfolio_size(
@@ -178,6 +180,9 @@ def _apply_buy_state(
     series.state.held_quantity = shares
     series.state.highest_price_achieved = bar.close
     series.state.entry_price = bar.close
+    series.state.entry_bar_date = bar_date
+    series.state.bars_held = 0
+    series.state.hold_count_bar_date = bar_date
     series.state.days_below_sma_long = 0
     series.state.profit_trail_armed = False
     series.engine._update_trailing_state(series.state, bar.close, bar.atr)
@@ -194,6 +199,9 @@ def _apply_sell_state(series: TickerBacktestSeries, bar_date: str) -> None:
     series.state.trigger_floor = None
     series.state.session_low = None
     series.state.entry_price = None
+    series.state.entry_bar_date = None
+    series.state.bars_held = 0
+    series.state.hold_count_bar_date = None
     series.state.days_below_sma_long = 0
     series.state.profit_trail_armed = False
     series.state.last_processed_date = bar_date
@@ -344,7 +352,7 @@ class PortfolioBacktestEngine:
             mark_prices = self._mark_prices(bar_date)
             holdings = self._holdings_snapshot(mark_prices)
 
-            exit_events: list[tuple[TickerBacktestSeries, BarSnapshot, str]] = []
+            exit_events: list[tuple[TickerBacktestSeries, BarSnapshot, str, str]] = []
             entry_events: list[tuple[TickerBacktestSeries, BarSnapshot, float]] = []
 
             for ticker in self.watchlist:
@@ -357,16 +365,23 @@ class PortfolioBacktestEngine:
                 prev_bar = BarSnapshot.from_row(series.enriched.iloc[idx - 1])
 
                 if series.shares > 0:
+                    ranked_hold = ticker in self._active_trade_tickers
                     exit_check = series.engine.evaluate_bar(
                         series.state,
                         bar,
                         prev_bar,
                         mutate_state=True,
                         allow_crossover=True,
+                        momentum_ranked_hold=ranked_hold,
                     )
                     if exit_check["signal"] in {"SELL", "DYNAMIC_ATR_SELL"}:
                         exit_events.append(
-                            (series, bar, exit_check["signal"])
+                            (
+                                series,
+                                bar,
+                                exit_check["signal"],
+                                str(exit_check.get("exit_reason") or exit_check["signal"]),
+                            )
                         )
                 else:
                     if self.regime_lookup is not None:
@@ -394,7 +409,7 @@ class PortfolioBacktestEngine:
                     ):
                         entry_events.append((series, bar, size_multiplier))
 
-            for series, bar, signal in exit_events:
+            for series, bar, signal, exit_reason in exit_events:
                 if series.shares <= 0:
                     continue
                 shares = series.shares
@@ -419,6 +434,7 @@ class PortfolioBacktestEngine:
                         cash_after=cash,
                         equity_after=equity,
                         signal=signal,
+                        exit_reason=exit_reason,
                     )
                 )
 
@@ -502,6 +518,12 @@ class PortfolioBacktestEngine:
 
         winning_trades = sum(1 for pnl in closed_trade_pnls if pnl > 0)
         per_ticker = self._build_per_ticker_summary(trades)
+        exit_reason_counts: dict[str, int] = {}
+        for trade in trades:
+            if trade.side == "SELL" and trade.exit_reason:
+                exit_reason_counts[trade.exit_reason] = (
+                    exit_reason_counts.get(trade.exit_reason, 0) + 1
+                )
 
         return PortfolioBacktestResult(
             initial_cash=self.initial_cash,
@@ -518,6 +540,7 @@ class PortfolioBacktestEngine:
             equity_curve=equity_curve,
             trades=trades,
             per_ticker_summary=per_ticker,
+            exit_reason_counts=exit_reason_counts,
         )
 
     def _build_per_ticker_summary(
