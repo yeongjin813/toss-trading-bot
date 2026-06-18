@@ -264,8 +264,9 @@ On EC2: `.venv/bin/python telegram_notifier.py --diagnose`
 - `OrderFillMonitor` polls KIS ccnl/nccs (`VTTS3035R` / `VTTS3018R`).
 - Events append to `trade_log.csv`.
 - `RiskGuard`: `MAX_DAILY_LOSS_USD`, `MAX_OPEN_POSITIONS`, `MAX_TICKER_EXPOSURE_USD`.
+- **VTS fallback (Phase 9):** when ccnl/nccs return HTTP 500, bot infers fill from `present-balance` — look for `[FILL/BROKER-FB]` in logs.
 
-**Trade log statuses:** `ACCEPTED`, `PARTIAL`, `FILLED`, `REJECTED`, `RELEASED`
+**Trade log statuses:** `ACCEPTED`, `PARTIAL`, `FILLED`, `REJECTED`, `RELEASED`, `DRY_RUN`
 
 ---
 

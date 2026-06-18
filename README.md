@@ -24,7 +24,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Phase 8 hardening · `a45f7b6` (ops doc split) · `46767be` (RTH-only) · `872f7d2` (Telegram)
+**Latest production commits:** Phase 9 strategy overhaul · `9dcea21` (dry-run, EOD, benchmarks) · `09bedda` (momentum, staged exits) · `5ed98ac` (fill sync fix)
 
 ---
 
@@ -121,6 +121,7 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 
 **Operations (start here for live trading)**
 
+- **[Live System Flow](#live-system-flow)** — end-to-end gate + fill pipeline
 - **[Improvement Journey — what changed & why](#improvement-journey--what-changed-and-why)**
 - **[Production Operations Guide](docs/OPERATIONS.md)** — deploy, monitor, Telegram, EC2, troubleshooting
 
@@ -129,6 +130,7 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 1. [Project Evolution](#1-project-evolution--development-chronology)
 - [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering)
 - [Phase 8 Hardening](#phase-8-production-hardening--readme-improvement-log)
+- [Phase 9 Strategy Overhaul](#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06)
 2. [Same-Bar Look-Ahead Fix](#2-dedicated-section-same-bar-look-ahead-bias-eradication)
 3. [RSI Crossdown Exit](#3-dedicated-section-rsi-crossdown-exit-engine)
 4. [Dual-Clamp Sizing](#4-dedicated-section-dual-clamp-position-sizing)
@@ -200,7 +202,8 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 - **Problem**: KIS returned `rt_cd=0` (accepted) before shares filled — local state showed positions that did not exist → invalid SELL orders.
 - **Why it mattered**: Any sizing or stop logic built on phantom `held_quantity` is unsafe for live capital.
 - **Fix**: Poll `inquire-ccnl` / `inquire-nccs` until fill confirms; append `trade_log.csv`; `RiskGuard` caps loss/exposure; block new BUY near open/close.
-- **Commit**: `66951a6` — see [OPERATIONS.md — Phase 6](docs/OPERATIONS.md#phase-6--fills--risk).
+- **Phase 9 patch**: VTS HTTP 500 on ccnl/nccs → retry + infer fill from `present-balance` (`[FILL/BROKER-FB]`); reconcile clears stale pending locks.
+- **Commit**: `66951a6` (P6) · `5ed98ac` (fill fallback) — see [OPERATIONS.md — Phase 6](docs/OPERATIONS.md#phase-6--fills--risk).
 
 ### Phase 7: Telegram Mobile Alerts *(2026-06)*
 
@@ -1203,8 +1206,14 @@ To prevent the system from getting flagged or blacklisted by the broker's rate l
 
 The system enforces a strict state boundary to prevent duplicate order generation or "double-buying" bugs caused by identical EOD signals evaluating inside a 60-second polling window:
 
+**Live path:** KIS dispatch → verify `rt_cd == "0"` → lock `pending_order` → ccnl/nccs fill poll → `apply_post_order_transition()`.
+
+**Dry-run path (`KIS_DRY_RUN=true`):** skip KIS order API → instant simulated fill → state + `trade_log.csv` updated immediately (status `DRY_RUN`).
+
+**VTS fallback:** when ccnl/nccs return HTTP 500, infer fill from broker `present-balance` holdings before releasing the pending lock.
+
 $$
-\text{KIS Order Dispatch} \longrightarrow \text{Verify Response (rt\_cd == "0")} \longrightarrow \text{Lock local pending\_order = True} \longrightarrow \text{Commit state to disk} \longrightarrow \text{apply\_post\_order\_transition()} \longrightarrow \text{Final persist}
+\text{KIS Order Dispatch} \longrightarrow \text{Verify Response (rt\_cd == "0")} \longrightarrow \text{Lock local pending\_order = True} \longrightarrow \text{Commit state to disk} \longrightarrow \text{Fill confirm (ccnl / broker-fb / dry-run)} \longrightarrow \text{apply\_post\_order\_transition()} \longrightarrow \text{Final persist}
 $$
 
 While `pending_order` resolves to `True`, all incoming execution signals for that specific ticker are suppressed and ignored until the local state machine confirms transaction fulfillment via `apply_post_order_transition()`.
@@ -1270,21 +1279,43 @@ Implemented in `analytics.py` (`LiveSignalEngine`); Backtrader twin in `strategy
 
 ## 8. Strategy Configurations & Parameters
 
-Signal execution parameters are **ticker-isolated** via `config.py` → `StrategyConfigMapper.for_ticker()`. See [Phase 3 Architecture](#phase-3-architecture-ticker-specific-configuration--macro-regime-filtering) for the full regime matrix.
+Signal execution parameters are **ticker-isolated** via `config.py` → `StrategyConfigMapper.for_ticker()`.  
+Phase 9 expanded the Phase 5 NVDA/PLTR/DEFAULT matrix into four **entry regimes** with **staged exits**. See [Phase 9](#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06) and [Appendix E](#appendix-e-academic-regime-mapping-watchlist-design).
 
-`.env` controls **credentials, watchlist, capital, and loop timing only** — not SMA/RSI/ATR signal thresholds.
+`.env` controls **credentials, watchlist, capital, momentum rank, and loop timing** — not SMA/RSI/ATR signal thresholds.
 
-#### Ticker-Isolated Execution Parameters (Hardcoded in `config.py`)
+#### Entry Regimes (Hardcoded in `config.py`)
 
-| Parameter | NVDA | PLTR | DEFAULT (AAPL) | Description |
-|---|---|---|---|---|
-| `sma_period` | 10 | 10 | 20 | Short SMA — Golden/Death cross window |
-| `volume_threshold` | 0.55 | 0.60 | 0.65 | Projected volume surge multiplier vs. 20-day avg |
-| `rsi_buy_threshold` | 40 | 42 | 48 | Minimum RSI for BUY authorization |
-| `atr_multiplier` | 3.0 | 2.5 | 2.0 | Trailing stop width ($\text{ATR} \times \text{mult}$) |
-| `use_trend_filter` | True | False | True | Enable 50-day SMA regime gate + conditional RSI exit |
-| `sma_long_period` | 50 | 50 | 50 | Fixed macro regime baseline (not ticker-tuned) |
-| `rsi_exit_threshold` | 50 | 50 | 50 | RSI crossdown level (conditionally applied) |
+| Regime | Tickers | `entry_mode` | `sma` | `use_trend_filter` | Notes |
+|---|---|---|---|---|---|
+| **MEGA_CAP** | AAPL, MSFT, GOOGL, AMZN | `dual` | 20 | True | Breakout + pullback + golden cross |
+| **HIGH_BETA** | NVDA, META, AVGO, NFLX | `dual` | 10 | True | Wider ATR (3.0×), profit trail −12% |
+| **MOMENTUM** | PLTR, TSLA, CRWD, AMD | `breakout` | 10 | False | 20-day high breakout only |
+| **DEFAULT** | TSM, SHOP, UBER, others | `dual` | 20 | True | Conservative large-cap baseline |
+
+**Dual entry** (`entry_mode=dual`): any of (a) 20-day high breakout, (b) pullback to short SMA with RSI 40–60, (c) golden cross with volume gate.
+
+#### Staged Exit Stack (Phase 9 — all regimes)
+
+| Priority | Exit | Trigger |
+|---|---|---|
+| 1 | Hard stop | −5% from entry **or** 2× ATR below entry |
+| 2 | Profit trail | After +15% gain (MOMENTUM: +12%), sell on −10–12% drawdown from peak |
+| 3 | Trend break | 2 consecutive closes below 50MA |
+| 4 | ATR trail | Only after profit trail armed; same-bar prior-floor check |
+| 5 | Legacy | Death cross, RSI crossdown (regime-conditional), liquidity gate |
+
+#### Macro Regime Sizing (`.env`)
+
+| SPY vs 200MA | QQQ vs 200MA | New BUY behavior |
+|---|---|---|
+| Above | any | Full size |
+| Below | Above | **Half size** (`USE_QQQ_REGIME_FILTER=true`) |
+| Below | Below | Blocked (`USE_SPY_MARKET_FILTER=true`) |
+
+#### Momentum Universe (`.env`)
+
+Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default 5) receive new BUY signals. Held positions always get exit evaluation regardless of rank. Rebalance every Friday (`MOMENTUM_REBALANCE_WEEKDAY=4`).
 
 #### Shared Infrastructure Constants
 
@@ -1384,8 +1415,11 @@ python run_backtest.py --random --random-bars 252 --random-seed 42
 # Legacy — isolated per-ticker Backtrader (comparison only)
 python run_backtest.py --isolated
 
-# Walk-forward validation (2018-2020 / 2020-2022 / 2022-2024 / 2024-2026, yfinance)
-python run_backtest.py --walk-forward
+# Walk-forward validation — Strat vs B&H vs SPY alpha table (yfinance)
+python run_backtest.py --walk-forward --yfinance
+
+# Disable momentum rank for A/B comparison
+python run_backtest.py --no-momentum-rank
 
 # Disable SPY > 200MA buy gate for A/B comparison
 python run_backtest.py --no-spy-filter
@@ -1800,6 +1834,7 @@ Toss Trading Bot/
 ├── project_metrics.log     # Example redirected telemetry output
 └── data/
     ├── spy_daily.csv       # SPY benchmark cache (market filter)
+    ├── qqq_daily.csv       # QQQ benchmark cache (regime half-size filter)
     ├── nvda_daily.csv      # OHLCV cache (bootstrap + incremental refresh)
     ├── pltr_daily.csv
     ├── aapl_daily.csv
@@ -1810,15 +1845,18 @@ Toss Trading Bot/
 
 ## Appendix E: Academic Regime Mapping (Watchlist Design)
 
-The default watchlist targets three distinct volatility regimes for cross-regime empirical comparison:
+The default 15-ticker watchlist maps to four execution regimes in `config.py`:
 
-| Ticker | Volatility Regime | Primary Experimental Target |
-|---|---|---|
-| `NVDA` | High-volatility market leader | 3-step ATR stop under elevated realized volatility |
-| `PLTR` | High-momentum growth / breakout | Dual-clamp sizing + volume gate + NASD VTS proxy |
-| `AAPL` | Low-volatility large-cap control | RSI crossdown stability + crossover deduplication |
+| Regime | Tickers | Volatility Profile | Entry Style |
+|---|---|---|---|
+| **MEGA_CAP** | AAPL, MSFT, GOOGL, AMZN | Low-vol mega-cap trend | Dual (breakout + pullback + cross) |
+| **HIGH_BETA** | NVDA, META, AVGO, NFLX | High-beta market leaders | Dual, wider ATR trail |
+| **MOMENTUM** | PLTR, TSLA, CRWD, AMD | Breakout / parabolic growth | 20-day high breakout only |
+| **DEFAULT** | TSM, SHOP, UBER | Mid-cap control group | Dual, conservative gates |
 
-Customize via `WATCHLIST` in `.env` while registering exchange routing in `MARKET_META`.
+**Universe filter:** `momentum_ranker.py` scores all 15 names weekly and activates the Top-N (`MOMENTUM_TOP_N=5`) for new BUY only. Exits run on every held position.
+
+Customize via `WATCHLIST` in `.env` while registering exchange routing in `MARKET_META` (`market_registry.py`).
 
 ---
 
