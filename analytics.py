@@ -419,15 +419,22 @@ def seconds_until_us_rth_open(
     current_dt: datetime | None = None,
     *,
     min_sleep: int = 60,
-    max_sleep: int = 3600,
+    max_sleep: int | None = None,
+    near_open_threshold_seconds: int = 900,
+    near_open_min_sleep: int = 30,
 ) -> int:
     """
     Seconds until the next NYSE regular session open (09:30 ET).
 
-    Capped at ``max_sleep`` so the outer loop can re-check clocks periodically.
+    Off-hours sleep is adaptive:
+      - Far from open: up to ``OFF_HOURS_MAX_SLEEP_SECONDS`` (default 7200) to reduce idle wakeups
+      - Within 15 minutes of open: at least ``near_open_min_sleep`` for timely RTH start
     """
     if is_us_regular_market_hours(current_dt):
         return 0
+
+    if max_sleep is None:
+        max_sleep = int(os.getenv("OFF_HOURS_MAX_SLEEP_SECONDS", "7200"))
 
     ny_dt = _to_ny_datetime(current_dt)
     candidate_day = ny_dt.date()
@@ -461,6 +468,8 @@ def seconds_until_us_rth_open(
         return max_sleep
 
     seconds = int((open_dt - ny_dt).total_seconds())
+    if seconds <= near_open_threshold_seconds:
+        return max(min(seconds, max_sleep), near_open_min_sleep)
     return min(max(seconds, min_sleep), max_sleep)
 
 

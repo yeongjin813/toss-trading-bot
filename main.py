@@ -2118,6 +2118,11 @@ def main() -> None:
         f"EOD Telegram Report : "
         f"{'ON (after 16:00 ET)' if use_daily_telegram_report() else 'OFF'}"
     )
+    print(
+        "Extended Hours      : OFF (daily-bar strategy; pre/post market orders disabled)"
+    )
+    off_hours_sleep = int(os.getenv("OFF_HOURS_MAX_SLEEP_SECONDS", "7200"))
+    print(f"Off-Hours Sleep Cap : {off_hours_sleep}s (adaptive until 09:30 ET)")
     if is_dry_run_mode():
         print("*** KIS DRY-RUN MODE — orders simulated locally, no broker API ***")
     print("=" * 88)

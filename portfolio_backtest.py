@@ -346,7 +346,6 @@ class PortfolioBacktestEngine:
 
             exit_events: list[tuple[TickerBacktestSeries, BarSnapshot, str]] = []
             entry_events: list[tuple[TickerBacktestSeries, BarSnapshot, float]] = []
-            trailing_updates: list[tuple[TickerBacktestSeries, BarSnapshot, BarSnapshot]] = []
 
             for ticker in self.watchlist:
                 series = self.series_map[ticker]
@@ -369,8 +368,6 @@ class PortfolioBacktestEngine:
                         exit_events.append(
                             (series, bar, exit_check["signal"])
                         )
-                    else:
-                        trailing_updates.append((series, bar, prev_bar))
                 else:
                     if self.regime_lookup is not None:
                         regime = resolve_market_regime(self.regime_lookup, bar_date)
@@ -424,9 +421,6 @@ class PortfolioBacktestEngine:
                         signal=signal,
                     )
                 )
-
-            for series, bar, prev_bar in trailing_updates:
-                _update_in_position_trailing(series, bar, prev_bar)
 
             for series, bar, size_multiplier in entry_events:
                 if series.shares > 0:

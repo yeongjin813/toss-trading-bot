@@ -20,6 +20,7 @@ from analytics import (
     calculate_atr,
     calculate_rsi,
     calculate_sma,
+    seconds_until_us_rth_open,
     us_market_holidays_for_year,
     use_eod_atr_stops,
 )
@@ -472,6 +473,26 @@ def verify_use_eod_atr_stops_env() -> None:
     print()
 
 
+def verify_off_hours_sleep_adaptive() -> None:
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+    far = datetime(2024, 6, 18, 20, 0, tzinfo=ny)
+    far_sleep = seconds_until_us_rth_open(far, max_sleep=7200)
+    assert far_sleep == 7200, f"expected 7200 cap, got {far_sleep}"
+
+    near = datetime(2024, 6, 18, 9, 20, tzinfo=ny)
+    near_sleep = seconds_until_us_rth_open(near, max_sleep=7200)
+    assert near_sleep == 600, f"expected 600 (10m), got {near_sleep}"
+
+    imminent = datetime(2024, 6, 18, 9, 29, 30, tzinfo=ny)
+    imminent_sleep = seconds_until_us_rth_open(imminent, max_sleep=7200)
+    assert imminent_sleep == 30, f"expected 30, got {imminent_sleep}"
+
+    print("Off-hours adaptive sleep until RTH open   : PASS")
+    print()
+
+
 def main() -> int:
     engine = LiveSignalEngine("PLTR")
 
@@ -488,6 +509,7 @@ def main() -> int:
     verify_nyse_holiday_library_merge()
     verify_intraday_volume_projection()
     verify_use_eod_atr_stops_env()
+    verify_off_hours_sleep_adaptive()
 
     print("=" * 88)
     print("ALL ANALYTICS TESTS PASSED")
