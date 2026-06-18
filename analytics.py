@@ -1211,7 +1211,7 @@ class LiveSignalEngine:
                 self._rsi_exit_allowed(bar)
                 and self._rsi_crossdown_exit(bar.rsi, prev_bar.rsi)
             )
-            if not soft_blocked and (cross_below or rsi_exit):
+            if not soft_blocked and not momentum_ranked_hold and (cross_below or rsi_exit):
                 if mutate_state:
                     self._clear_position_fields(state)
                 return {

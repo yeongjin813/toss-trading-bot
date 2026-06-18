@@ -153,7 +153,7 @@ class StrategyConfigMapper:
         entry_mode="breakout",
         stop_loss_pct=0.08,
         trend_exit_days=TREND_EXIT_DISABLED,
-        profit_trail_activation_pct=0.25,
+        profit_trail_activation_pct=0.15,
         profit_trail_drawdown_pct=0.18,
         min_hold_days=5,
         skip_trend_exit_when_ranked=True,
