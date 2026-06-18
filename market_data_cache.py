@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -113,14 +114,16 @@ class MarketDataCache:
         self._forming: dict[str, pd.Series] = {}
         self._data_sources: dict[str, str] = {}
         self._cycle_count = 0
-        default_workers = max(1, min(8, int(os.getenv("TICKER_REFRESH_WORKERS", "8"))))
+        default_workers = max(1, min(4, int(os.getenv("TICKER_REFRESH_WORKERS", "3"))))
         self._max_refresh_workers = max_refresh_workers or default_workers
-        self._parallel_refresh = os.getenv("PARALLEL_TICKER_REFRESH", "true").strip().lower() in {
+        # VTS mock often 500s under burst parallel dailyprice — default sequential.
+        self._parallel_refresh = os.getenv("PARALLEL_TICKER_REFRESH", "false").strip().lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
+        self._refresh_stagger_seconds = float(os.getenv("KIS_REFRESH_STAGGER_SECONDS", "0.35"))
 
     def data_path_for_ticker(self, ticker: str) -> str:
         return os.path.join(self._data_dir, f"{ticker.lower()}_daily.csv")
@@ -166,7 +169,14 @@ class MarketDataCache:
         now: datetime | None = None,
     ) -> tuple[pd.DataFrame, bool]:
         excd = self._market_meta[ticker]["excd"]
-        latest_batch = self._client.fetch_us_daily_latest(ticker, excd)
+        try:
+            latest_batch = self._client.fetch_us_daily_latest(ticker, excd)
+        except Exception as exc:
+            print(
+                f"[CACHE/WARN] {ticker} KIS refresh failed ({exc}) — "
+                "using last good bars"
+            )
+            return self.evaluation_frame(ticker), False
 
         if ticker not in self._completed:
             completed, forming = self._load_or_fetch_full_history(ticker)
@@ -219,7 +229,7 @@ class MarketDataCache:
         if not unique:
             return {}
         if not self._parallel_refresh or len(unique) == 1:
-            return {t: self.refresh_latest(t, now=now) for t in unique}
+            return self._refresh_sequential(unique, now=now)
 
         results: dict[str, tuple[pd.DataFrame, bool]] = {}
         workers = min(self._max_refresh_workers, len(unique))
@@ -230,7 +240,27 @@ class MarketDataCache:
             }
             for future in as_completed(futures):
                 ticker = futures[future]
-                results[ticker] = future.result()
+                try:
+                    results[ticker] = future.result()
+                except Exception as exc:
+                    print(
+                        f"[CACHE/WARN] {ticker} parallel refresh failed ({exc}) — "
+                        "using last good bars"
+                    )
+                    results[ticker] = (self.evaluation_frame(ticker), False)
+        return results
+
+    def _refresh_sequential(
+        self,
+        tickers: list[str],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, tuple[pd.DataFrame, bool]]:
+        results: dict[str, tuple[pd.DataFrame, bool]] = {}
+        for index, ticker in enumerate(tickers):
+            results[ticker] = self.refresh_latest(ticker, now=now)
+            if index + 1 < len(tickers) and self._refresh_stagger_seconds > 0:
+                time.sleep(self._refresh_stagger_seconds)
         return results
 
     def finalize_intraday_bars(self, *, now: datetime | None = None) -> int:

@@ -168,6 +168,8 @@ KIS_REQUEST_TIMEOUT_SECONDS = int(os.getenv("KIS_REQUEST_TIMEOUT_SECONDS", "30")
 KIS_ORDER_MAX_RETRIES = max(1, int(os.getenv("KIS_ORDER_MAX_RETRIES", "3")))
 KIS_ORDER_RETRY_BACKOFF_SECONDS = float(os.getenv("KIS_ORDER_RETRY_BACKOFF_SECONDS", "2.0"))
 KIS_SLOW_API_MS = int(os.getenv("KIS_SLOW_API_MS", "3000"))
+TELEGRAM_ALERT_THROTTLE_SECONDS = int(os.getenv("TELEGRAM_ALERT_THROTTLE_SECONDS", "900"))
+_alert_last_sent: dict[str, float] = {}
 
 
 def _resolve_kis_order_type() -> str:
@@ -237,6 +239,13 @@ def _dispatch_trade_report(
     logger.info("Telegram trade report sent for %s %s", action, ticker)
 
 
+def _is_transient_kis_failure(exc: BaseException) -> bool:
+    if is_retryable_request_error(exc):
+        return True
+    text = str(exc)
+    return "500 Server Error" in text or "502 " in text or "503 " in text
+
+
 def _dispatch_system_alert(
     level: str,
     message: str,
@@ -261,6 +270,19 @@ def _dispatch_system_alert(
     if not send_telegram:
         logger.debug("Outside RTH — %s alert logged locally only (no Telegram)", level_upper)
         return
+
+    if level_upper == "CRITICAL" and TELEGRAM_ALERT_THROTTLE_SECONDS > 0:
+        throttle_key = message[:120]
+        now = time.time()
+        last = _alert_last_sent.get(throttle_key, 0.0)
+        if now - last < TELEGRAM_ALERT_THROTTLE_SECONDS:
+            logger.warning(
+                "Throttled duplicate CRITICAL Telegram alert (%ds): %s",
+                TELEGRAM_ALERT_THROTTLE_SECONDS,
+                throttle_key[:80],
+            )
+            return
+        _alert_last_sent[throttle_key] = now
 
     _run_telegram(send_system_alert(level_upper, message))
 
@@ -671,7 +693,6 @@ class KISApiClient:
         inqr_dvsn_cd: str = "00",
     ) -> dict[str, Any]:
         """Fetch overseas mock account balance/deposit via inquire-present-balance."""
-        url = f"{BASE_URL}{PRESENT_BALANCE_PATH}"
         params = {
             "CANO": CANO,
             "ACNT_PRDT_CD": ACNT_PRDT_CD,
@@ -680,24 +701,13 @@ class KISApiClient:
             "TR_MKET_CD": tr_mket_cd,
             "INQR_DVSN_CD": inqr_dvsn_cd,
         }
-        response = kis_request(
-            "GET",
-            url,
-            label="present-balance",
-            headers=self._build_headers(TR_ID_US_PRESENT_BALANCE),
+        return self._kis_get_with_retry(
+            path=PRESENT_BALANCE_PATH,
+            tr_id=TR_ID_US_PRESENT_BALANCE,
             params=params,
-            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
+            label="present-balance",
+            error_prefix="Present balance API error",
         )
-        response.raise_for_status()
-        payload = response.json()
-
-        if payload.get("rt_cd") not in (None, "0"):
-            raise RuntimeError(
-                f"Present balance API error: "
-                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
-            )
-
-        return payload
 
     def fetch_overseas_order_ccnl(
         self,
@@ -1473,8 +1483,14 @@ def run_session_reconciliation(
         fallback_cash=CAPITAL_AT_RISK,
     )
     if not report.reconciled and report.error:
+        level = (
+            "WARNING"
+            if _is_transient_kis_failure(RuntimeError(report.error))
+            or "500 Server Error" in str(report.error)
+            else "CRITICAL"
+        )
         _dispatch_system_alert(
-            "CRITICAL",
+            level,
             f"Broker reconciliation failed: {report.error}",
         )
     if report.reconciled and is_us_regular_market_hours(now):
@@ -2042,17 +2058,18 @@ def main() -> None:
     )
     print(f"State File          : {STATE_FILE}")
     print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s (order pacing; OHLCV refresh is parallel)")
-    parallel_refresh = os.getenv("PARALLEL_TICKER_REFRESH", "true").strip().lower() in {
+    parallel_refresh = os.getenv("PARALLEL_TICKER_REFRESH", "false").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
     }
-    workers = os.getenv("TICKER_REFRESH_WORKERS", "8")
+    workers = os.getenv("TICKER_REFRESH_WORKERS", "3")
+    stagger = os.getenv("KIS_REFRESH_STAGGER_SECONDS", "0.35")
     print(
         f"OHLCV Refresh       : "
-        f"{'parallel' if parallel_refresh else 'sequential'} "
-        f"(workers={workers}, forming-bar overlay, completed-only CSV)"
+        f"{'parallel' if parallel_refresh else 'sequential+stagger'} "
+        f"(workers={workers}, stagger={stagger}s, forming-bar overlay)"
     )
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
     print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
@@ -2190,7 +2207,18 @@ def main() -> None:
                 f"{cycle_started.strftime('%Y-%m-%d %H:%M:%S')} ---"
             )
 
-            states, ledger = run_watchlist_cycle(client, cache, states, ledger)
+            try:
+                states, ledger = run_watchlist_cycle(client, cache, states, ledger)
+            except Exception as exc:
+                if _is_transient_kis_failure(exc):
+                    print(f"[WARN] Cycle skipped after transient KIS error: {exc}")
+                    _dispatch_system_alert(
+                        "WARNING",
+                        f"Cycle skipped (transient KIS): {str(exc)[:200]}",
+                    )
+                    time.sleep(LOOP_COOLDOWN_SECONDS)
+                    continue
+                raise
 
             print(
                 f"Cycle {cycle_count} complete. "
@@ -2205,9 +2233,12 @@ def main() -> None:
         print(f"Final state saved to {STATE_FILE}")
         sys.exit(0)
     except Exception as exc:
+        if _is_transient_kis_failure(exc):
+            print(f"[FATAL] Unrecoverable after transient errors: {exc}")
         print(f"[FATAL] Trading loop crashed: {exc}")
         traceback.print_exc()
-        _dispatch_system_alert("CRITICAL", f"Trading loop crashed: {exc}")
+        if not _is_transient_kis_failure(exc):
+            _dispatch_system_alert("CRITICAL", f"Trading loop crashed: {exc}")
         save_persisted_states(states)
         raise
 
