@@ -388,6 +388,53 @@ class KISApiClient:
             headers["hashkey"] = hashkey
         return headers
 
+    def _kis_get_with_retry(
+        self,
+        *,
+        path: str,
+        tr_id: str,
+        params: dict[str, Any],
+        label: str,
+        error_prefix: str,
+        max_retries: int = KIS_ORDER_MAX_RETRIES,
+    ) -> dict[str, Any]:
+        """GET a KIS endpoint with exponential backoff on transient HTTP failures."""
+        url = f"{BASE_URL}{path}"
+        last_error: requests.RequestException | None = None
+
+        for attempt in range(max_retries):
+            try:
+                response = kis_request(
+                    "GET",
+                    url,
+                    label=label,
+                    headers=self._build_headers(tr_id),
+                    params=params,
+                    timeout=KIS_REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("rt_cd") not in (None, "0"):
+                    raise RuntimeError(
+                        f"{error_prefix}: "
+                        f"{payload.get('msg_cd')} | {payload.get('msg1')}"
+                    )
+                return payload
+            except requests.RequestException as exc:
+                last_error = exc
+                if not is_retryable_request_error(exc) or attempt >= max_retries - 1:
+                    raise
+                wait_seconds = KIS_ORDER_RETRY_BACKOFF_SECONDS * (2**attempt)
+                print(
+                    f"[KIS/RETRY] {label} attempt {attempt + 2}/{max_retries} "
+                    f"in {wait_seconds:.1f}s — {exc}"
+                )
+                time.sleep(wait_seconds)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"{error_prefix}: unknown error")
+
     def get_hashkey(self, body: dict[str, Any]) -> str:
         url = f"{BASE_URL}{HASHKEY_PATH}"
         token = self.get_access_token()
@@ -615,7 +662,6 @@ class KISApiClient:
         ccld_nccs_dvsn: str = "00",
     ) -> list[dict[str, Any]]:
         """Fetch overseas order/fill rows for the given NY order-date window."""
-        url = f"{BASE_URL}{INQUIRE_CCNL_PATH}"
         params = {
             "CANO": CANO,
             "ACNT_PRDT_CD": ACNT_PRDT_CD,
@@ -632,21 +678,13 @@ class KISApiClient:
             "CTX_AREA_NK200": "",
             "CTX_AREA_FK200": "",
         }
-        response = kis_request(
-            "GET",
-            url,
-            label=f"ccnl:{pdno or 'all'}",
-            headers=self._build_headers(TR_ID_US_CCNL),
+        payload = self._kis_get_with_retry(
+            path=INQUIRE_CCNL_PATH,
+            tr_id=TR_ID_US_CCNL,
             params=params,
-            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
+            label=f"ccnl:{pdno or 'all'}",
+            error_prefix="Order ccnl inquiry failed",
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("rt_cd") not in (None, "0"):
-            raise RuntimeError(
-                f"Order ccnl inquiry failed: "
-                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
-            )
         output = payload.get("output") or []
         if isinstance(output, dict):
             return [output]
@@ -660,7 +698,6 @@ class KISApiClient:
         sort_sqn: str = "DS",
     ) -> list[dict[str, Any]]:
         """Fetch open (unfilled) overseas orders for an exchange bucket."""
-        url = f"{BASE_URL}{INQUIRE_NCCS_PATH}"
         params = {
             "CANO": CANO,
             "ACNT_PRDT_CD": ACNT_PRDT_CD,
@@ -669,21 +706,13 @@ class KISApiClient:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        response = kis_request(
-            "GET",
-            url,
-            label=f"nccs:{ovrs_excg_cd}",
-            headers=self._build_headers(TR_ID_US_NCCS),
+        payload = self._kis_get_with_retry(
+            path=INQUIRE_NCCS_PATH,
+            tr_id=TR_ID_US_NCCS,
             params=params,
-            timeout=KIS_REQUEST_TIMEOUT_SECONDS,
+            label=f"nccs:{ovrs_excg_cd}",
+            error_prefix="Open-order inquiry failed",
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("rt_cd") not in (None, "0"):
-            raise RuntimeError(
-                f"Open-order inquiry failed: "
-                f"{payload.get('msg_cd')} | {payload.get('msg1')}"
-            )
         output = payload.get("output") or []
         if isinstance(output, dict):
             return [output]

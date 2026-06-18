@@ -40,6 +40,7 @@ class ExecutionSettings:
     rth_buy_block_open_minutes: int
     rth_buy_block_close_minutes: int
     pending_order_stale_minutes: int
+    fill_inquiry_alert_cooldown_minutes: int
     default_limit_buffer_bps: float
     high_vol_limit_buffer_bps: float
 
@@ -53,6 +54,9 @@ class ExecutionSettings:
             rth_buy_block_close_minutes=int(os.getenv("RTH_BUY_BLOCK_CLOSE_MINUTES", "5")),
             pending_order_stale_minutes=int(
                 os.getenv("PENDING_ORDER_STALE_MINUTES", "120")
+            ),
+            fill_inquiry_alert_cooldown_minutes=int(
+                os.getenv("FILL_INQUIRY_ALERT_COOLDOWN_MINUTES", "15")
             ),
             default_limit_buffer_bps=float(os.getenv("KIS_LIMIT_PRICE_BUFFER_BPS", "10")),
             high_vol_limit_buffer_bps=float(
@@ -345,6 +349,7 @@ class OrderFillMonitor:
         self.trade_log = trade_log
         self.on_fill = on_fill
         self.on_alert = on_alert
+        self._fill_inquiry_alert_at: dict[str, datetime] = {}
 
     def _notify_fill(
         self,
@@ -368,6 +373,172 @@ class OrderFillMonitor:
             self.on_alert(level, message)
         except Exception as exc:
             print(f"[NOTIFY/ALERT] callback failed: {exc}")
+
+    def _notify_fill_inquiry_failure(self, ticker: str, exc: BaseException) -> None:
+        now = datetime.now()
+        last_alert = self._fill_inquiry_alert_at.get(ticker)
+        cooldown = timedelta(minutes=self.settings.fill_inquiry_alert_cooldown_minutes)
+        if last_alert is not None and now - last_alert < cooldown:
+            print(
+                f"[FILL/POLL] {ticker} inquiry failed (alert suppressed): {exc}"
+            )
+            return
+
+        self._fill_inquiry_alert_at[ticker] = now
+        print(f"[FILL/POLL] {ticker} inquiry failed: {exc}")
+        self._notify_alert(
+            "WARNING",
+            f"{ticker} KIS fill inquiry failed: {exc}",
+        )
+
+    def _fetch_live_broker_qty(
+        self,
+        client: Any,
+        ticker: str,
+        states: dict[str, Any],
+    ) -> int:
+        """Refresh one ticker's held qty via present-balance when ccnl/nccs are down."""
+        cached = int(
+            states.get("_portfolio", {})
+            .get("broker_holdings", {})
+            .get(ticker, 0)
+            or 0
+        )
+        try:
+            from session_manager import _parse_broker_holdings
+
+            payload = client.fetch_overseas_present_balance(natn_cd="840")
+            holdings = _parse_broker_holdings(payload, [ticker])
+            qty = int(holdings.get(ticker, 0))
+            portfolio = states.setdefault("_portfolio", {})
+            portfolio.setdefault("broker_holdings", {})[ticker] = qty
+            return qty
+        except Exception as exc:
+            print(f"[FILL/BROKER-FB] {ticker} present-balance lookup failed: {exc}")
+            return max(
+                cached,
+                int(states.get(ticker, {}).get("held_quantity", 0) or 0),
+            )
+
+    def _resolve_via_broker_holdings(
+        self,
+        client: Any,
+        engine: Any,
+        ticker: str,
+        runtime: PositionState,
+        states: dict[str, Any],
+        *,
+        broker_qty: int | None,
+        cash_after: float | None,
+        current_bar_date: str | None,
+        inquiry_error: str,
+    ) -> bool:
+        """
+        Infer fill from live broker holdings when ccnl/nccs are unavailable.
+
+        VTS often returns HTTP 500 on inquire-ccnl/nccs while present-balance
+        still reflects the filled position.
+        """
+        if broker_qty is None:
+            broker_qty = self._fetch_live_broker_qty(client, ticker, states)
+        else:
+            broker_qty = max(broker_qty, self._fetch_live_broker_qty(client, ticker, states))
+
+        side = (runtime.open_order_side or "").upper()
+        order_qty = int(runtime.open_order_qty or 0)
+        odno = runtime.open_order_id or ""
+        today = ny_today_yyyymmdd()
+        fill_price = float(runtime.open_order_price or 0.0)
+
+        if side == "BUY":
+            if broker_qty <= 0:
+                return False
+            if order_qty > 0 and broker_qty < order_qty:
+                runtime.held_quantity = broker_qty
+                runtime.in_position = True
+                runtime.open_order_filled_qty = broker_qty
+                print(
+                    f"[FILL/BROKER-FB] {ticker} partial BUY {broker_qty}/{order_qty} "
+                    f"(ccnl/nccs unavailable)"
+                )
+                return False
+
+            runtime.held_quantity = broker_qty
+            runtime.in_position = broker_qty > 0
+            runtime.open_order_filled_qty = broker_qty
+            engine.apply_post_order_transition(
+                runtime,
+                signal="BUY",
+                filled_quantity=runtime.held_quantity,
+                current_bar_date=current_bar_date or today,
+                allow_crossover=True,
+            )
+            clear_open_order(runtime)
+            self.trade_log.append(
+                ticker=ticker,
+                signal="BUY",
+                qty=runtime.held_quantity,
+                order_price=runtime.open_order_price,
+                fill_price=fill_price or None,
+                status="FILLED",
+                reason=f"broker_fallback ccnl/nccs_error={inquiry_error} odno={odno}",
+                cash_after=cash_after,
+                held_qty=runtime.held_quantity,
+            )
+            print(
+                f"[FILL/BROKER-FB] {ticker} BUY held_qty={runtime.held_quantity} "
+                f"confirmed via present-balance odno={odno}"
+            )
+            self._notify_fill(
+                ticker,
+                "BUY",
+                runtime.held_quantity,
+                fill_price,
+                "FILLED",
+            )
+            return True
+
+        if side in {"SELL", "DYNAMIC_ATR_SELL"}:
+            pre_held = max(int(runtime.held_quantity or 0), order_qty, broker_qty)
+            sold_qty = pre_held - broker_qty if pre_held > broker_qty else order_qty
+            if sold_qty <= 0 and broker_qty > 0:
+                return False
+
+            runtime.held_quantity = broker_qty
+            runtime.open_order_filled_qty = sold_qty
+            engine.apply_post_order_transition(
+                runtime,
+                signal="SELL",
+                filled_quantity=sold_qty,
+                current_bar_date=current_bar_date or today,
+                allow_crossover=True,
+            )
+            clear_open_order(runtime)
+            self.trade_log.append(
+                ticker=ticker,
+                signal=side,
+                qty=sold_qty,
+                order_price=runtime.open_order_price,
+                fill_price=fill_price or None,
+                status="FILLED",
+                reason=f"broker_fallback ccnl/nccs_error={inquiry_error} odno={odno}",
+                cash_after=cash_after,
+                held_qty=runtime.held_quantity,
+            )
+            print(
+                f"[FILL/BROKER-FB] {ticker} SELL sold={sold_qty} "
+                f"held_qty={runtime.held_quantity} odno={odno}"
+            )
+            self._notify_fill(
+                ticker,
+                side,
+                sold_qty,
+                fill_price,
+                "FILLED",
+            )
+            return True
+
+        return False
 
     def resolve_ticker(
         self,
@@ -410,12 +581,23 @@ class OrderFillMonitor:
             )
             nccs_rows = client.fetch_overseas_open_orders(ovrs_excg_cd=ovrs_excg_cd)
         except Exception as exc:
-            print(f"[FILL/POLL] {ticker} inquiry failed: {exc}")
-            self._notify_alert(
-                "WARNING",
-                f"{ticker} KIS fill inquiry failed: {exc}",
-            )
+            self._notify_fill_inquiry_failure(ticker, exc)
+            if self._resolve_via_broker_holdings(
+                client,
+                engine,
+                ticker,
+                runtime,
+                states,
+                broker_qty=broker_qty,
+                cash_after=cash_after,
+                current_bar_date=current_bar_date,
+                inquiry_error=str(exc),
+            ):
+                self._fill_inquiry_alert_at.pop(ticker, None)
+                return True
             return False
+
+        self._fill_inquiry_alert_at.pop(ticker, None)
 
         filled_qty, fill_price = summarize_ccnl_fills(
             ccnl_rows, odno=odno, ticker=ticker
@@ -430,10 +612,28 @@ class OrderFillMonitor:
             self._release_stale(runtime, ticker, side, cash_after, reason="stale_no_fill")
             return True
 
-        if filled_qty <= 0 and still_open:
+        if filled_qty <= 0:
+            if self._resolve_via_broker_holdings(
+                client,
+                engine,
+                ticker,
+                runtime,
+                states,
+                broker_qty=broker_qty,
+                cash_after=cash_after,
+                current_bar_date=current_bar_date,
+                inquiry_error="ccnl_no_fill_rows",
+            ):
+                return True
+            if still_open:
+                print(
+                    f"[FILL/PENDING] {ticker} odno={odno} side={side} "
+                    f"waiting (0/{order_qty} filled)"
+                )
+                return False
             print(
                 f"[FILL/PENDING] {ticker} odno={odno} side={side} "
-                f"waiting (0/{order_qty} filled)"
+                f"no ccnl rows yet — waiting for broker confirmation"
             )
             return False
 

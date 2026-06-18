@@ -313,6 +313,25 @@ class PortfolioReconciliationEngine:
                     )
                     ticker_state["held_quantity"] = broker_qty
                     ticker_state["in_position"] = broker_qty > 0
+                    if (
+                        ticker_state.get("pending_order")
+                        and delta > 0
+                        and str(ticker_state.get("open_order_side") or "BUY").upper()
+                        == "BUY"
+                    ):
+                        order_qty = int(ticker_state.get("open_order_qty") or 0)
+                        if order_qty <= 0 or broker_qty >= order_qty:
+                            runtime = PositionState.from_dict(ticker_state)
+                            runtime.held_quantity = broker_qty
+                            runtime.in_position = broker_qty > 0
+                            from execution_engine import clear_open_order
+
+                            clear_open_order(runtime)
+                            ticker_state.update(runtime.to_dict())
+                            print(
+                                f"[RECONCILE/FILL-FB] {ticker} pending BUY cleared "
+                                f"via broker qty={broker_qty}"
+                            )
                     if broker_qty <= 0 and not ticker_state.get("pending_order"):
                         ticker_state["highest_price_achieved"] = None
                         ticker_state["current_atr"] = None

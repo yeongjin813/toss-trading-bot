@@ -43,6 +43,7 @@ def test_risk_guard_blocks_max_positions() -> None:
         rth_buy_block_open_minutes=10,
         rth_buy_block_close_minutes=5,
         pending_order_stale_minutes=120,
+        fill_inquiry_alert_cooldown_minutes=15,
         default_limit_buffer_bps=10,
         high_vol_limit_buffer_bps=15,
     )
@@ -69,6 +70,7 @@ def test_rth_open_buy_block() -> None:
         rth_buy_block_open_minutes=10,
         rth_buy_block_close_minutes=5,
         pending_order_stale_minutes=120,
+        fill_inquiry_alert_cooldown_minutes=15,
         default_limit_buffer_bps=10,
         high_vol_limit_buffer_bps=15,
     )
@@ -95,11 +97,69 @@ def test_clear_open_order_fields() -> None:
     assert runtime.open_order_qty == 0
 
 
+def test_broker_fallback_clears_pending_buy() -> None:
+    from execution_engine import ExecutionSettings, OrderFillMonitor, TradeLogWriter, assign_open_order
+
+    settings = ExecutionSettings(
+        max_daily_loss_usd=100,
+        max_open_positions=3,
+        max_ticker_exposure_usd=1000,
+        rth_buy_block_open_minutes=10,
+        rth_buy_block_close_minutes=5,
+        pending_order_stale_minutes=120,
+        fill_inquiry_alert_cooldown_minutes=15,
+        default_limit_buffer_bps=10,
+        high_vol_limit_buffer_bps=15,
+    )
+    monitor = OrderFillMonitor(settings, TradeLogWriter("./trade_log_test.csv"))
+    runtime = PositionState()
+    assign_open_order(
+        runtime,
+        odno="12345",
+        side="BUY",
+        qty=1,
+        price=250.0,
+        submitted_at="2026-06-17T08:00:00",
+    )
+    states: dict[str, object] = {"_portfolio": {"broker_holdings": {"TSLA": 0}}}
+
+    class FakeClient:
+        def fetch_overseas_order_ccnl(self, **_kwargs):
+            raise RuntimeError("500 Server Error")
+
+        def fetch_overseas_open_orders(self, **_kwargs):
+            raise RuntimeError("500 Server Error")
+
+        def fetch_overseas_present_balance(self, **_kwargs):
+            return {
+                "output1": [{"pdno": "TSLA", "ovrs_stck_tot_qty": "1"}],
+                "output2": [],
+            }
+
+    class FakeEngine:
+        def apply_post_order_transition(self, runtime, **_kwargs) -> None:
+            runtime.pending_order = False
+
+    changed = monitor.resolve_ticker(
+        FakeClient(),
+        FakeEngine(),
+        "TSLA",
+        runtime,
+        states,
+        broker_qty=0,
+    )
+    assert changed is True
+    assert runtime.pending_order is False
+    assert runtime.held_quantity == 1
+    assert runtime.in_position is True
+
+
 def main() -> int:
     test_summarize_ccnl_fills_partial()
     test_risk_guard_blocks_max_positions()
     test_rth_open_buy_block()
     test_clear_open_order_fields()
+    test_broker_fallback_clears_pending_buy()
     print("ALL EXECUTION ENGINE TESTS PASSED")
     return 0
 
