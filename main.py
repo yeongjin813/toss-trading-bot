@@ -81,6 +81,7 @@ from telegram_notifier import (
 )
 from kis_http import is_retryable_request_error, kis_request, last_api_response_ms
 from order_retry_queue import OrderRetryQueue, PendingOrderRetry
+from market_data_cache import MarketDataCache
 from momentum_ranker import (
     MomentumRankSettings,
     build_cycle_tickers,
@@ -806,151 +807,6 @@ class KISApiClient:
         return payload
 
 
-class MarketDataCache:
-    """
-    Bootstrap full historical windows once, then refresh only the latest bar.
-
-    Avoids re-downloading ~756 bars every 60-second polling cycle.
-    """
-
-    def __init__(self, client: KISApiClient) -> None:
-        self._client = client
-        self._frames: dict[str, pd.DataFrame] = {}
-        self._data_sources: dict[str, str] = {}
-
-    def get_data_source(self, ticker: str) -> str:
-        return self._data_sources.get(ticker, "kis")
-
-    def bootstrap(self, tickers: list[str]) -> None:
-        for ticker in tickers:
-            self._frames[ticker] = self._load_or_fetch_full_history(ticker)
-            persist_market_data(self._frames[ticker], data_path_for_ticker(ticker))
-            print(
-                f"  -> Bootstrap {ticker}: {len(self._frames[ticker])} bars cached "
-                f"to {data_path_for_ticker(ticker)}"
-            )
-
-    def get_frame(self, ticker: str) -> pd.DataFrame:
-        if ticker not in self._frames:
-            raise KeyError(f"Ticker {ticker} is not bootstrapped in MarketDataCache.")
-        return self._frames[ticker].copy()
-
-    def refresh_latest(self, ticker: str) -> tuple[pd.DataFrame, bool]:
-        """
-        Pull the latest KIS daily page and merge into the cached frame.
-
-        Returns (updated_frame, is_new_bar).
-        """
-        excd = MARKET_META[ticker]["excd"]
-        latest_batch = self._client.fetch_us_daily_latest(ticker, excd)
-        cached = self._frames.get(ticker)
-
-        if cached is None or cached.empty:
-            cached = self._load_or_fetch_full_history(ticker)
-            self._frames[ticker] = cached
-            return cached, True
-
-        if latest_batch.empty:
-            return cached, False
-
-        cached = normalize_market_frame(cached)
-        latest_batch = normalize_market_frame(latest_batch)
-        latest_row = latest_batch.sort_values("Date").iloc[-1]
-        latest_date = latest_row["Date"]
-
-        if latest_date not in set(cached["Date"]):
-            merged = pd.concat([cached, latest_row.to_frame().T], ignore_index=True)
-            merged = (
-                merged.drop_duplicates(subset=["Date"])
-                .sort_values("Date")
-                .tail(TARGET_BARS)
-                .reset_index(drop=True)
-            )
-            self._frames[ticker] = merged
-            return merged, True
-
-        idx = cached[cached["Date"] == latest_date].index[-1]
-        cached.loc[idx, ["Open", "High", "Low", "Close", "Volume"]] = latest_row[
-            ["Open", "High", "Low", "Close", "Volume"]
-        ].values
-        self._frames[ticker] = cached.reset_index(drop=True)
-        return self._frames[ticker], False
-
-    def _load_or_fetch_full_history(self, ticker: str) -> pd.DataFrame:
-        path = data_path_for_ticker(ticker)
-        if os.path.exists(path):
-            cached = read_market_csv(path)
-            if cached is not None and len(cached) >= MIN_DATA_BARS:
-                try:
-                    self._data_sources[ticker] = "kis"
-                    return normalize_market_frame(cached)
-                except ValueError as exc:
-                    print(
-                        f"[WARN] Cached CSV for {ticker} failed normalization "
-                        f"({exc}) - refetching from KIS"
-                    )
-
-        excd = MARKET_META[ticker]["excd"]
-        try:
-            df = self._client.fetch_us_daily_bars(ticker=ticker, excd=excd)
-            self._data_sources[ticker] = "kis"
-            return normalize_market_frame(df)
-        except (requests.RequestException, RuntimeError, ValueError) as exc:
-            print(
-                f"[WARN] KIS history fetch failed for {ticker} ({excd}): {exc} "
-                "- using yfinance fallback"
-            )
-            df = fetch_yfinance_daily_bars(ticker)
-            self._data_sources[ticker] = "yfinance"
-            return normalize_market_frame(df)
-
-
-def fetch_yfinance_daily_bars(
-    ticker: str,
-    target_bars: int = TARGET_BARS,
-) -> pd.DataFrame:
-    """Fallback OHLCV loader when KIS VTS dailyprice is unavailable."""
-    import yfinance as yf
-
-    lookback_days = int(target_bars * 1.6) + 30
-    start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    raw = yf.download(
-        ticker,
-        start=start,
-        progress=False,
-        auto_adjust=True,
-    )
-    if raw is None or raw.empty:
-        raise RuntimeError(f"yfinance returned no data for {ticker}")
-
-    frame = raw.reset_index()
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = [str(level[0]).capitalize() for level in frame.columns]
-    else:
-        frame.columns = [str(column).capitalize() for column in frame.columns]
-
-    if "Date" not in frame.columns:
-        date_col = frame.columns[0]
-        frame = frame.rename(columns={date_col: "Date"})
-
-    frame["Date"] = pd.to_datetime(frame["Date"]).dt.strftime("%Y-%m-%d")
-    for column in ("Open", "High", "Low", "Close", "Volume"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-
-    frame = (
-        frame.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
-        .drop_duplicates(subset=["Date"])
-        .sort_values("Date")
-        .tail(target_bars)
-        .reset_index(drop=True)
-    )
-    if len(frame) < MIN_DATA_BARS:
-        raise RuntimeError(
-            f"yfinance fallback for {ticker} returned only {len(frame)} bars"
-        )
-    return frame
-
-
 def _parse_amount(value: Any) -> float:
     if value in (None, ""):
         return 0.0
@@ -1076,64 +932,6 @@ def _parse_kis_daily_output(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def read_market_csv(path: str) -> pd.DataFrame | None:
-    """Load a cached daily CSV, skipping yfinance metadata rows and coercing OHLCV."""
-    if not os.path.exists(path):
-        return None
-
-    frame = pd.read_csv(path)
-    if frame.empty:
-        return None
-
-    if "Date" not in frame.columns and "Price" in frame.columns:
-        frame = frame.rename(columns={"Price": "Date"})
-
-    if "Date" not in frame.columns:
-        return None
-
-    while len(frame) > 0:
-        first_cell = str(frame.iloc[0, 0]).strip()
-        if first_cell.lower() in {"ticker", "date"}:
-            frame = frame.iloc[1:].copy()
-            continue
-        if first_cell and not first_cell[:4].isdigit():
-            frame = frame.iloc[1:].copy()
-            continue
-        break
-
-    if frame.empty:
-        return None
-
-    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    for column in ("Open", "High", "Low", "Close", "Volume"):
-        if column not in frame.columns:
-            return None
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-
-    frame = frame.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
-    if frame.empty:
-        return None
-
-    return frame.sort_values("Date").reset_index(drop=True)
-
-
-def normalize_market_frame(df: pd.DataFrame) -> pd.DataFrame:
-    frame = df.copy()
-    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    for column in ("Open", "High", "Low", "Close", "Volume"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"]).copy()
-    frame = frame[(frame["Close"] > 0) & (frame["Volume"] >= 0)]
-    frame = frame.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-    if len(frame) < MIN_DATA_BARS:
-        raise ValueError(f"Insufficient bar count after normalization: {len(frame)}")
-    return frame
-
-
-def data_path_for_ticker(ticker: str) -> str:
-    return os.path.join(DATA_DIR, f"{ticker.lower()}_daily.csv")
-
-
 def load_persisted_states(path: str = STATE_FILE) -> dict[str, Any]:
     if not os.path.exists(path):
         return {}
@@ -1154,11 +952,6 @@ def save_persisted_states(states: dict[str, Any], path: str = STATE_FILE) -> Non
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(states, handle, indent=2, sort_keys=True)
-
-
-def persist_market_data(df: pd.DataFrame, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False)
 
 
 def _failed_order_key(signal: str, bar_date: str) -> str:
@@ -1710,18 +1503,21 @@ def process_ticker(
     ledger: PortfolioLedger,
     *,
     active_trade_tickers: frozenset[str] | None = None,
+    market_frame: pd.DataFrame | None = None,
+    is_new_bar: bool = False,
+    cycle_timestamp: datetime | None = None,
 ) -> str:
     """Run fetch-evaluate-execute-persist cycle for one ticker with state machine gates."""
     engine = LiveSignalEngine(ticker)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing ticker: {ticker}")
 
-    df, is_new_bar = cache.refresh_latest(ticker)
-    persist_market_data(df, data_path_for_ticker(ticker))
+    if market_frame is None:
+        market_frame, is_new_bar = cache.refresh_latest(ticker, now=cycle_timestamp)
+    df = market_frame
     data_source = cache.get_data_source(ticker)
+    refresh_kind = "new daily bar" if is_new_bar else "intraday overlay"
     print(
-        f"  -> {len(df)} bars in memory "
-        f"({'new daily bar' if is_new_bar else 'intraday refresh'}) "
-        f"[source={data_source}]"
+        f"  -> {len(df)} bars in memory ({refresh_kind}) [source={data_source}]"
     )
 
     ticker_state = states.get(ticker, {})
@@ -2104,7 +1900,23 @@ def run_watchlist_cycle(
                 f"{MOMENTUM_SETTINGS.top_n}: {', '.join(skipped)}"
             )
 
-    for index, ticker in enumerate(cycle_tickers):
+    refresh_tickers = list(cycle_tickers)
+    if USE_SPY_MARKET_FILTER:
+        refresh_tickers.append(BENCHMARK_TICKER)
+    if USE_QQQ_REGIME_FILTER:
+        refresh_tickers.append(SECONDARY_BENCHMARK_TICKER)
+    cycle_timestamp = datetime.now()
+    refresh_map = cache.refresh_latest_parallel(refresh_tickers, now=cycle_timestamp)
+    print(
+        f"[CYCLE] Refreshed {len(refresh_map)} tickers in parallel "
+        f"at {cycle_timestamp.strftime('%H:%M:%S')}"
+    )
+
+    for ticker in cycle_tickers:
+        frame, is_new = refresh_map.get(
+            ticker,
+            (cache.evaluation_frame(ticker), False),
+        )
         try:
             signal = process_ticker(
                 client,
@@ -2113,6 +1925,9 @@ def run_watchlist_cycle(
                 states,
                 ledger,
                 active_trade_tickers=active_trade_tickers,
+                market_frame=frame,
+                is_new_bar=is_new,
+                cycle_timestamp=cycle_timestamp,
             )
             summary.append((ticker, signal))
         except requests.Timeout as exc:
@@ -2136,10 +1951,8 @@ def run_watchlist_cycle(
             )
             summary.append((ticker, "FAILED"))
 
-        if index < len(cycle_tickers) - 1:
-            time.sleep(TICKER_SLEEP_SECONDS)
-
     run_top3_shadow_cycle(client, cache, states, ledger)
+    cache.maybe_collect_garbage()
     save_persisted_states(states)
 
     print()
@@ -2228,7 +2041,19 @@ def main() -> None:
         f"max_exposure=${EXECUTION_SETTINGS.max_ticker_exposure_usd:.0f}/ticker"
     )
     print(f"State File          : {STATE_FILE}")
-    print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s")
+    print(f"Ticker Interval     : {TICKER_SLEEP_SECONDS}s (order pacing; OHLCV refresh is parallel)")
+    parallel_refresh = os.getenv("PARALLEL_TICKER_REFRESH", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    workers = os.getenv("TICKER_REFRESH_WORKERS", "8")
+    print(
+        f"OHLCV Refresh       : "
+        f"{'parallel' if parallel_refresh else 'sequential'} "
+        f"(workers={workers}, forming-bar overlay, completed-only CSV)"
+    )
     print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
     print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
     print(f"KIS Request Timeout : {KIS_REQUEST_TIMEOUT_SECONDS}s")
@@ -2259,7 +2084,13 @@ def main() -> None:
     print("=" * 88)
 
     client = KISApiClient()
-    cache = MarketDataCache(client)
+    cache = MarketDataCache(
+        client,
+        market_meta=MARKET_META,
+        data_dir=DATA_DIR,
+        target_bars=TARGET_BARS,
+        min_data_bars=MIN_DATA_BARS,
+    )
 
     print("Requesting KIS access token...")
     try:
@@ -2333,6 +2164,12 @@ def main() -> None:
                 continue
 
             if not is_us_regular_market_hours(cycle_started):
+                finalized = cache.finalize_intraday_bars(now=cycle_started)
+                if finalized:
+                    print(
+                        f"[CACHE] Finalized {finalized} forming bar(s) into "
+                        "completed EOD history (disk-safe)"
+                    )
                 _maybe_send_eod_report(states, ledger, now=cycle_started)
                 sleep_seconds = seconds_until_us_rth_open(cycle_started)
                 print()

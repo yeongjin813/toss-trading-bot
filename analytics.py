@@ -409,6 +409,11 @@ def _to_ny_datetime(current_dt: datetime | None) -> datetime:
     return current_dt.astimezone(NY_TZ)
 
 
+def ny_session_date_str(current_dt: datetime | None = None) -> str:
+    """Current NY regular-session calendar date as YYYY-MM-DD."""
+    return _to_ny_datetime(current_dt).strftime("%Y-%m-%d")
+
+
 def is_us_regular_market_hours(current_dt: datetime | None = None) -> bool:
     """
     True during NYSE regular session: Mon-Fri 09:30-16:00 America/New_York.

@@ -465,7 +465,27 @@ Full strategy matrix: [README Section 8](../README.md#8-strategy-configurations-
 
 ---
 
-## Verification Tests
+## Live OHLCV Cache Hardening (2026-06)
+
+Three production risks addressed in `market_data_cache.py`:
+
+| Risk | Fix |
+|---|---|
+| **Intraday CSV pollution** | RTH forming bar kept in memory only; disk stores **completed EOD bars**; startup heals polluted CSV tails |
+| **15-ticker sequential skew** | `PARALLEL_TICKER_REFRESH=true` — all tickers refreshed at cycle start via thread pool |
+| **Pandas memory fragmentation** | In-place row updates during RTH; `pd.concat` only on new session dates; periodic `gc.collect()` |
+
+**Env:**
+
+```ini
+PARALLEL_TICKER_REFRESH=true
+TICKER_REFRESH_WORKERS=8
+CACHE_GC_EVERY_N_CYCLES=60
+```
+
+Post-RTH the bot calls `finalize_intraday_bars()` before sleeping — commits forming bars to CSV once per session.
+
+---
 
 ```powershell
 python test_analytics.py
@@ -474,6 +494,6 @@ python test_momentum_ranker.py
 python test_backtest_benchmarks.py
 python test_daily_report.py
 python test_telegram_notifier.py
-python test_deployment_config.py
+python test_market_data_cache.py
 python test_top3_backtest.py
 ```
