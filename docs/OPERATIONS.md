@@ -52,9 +52,17 @@ KIS_ORDER_RETRY_BACKOFF_SECONDS=2.0
 USE_EOD_ATR_STOPS=false
 KIS_ORDER_TYPE=limit
 
-# Momentum Top-N (new BUY only)
-MOMENTUM_RANK_ENABLED=true
+# Dual-strategy Phase 4: Legacy $60k + Top3 $40k on $100k total
+DEPLOYMENT_PHASE=4
+STRATEGY_MODE=dual
+LEGACY_CAPITAL_PCT=60
+TOP3_CAPITAL_PCT=40
+TOP3_DRY_RUN_ENABLED=false
+MOMENTUM_RANK_ENABLED=false
 MOMENTUM_TOP_N=3
+MAX_DAILY_LOSS_USD=5000
+MAX_OPEN_POSITIONS=5
+MAX_TICKER_EXPOSURE_USD=25000
 
 # Safety & reporting
 KIS_DRY_RUN=false
@@ -391,11 +399,29 @@ python run_backtest.py --strategy compare --yfinance --start 2025-06-01
 python run_backtest.py --strategy compare --yfinance --start 2024-01-01 --end 2026-06-01
 ```
 
-**Advance checklist (2 → 3 → 4):**
+**Advance checklist (2 → 4):**
 
 1. Phase 2: Top3 total return beats legacy on same window (1Y and 2024–2026).
-2. Phase 3: Set env vars above, restart bot, confirm `[TOP3/SHADOW]` logs on Fridays; no KIS Top3 orders.
-3. Phase 4: After 2+ weeks shadow review, set `DEPLOYMENT_PHASE=4`; verify startup shows `capital=60/40` and `top3=live-split`.
+2. Phase 4 (production): Set env below; verify startup shows `capital=60/40`, `top3=live-split`, Legacy **$60,000** + Top3 **$40,000** on **$100,000** total.
+
+**Production EC2 defaults (Phase 4 — $100k total):**
+
+```ini
+CAPITAL_AT_RISK=100000
+DEPLOYMENT_PHASE=4
+STRATEGY_MODE=dual
+LEGACY_CAPITAL_PCT=60
+TOP3_CAPITAL_PCT=40
+TOP3_DRY_RUN_ENABLED=false
+MOMENTUM_RANK_ENABLED=false
+MOMENTUM_TOP_N=3
+MAX_DAILY_LOSS_USD=5000
+MAX_TICKER_EXPOSURE_USD=25000
+MAX_OPEN_POSITIONS=5
+USE_QQQ_REGIME_FILTER=true
+KIS_DRY_RUN=false
+USE_DAILY_TELEGRAM_REPORT=true
+```
 
 **Limitations:** KIS VTS does not tag orders by strategy. Top3 shadow state lives in `trading_state.json` → `_portfolio._top3_shadow`. Phase 4 uses capital-slice sizing; broker positions are shared — reconcile carefully before advancing.
 
@@ -413,7 +439,11 @@ python run_backtest.py --strategy compare --yfinance --start 2024-01-01 --end 20
 | Top-3 momentum | `MOMENTUM_TOP_N=3` | Concentrated capital on highest-scoring names |
 | Exit telemetry | `portfolio_backtest.py` | Backtest summary prints SELL counts by `exit_reason` |
 
-**Production EC2 defaults (Phase 1):**
+**Production EC2 defaults (Phase 4 — supersede Phase 1 block below):**
+
+See [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases) for full Phase 4 `.env`.
+
+**Legacy-only reference (Phase 1 rollback):**
 
 ```ini
 DEPLOYMENT_PHASE=1

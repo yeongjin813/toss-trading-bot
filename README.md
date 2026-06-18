@@ -4,9 +4,10 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 10 — Breakout-only entries, min-hold soft exits, Top-3 momentum, regime-specific trails, exit-reason telemetry |
+| **System Status** | **Phase 4 live** — Legacy 60% + Top3 40% on **$100,000** total (`CAPITAL_AT_RISK`) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM / DEFAULT (all `breakout`) |
-| **Universe Filter** | `momentum_ranker.py` — weekly Top-N from 15-ticker watchlist; gates **new BUY only** |
+| **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top3 momentum rebalance (separate sizing pools) |
+| **Universe Filter** | Legacy: full watchlist signals · Top3: equal-weight Top-3, Friday rebalance (`top3_strategy.py`) |
 | **Regime Filter** | SPY 200MA gate + optional QQQ half-size when SPY bear / QQQ bull (`USE_QQQ_REGIME_FILTER`) |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
@@ -24,7 +25,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Phase 10 trend-hold overhaul · `770d2b4` · Phase 9 · `9dcea21` (dry-run, EOD, benchmarks)
+**Latest production commits:** Phase 4 dual 60/40 · `8ae5852` · Phase 11 crossover hold · `8879f61` · Phase 10 · `770d2b4`
 
 ---
 
@@ -233,7 +234,7 @@ Closed gaps from [Section 12](#12-pre-deployment-critical-architectural-flaws--h
 | **8.7** | Ops mixed into 2k-line README | Split [docs/OPERATIONS.md](docs/OPERATIONS.md) | `docs/` |
 
 **Recommended for backtest-aligned live runs:** set `USE_EOD_ATR_STOPS=true` in `.env`.  
-**Recommended for production VTS:** `MOMENTUM_RANK_ENABLED=true`, `USE_QQQ_REGIME_FILTER=true`, `USE_DAILY_TELEGRAM_REPORT=true`, `KIS_DRY_RUN=false`.  
+**Recommended for production VTS (Phase 4):** `CAPITAL_AT_RISK=100000`, `DEPLOYMENT_PHASE=4`, `STRATEGY_MODE=dual`, `MOMENTUM_RANK_ENABLED=false`, `USE_QQQ_REGIME_FILTER=true`, `USE_DAILY_TELEGRAM_REPORT=true`, `KIS_DRY_RUN=false`.  
 **Still open (not auto-fixable):** sustained alpha vs buy-and-hold, VTS→real-account migration, 60s polling latency, VIX filter.
 
 ### Phase 9: Momentum Universe, Strategy Overhaul & Ops Polish *(2026-06)*
@@ -276,6 +277,24 @@ python test_daily_report.py
 python run_backtest.py --walk-forward --yfinance --momentum-top-n 3
 python test_analytics.py
 ```
+
+### Phase 11: Top-N Winner Hold *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **Crossover hold** | `analytics.py` | Skip death-cross / RSI exit while ticker is in momentum Top-N set |
+| **MOMENTUM trail** | `config.py` | Profit-trail arm lowered to **15%** (from 25%) |
+
+### Phase 12: Dual-Strategy Deployment *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **Four-phase rollout** | `deployment_config.py` | Phase 1 legacy → Phase 2 compare backtest → Phase 3 shadow → Phase 4 live split |
+| **Top3 backtest** | `top3_backtest.py` | Standalone equal-weight Top-3 momentum portfolio |
+| **Top3 live path** | `top3_strategy.py` + `main.py` | Shadow (phase 3) or KIS orders (phase 4) on separate capital slice |
+| **Compare CLI** | `run_backtest.py --strategy compare` | Legacy vs Top3 side-by-side on same window |
+
+**Production (Phase 4):** `CAPITAL_AT_RISK=100000` → Legacy **$60,000** sizing + Top3 **$40,000** sizing. See [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases-env).
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -1340,23 +1359,34 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 
 #### Dual-Strategy Deployment Phases (`.env`)
 
+**Production default:** Phase **4** — `$100,000` total capital split **60% Legacy / 40% Top3**.
+
+| Pool | Capital | Strategy |
+|---|---|---|
+| **Legacy** | $60,000 (60%) | Breakout + ATR trail + regime exits on full watchlist |
+| **Top3** | $40,000 (40%) | Equal-weight Top-3 momentum; Friday rebalance; exit when dropped from Top-N |
+
 | Phase | `DEPLOYMENT_PHASE` | Live behavior | Backtest |
 |---|---|---|---|
-| **1** (now) | `1` | Legacy signal engine only; `MOMENTUM_RANK_ENABLED=false` | `python run_backtest.py` |
+| **1** | `1` | Legacy only; `MOMENTUM_RANK_ENABLED=false` | `python run_backtest.py` |
 | **2** | `2` | Same as phase 1 live | `python run_backtest.py --strategy compare --yfinance` |
-| **3** | `3` + `STRATEGY_MODE=dual` + `TOP3_DRY_RUN_ENABLED=true` | Legacy live + Top3 shadow (log/Telegram, no KIS for Top3) | Compare first |
-| **4** | `4` + `STRATEGY_MODE=dual` | 60% legacy / 40% Top3 capital split (`LEGACY_CAPITAL_PCT` / `TOP3_CAPITAL_PCT`) | N/A |
+| **3** | `3` + `STRATEGY_MODE=dual` + `TOP3_DRY_RUN_ENABLED=true` | Legacy live + Top3 shadow (log/Telegram only) | Compare first |
+| **4** *(production)* | `4` + `STRATEGY_MODE=dual` | **60% legacy / 40% Top3** on `CAPITAL_AT_RISK` | N/A |
 
 | Parameter | Default | Description |
 |---|---|---|
-| `DEPLOYMENT_PHASE` | **1** | Active rollout phase (1–4) |
-| `STRATEGY_MODE` | **legacy** | `legacy` or `dual` (dual activates at phase ≥ 3) |
+| `CAPITAL_AT_RISK` | **100000** | **Total** deployable portfolio (USD); split in phase 4 |
+| `DEPLOYMENT_PHASE` | **4** | Active rollout phase (1–4) |
+| `STRATEGY_MODE` | **dual** | `legacy` or `dual` (dual activates at phase ≥ 3) |
+| `LEGACY_CAPITAL_PCT` | **60** | Legacy sizing slice (% of `CAPITAL_AT_RISK`) |
+| `TOP3_CAPITAL_PCT` | **40** | Top3 sizing slice (% of `CAPITAL_AT_RISK`) |
 | `TOP3_BACKTEST_ONLY` | **false** | Phase 2 flag — Top3 evaluated in backtests only |
 | `TOP3_DRY_RUN_ENABLED` | **false** | Phase 3 — shadow Top3 orders without KIS |
-| `LEGACY_CAPITAL_PCT` | **60** | Phase 4 legacy sizing slice (%) |
-| `TOP3_CAPITAL_PCT` | **40** | Phase 4 Top3 sizing slice (%) |
+| `MOMENTUM_RANK_ENABLED` | **false** | Legacy path: off in dual mode (Top3 handles momentum separately) |
 
-**Advance phases:** After phase 2 backtests favor Top3, set phase 3 env vars and observe shadow logs for 2+ weeks. If shadow P&L is acceptable, advance to phase 4 for live capital split. KIS does not tag orders by strategy — position tracking uses `trading_state.json` → `_portfolio._top3_shadow` for Top3 shadow state.
+**Backtest decision (2026-06):** Four-window compare — Top3 wins recent bull windows; Legacy wins 2020–22 bear. **60/40 split** chosen over either strategy alone. No live shadow wait required.
+
+**Limitations:** KIS VTS does not tag orders by strategy. Top3 state in `trading_state.json` → `_portfolio._top3_shadow`. Broker positions are shared — reconcile before phase changes.
 
 #### Shared Infrastructure Constants
 
@@ -1374,7 +1404,7 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 
 | Parameter | Default | Description |
 |---|---|---|
-| `CAPITAL_AT_RISK` | **10000** | Deployable capital for dual-clamp sizing (USD) |
+| `CAPITAL_AT_RISK` | **100000** | Total deployable portfolio (USD); Phase 4 → Legacy $60k + Top3 $40k |
 | `RISK_PER_TRADE` | **0.01** | Per-trade risk fraction (1%) |
 | `WATCHLIST` | `AAPL,MSFT,NVDA,...` (15 defaults) | Comma-separated ticker list; must exist in `market_registry.MARKET_META` |
 | `TARGET_BARS` | **756** | Rolling historical window (3 × 252 trading days) |
@@ -1771,7 +1801,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `WATCHLIST` | No | 15-ticker default in `.env.example` | Comma-separated tickers; register new symbols in `market_registry.py` |
-| `CAPITAL_AT_RISK` | No | `10000` | USD capital base |
+| `CAPITAL_AT_RISK` | No | `100000` | Total USD capital base (Phase 4: 60% legacy + 40% Top3) |
 | `RISK_PER_TRADE` | No | `0.01` | Per-trade risk fraction |
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
 | `TICKER_SLEEP_SECONDS` | No | `1` | Inter-ticker pause |
@@ -1783,9 +1813,9 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `KIS_LIMIT_PRICE_BUFFER_BPS` | No | `10` | Default limit buffer vs reference close |
 | `KIS_HIGH_VOL_LIMIT_BUFFER_BPS` | No | `15` | NVDA/TSLA/PLTR/CRWD/AMD/META buffer |
 | `TRADE_LOG_FILE` | No | `./trade_log.csv` | Append-only execution audit log |
-| `MAX_DAILY_LOSS_USD` | No | `100` | Block new BUY when day P&L exceeds limit |
-| `MAX_OPEN_POSITIONS` | No | `3` | Max simultaneous held tickers |
-| `MAX_TICKER_EXPOSURE_USD` | No | `1000` | Max notional per new BUY |
+| `MAX_DAILY_LOSS_USD` | No | `5000` | Block new BUY when day P&L exceeds limit (5% of $100k) |
+| `MAX_OPEN_POSITIONS` | No | `5` | Max simultaneous held tickers (legacy pool) |
+| `MAX_TICKER_EXPOSURE_USD` | No | `25000` | Max notional per new BUY |
 | `RTH_BUY_BLOCK_OPEN_MINUTES` | No | `10` | No new BUY after 09:30 ET open |
 | `RTH_BUY_BLOCK_CLOSE_MINUTES` | No | `5` | No new BUY before 16:00 ET close |
 | `PENDING_ORDER_STALE_MINUTES` | No | `120` | Release pending lock if zero fill |
@@ -1800,7 +1830,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `MOMENTUM_RANK_ENABLED` | No | `true` | Enable weekly Top-N universe filter |
+| `MOMENTUM_RANK_ENABLED` | No | `false` | Legacy Top-N gate (off in Phase 4 dual — Top3 handles momentum) |
 | `MOMENTUM_TOP_N` | No | `3` | Number of tickers eligible for new BUY |
 | `MOMENTUM_REBALANCE_WEEKDAY` | No | `4` | Rebalance day (0=Mon … 4=Fri) |
 | `MOMENTUM_WEIGHT_3M` | No | `0.4` | 3-month return weight |
@@ -1809,6 +1839,17 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `MOMENTUM_WEIGHT_VOLUME` | No | `0.1` | Volume stability weight |
 | `MOMENTUM_REQUIRE_SMA50` | No | `true` | Require price above 50MA for ranking |
 | `MOMENTUM_REQUIRE_SMA200` | No | `false` | Require price above 200MA for ranking |
+
+#### Dual-Strategy Deployment (Phase 12)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DEPLOYMENT_PHASE` | No | `4` | Rollout phase (1–4) |
+| `STRATEGY_MODE` | No | `dual` | `legacy` or `dual` |
+| `LEGACY_CAPITAL_PCT` | No | `60` | Legacy pool % of `CAPITAL_AT_RISK` |
+| `TOP3_CAPITAL_PCT` | No | `40` | Top3 pool % of `CAPITAL_AT_RISK` |
+| `TOP3_BACKTEST_ONLY` | No | `false` | Phase 2 — backtest-only flag |
+| `TOP3_DRY_RUN_ENABLED` | No | `false` | Phase 3 — shadow Top3 without KIS |
 
 #### Telegram Alerts (Phase 7 + 9)
 
