@@ -23,6 +23,13 @@ from analytics import (
 )
 from config import StrategyConfig, StrategyConfigMapper
 from market_registry import BENCHMARK_SMA_PERIOD
+from momentum_ranker import (
+    MomentumRankSettings,
+    is_new_buy_allowed,
+    rank_universe_frames,
+    select_top_tickers,
+    should_rebalance_today,
+)
 
 
 @dataclass
@@ -224,11 +231,13 @@ class PortfolioBacktestEngine:
         commission_rate: float = 0.001,
         use_spy_market_filter: bool | None = None,
         spy_df: pd.DataFrame | None = None,
+        momentum_settings: MomentumRankSettings | None = None,
     ) -> None:
         self.initial_cash = initial_cash
         self.risk_per_trade = risk_per_trade
         self.commission_rate = commission_rate
         self.watchlist = tickers
+        self.momentum_settings = momentum_settings or MomentumRankSettings.from_env()
         self.use_spy_market_filter = (
             StrategyConfigMapper.use_spy_market_filter()
             if use_spy_market_filter is None
@@ -250,6 +259,38 @@ class PortfolioBacktestEngine:
         for series in self.series_map.values():
             all_dates.update(series.date_to_index.keys())
         self.timeline = sorted(all_dates)
+        self._active_trade_tickers: set[str] = set(tickers)
+        self._momentum_last_rebalance: str | None = None
+        self._raw_frames = {
+            ticker: ohlcv_by_ticker[ticker].copy() for ticker in tickers
+        }
+
+    def _maybe_rebalance_momentum(self, bar_date: str) -> None:
+        cfg = self.momentum_settings
+        if not cfg.enabled:
+            self._active_trade_tickers = set(self.watchlist)
+            return
+
+        bar_ts = pd.Timestamp(bar_date)
+        pseudo_now = bar_ts.to_pydatetime()
+        first_run = self._momentum_last_rebalance is None
+        if not first_run and not should_rebalance_today(
+            pseudo_now,
+            self._momentum_last_rebalance,
+            rebalance_weekday=cfg.rebalance_weekday,
+        ):
+            return
+
+        ranked = rank_universe_frames(
+            self._raw_frames,
+            self.watchlist,
+            as_of_date=bar_date,
+            settings=cfg,
+        )
+        active = select_top_tickers(ranked, top_n=cfg.top_n)
+        if active:
+            self._active_trade_tickers = set(active)
+        self._momentum_last_rebalance = bar_date
 
     def _mark_prices(self, bar_date: str) -> dict[str, float]:
         prices: dict[str, float] = {}
@@ -278,6 +319,7 @@ class PortfolioBacktestEngine:
         open_entry_cost: dict[str, float] = {}
 
         for bar_date in self.timeline:
+            self._maybe_rebalance_momentum(bar_date)
             mark_prices = self._mark_prices(bar_date)
             holdings = self._holdings_snapshot(mark_prices)
 
@@ -321,7 +363,11 @@ class PortfolioBacktestEngine:
                         allow_crossover=True,
                         market_bullish=market_bullish,
                     )
-                    if entry_check["signal"] == "BUY":
+                    if entry_check["signal"] == "BUY" and is_new_buy_allowed(
+                        ticker,
+                        self._active_trade_tickers,
+                        settings=self.momentum_settings,
+                    ):
                         entry_events.append((series, bar))
 
             for series, bar, signal in exit_events:
@@ -472,6 +518,7 @@ def run_portfolio_backtest(
     commission_rate: float = 0.001,
     use_spy_market_filter: bool | None = None,
     spy_df: pd.DataFrame | None = None,
+    momentum_settings: MomentumRankSettings | None = None,
 ) -> PortfolioBacktestResult:
     """Convenience wrapper for consolidated portfolio simulation."""
     engine = PortfolioBacktestEngine(
@@ -482,5 +529,6 @@ def run_portfolio_backtest(
         commission_rate=commission_rate,
         use_spy_market_filter=use_spy_market_filter,
         spy_df=spy_df,
+        momentum_settings=momentum_settings,
     )
     return engine.run()

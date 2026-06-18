@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from config import StrategyConfigMapper
 from market_registry import BENCHMARK_TICKER, DEFAULT_WATCHLIST, parse_watchlist
+from momentum_ranker import MomentumRankSettings
 from portfolio_backtest import (
     PortfolioBacktestResult,
     run_portfolio_backtest,
@@ -63,6 +64,24 @@ WALK_FORWARD_WINDOWS: list[tuple[str, str, str]] = [
     ("2024-2026", "2024-01-01", "2026-12-31"),
 ]
 YFINANCE_WARMUP_START = "2017-01-01"
+
+
+def resolve_momentum_settings(args: argparse.Namespace) -> MomentumRankSettings:
+    settings = MomentumRankSettings.from_env()
+    enabled = settings.enabled and not args.no_momentum_rank
+    top_n = args.momentum_top_n if args.momentum_top_n is not None else settings.top_n
+    return MomentumRankSettings(
+        enabled=enabled,
+        top_n=top_n,
+        rebalance_weekday=settings.rebalance_weekday,
+        weight_3m=settings.weight_3m,
+        weight_6m=settings.weight_6m,
+        weight_12m=settings.weight_12m,
+        weight_volume=settings.weight_volume,
+        require_above_sma50=settings.require_above_sma50,
+        require_above_sma200=settings.require_above_sma200,
+        min_bars=settings.min_bars,
+    )
 
 
 def load_daily_csv(path: Path) -> pd.DataFrame | None:
@@ -470,14 +489,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=42,
         help="RNG seed for --random data (default: 42)",
     )
+    parser.add_argument(
+        "--no-momentum-rank",
+        action="store_true",
+        help="Disable weekly momentum Top-N entry filter (default: enabled via MOMENTUM_RANK_ENABLED)",
+    )
+    parser.add_argument(
+        "--momentum-top-n",
+        type=int,
+        default=None,
+        help="Override MOMENTUM_TOP_N for this backtest run",
+    )
     return parser
 
 
 def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) -> int:
     use_spy_filter = not args.no_spy_filter and StrategyConfigMapper.use_spy_market_filter()
+    momentum_settings = resolve_momentum_settings(args)
     print("Fetching extended yfinance history for walk-forward validation...")
     print(f"Tickers: {', '.join(tickers)}")
     print(f"SPY market filter: {'ON' if use_spy_filter else 'OFF'}")
+    print(
+        f"Momentum rank    : "
+        f"{'ON (Top ' + str(momentum_settings.top_n) + ')' if momentum_settings.enabled else 'OFF'}"
+    )
     print()
 
     full_ohlcv, skipped = load_yfinance_watchlist_data(
@@ -523,6 +558,7 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
             commission_rate=args.commission,
             use_spy_market_filter=use_spy_filter,
             spy_df=spy_df,
+            momentum_settings=momentum_settings,
         )
         summary_rows.append(
             {
@@ -558,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
     tickers = parse_watchlist(args.tickers)
     data_dir = Path(args.data_dir)
     use_spy_filter = not args.no_spy_filter and StrategyConfigMapper.use_spy_market_filter()
+    momentum_settings = resolve_momentum_settings(args)
 
     if args.walk_forward:
         return run_walk_forward_validation(args, tickers)
@@ -578,6 +615,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"SPY market filter: "
         f"{'ON (BUY only when SPY > 200MA)' if use_spy_filter else 'OFF'}"
+    )
+    print(
+        f"Momentum rank    : "
+        f"{'ON (Top ' + str(momentum_settings.top_n) + ', Friday rebalance)' if momentum_settings.enabled else 'OFF'}"
     )
     print()
 
@@ -659,6 +700,7 @@ def main(argv: list[str] | None = None) -> int:
         commission_rate=args.commission,
         use_spy_market_filter=use_spy_filter,
         spy_df=spy_df,
+        momentum_settings=momentum_settings,
     )
 
     print_portfolio_summary(

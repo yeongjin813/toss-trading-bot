@@ -77,6 +77,12 @@ from telegram_notifier import (
 )
 from kis_http import is_retryable_request_error, kis_request, last_api_response_ms
 from order_retry_queue import OrderRetryQueue, PendingOrderRetry
+from momentum_ranker import (
+    MomentumRankSettings,
+    build_cycle_tickers,
+    is_new_buy_allowed,
+    rebalance_active_tickers,
+)
 
 load_dotenv(override=True)
 
@@ -106,6 +112,7 @@ ORDER_RVSECNCL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 
 WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
 USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
+MOMENTUM_SETTINGS = MomentumRankSettings.from_env()
 
 ANALYTICS_SMA_PERIOD = 20
 MIN_DATA_BARS = 22
@@ -1560,6 +1567,8 @@ def process_ticker(
     ticker: str,
     states: dict[str, Any],
     ledger: PortfolioLedger,
+    *,
+    active_trade_tickers: frozenset[str] | None = None,
 ) -> str:
     """Run fetch-evaluate-execute-persist cycle for one ticker with state machine gates."""
     engine = LiveSignalEngine(ticker)
@@ -1689,6 +1698,19 @@ def process_ticker(
             return "HOLD"
 
         if signal == "BUY":
+            if active_trade_tickers is not None and not is_new_buy_allowed(
+                ticker,
+                active_trade_tickers,
+                settings=MOMENTUM_SETTINGS,
+            ):
+                print(
+                    f"[GATE/MOMENTUM] {ticker} BUY blocked — outside Top "
+                    f"{MOMENTUM_SETTINGS.top_n} momentum rank"
+                )
+                states[ticker] = engine.dump_state(runtime)
+                save_persisted_states(states)
+                return "HOLD"
+
             rth_block = block_new_buy_rth_window(datetime.now(), EXECUTION_SETTINGS)
             if rth_block:
                 print(f"[GATE/RTH] {ticker} BUY blocked — {rth_block}")
@@ -1824,9 +1846,36 @@ def run_watchlist_cycle(
     save_persisted_states(states)
     process_order_retry_queue(client, states, ledger)
 
-    for index, ticker in enumerate(WATCHLIST):
+    momentum_snapshot = rebalance_active_tickers(
+        cache,
+        WATCHLIST,
+        states,
+        settings=MOMENTUM_SETTINGS,
+    )
+    active_trade_tickers = frozenset(momentum_snapshot.active_tickers)
+    cycle_tickers = build_cycle_tickers(
+        WATCHLIST,
+        momentum_snapshot.active_tickers,
+        states,
+    )
+    if MOMENTUM_SETTINGS.enabled:
+        skipped = [t for t in WATCHLIST if t not in cycle_tickers]
+        if skipped:
+            print(
+                f"[MOMENTUM] Skipping flat tickers outside Top "
+                f"{MOMENTUM_SETTINGS.top_n}: {', '.join(skipped)}"
+            )
+
+    for index, ticker in enumerate(cycle_tickers):
         try:
-            signal = process_ticker(client, cache, ticker, states, ledger)
+            signal = process_ticker(
+                client,
+                cache,
+                ticker,
+                states,
+                ledger,
+                active_trade_tickers=active_trade_tickers,
+            )
             summary.append((ticker, signal))
         except requests.Timeout as exc:
             print(f"[ERROR] Timeout for {ticker}: {exc}")
@@ -1849,7 +1898,7 @@ def run_watchlist_cycle(
             )
             summary.append((ticker, "FAILED"))
 
-        if index < len(WATCHLIST) - 1:
+        if index < len(cycle_tickers) - 1:
             time.sleep(TICKER_SLEEP_SECONDS)
 
     print()
@@ -1880,6 +1929,10 @@ def main() -> None:
     print(f"Base URL            : {BASE_URL}")
     print(f"Account             : {CANO}-{ACNT_PRDT_CD}")
     print(f"Watchlist           : {', '.join(WATCHLIST)}")
+    print(
+        f"Momentum Rank       : "
+        f"{'ON (Top ' + str(MOMENTUM_SETTINGS.top_n) + ' on Friday)' if MOMENTUM_SETTINGS.enabled else 'OFF'}"
+    )
     print(
         f"SPY Market Filter   : "
         f"{'ON (BUY only when SPY > 200MA)' if USE_SPY_MARKET_FILTER else 'OFF'}"
@@ -1949,6 +2002,17 @@ def main() -> None:
         cash_after=ledger.available_cash_usd,
     )
     save_persisted_states(states)
+
+    if MOMENTUM_SETTINGS.enabled:
+        print("[MOMENTUM] Seeding Top-N active trade universe at startup...")
+        rebalance_active_tickers(
+            cache,
+            WATCHLIST,
+            states,
+            settings=MOMENTUM_SETTINGS,
+            force=True,
+        )
+        save_persisted_states(states)
 
     print("Starting production monitoring loop. Press Ctrl+C to stop.")
     print(
