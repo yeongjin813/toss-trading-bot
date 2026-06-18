@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+from backtest_benchmarks import summarize_strategy_vs_benchmarks
 from config import StrategyConfigMapper
 from market_registry import BENCHMARK_TICKER, DEFAULT_WATCHLIST, SECONDARY_BENCHMARK_TICKER, parse_watchlist
 from momentum_ranker import MomentumRankSettings
@@ -321,26 +322,55 @@ def print_portfolio_summary(
 
 
 def print_walk_forward_table(rows: list[dict[str, Any]]) -> None:
-    width = 88
+    width = 118
     print("=" * width)
-    print("WALK-FORWARD VALIDATION (PORTFOLIO)".center(width))
+    print("WALK-FORWARD VALIDATION (PORTFOLIO vs BENCHMARKS)".center(width))
     print("=" * width)
     print(
-        f"{'Window':<12} {'Return':>8} {'MaxDD':>7} {'Sharpe':>7} "
+        f"{'Window':<12} {'Strat':>7} {'B&H':>7} {'SPY':>7} "
+        f"{'Alpha':>7} {'MaxDD':>7} {'Sharpe':>7} "
         f"{'Trades':>7} {'Wins':>5} {'Final $':>12}"
     )
     print("-" * width)
     for row in rows:
+        spy = row.get("spy_return_pct")
+        spy_text = f"{spy:>+6.1f}%" if spy is not None else "   n/a"
+        alpha = row.get("alpha_vs_spy_pct")
+        if alpha is None:
+            alpha = row.get("alpha_vs_buy_hold_pct", 0.0)
         print(
             f"{row['label']:<12} "
-            f"{row['return_pct']:>+7.2f}% "
-            f"{row['max_drawdown_pct']:>6.2f}% "
+            f"{row['return_pct']:>+6.1f}% "
+            f"{row.get('buy_hold_return_pct', 0.0):>+6.1f}% "
+            f"{spy_text} "
+            f"{alpha:>+6.1f}% "
+            f"{row['max_drawdown_pct']:>6.1f}% "
             f"{row['sharpe']:>7.2f} "
             f"{row['trades']:>7} "
             f"{row['wins']:>5} "
             f"{row['final_equity']:>12,.2f}"
         )
+    print("-" * width)
+    if rows:
+        avg_strat = sum(r["return_pct"] for r in rows) / len(rows)
+        avg_bh = sum(r.get("buy_hold_return_pct", 0.0) for r in rows) / len(rows)
+        spy_rows = [r for r in rows if r.get("spy_return_pct") is not None]
+        avg_spy = (
+            sum(r["spy_return_pct"] for r in spy_rows) / len(spy_rows)
+            if spy_rows
+            else None
+        )
+        avg_alpha = avg_strat - (avg_spy if avg_spy is not None else avg_bh)
+        spy_avg_text = f"{avg_spy:>+6.1f}%" if avg_spy is not None else "   n/a"
+        print(
+            f"{'AVERAGE':<12} "
+            f"{avg_strat:>+6.1f}% "
+            f"{avg_bh:>+6.1f}% "
+            f"{spy_avg_text} "
+            f"{avg_alpha:>+6.1f}%"
+        )
     print("=" * width)
+    print("Alpha column: vs SPY when loaded, otherwise vs equal-weight B&H.")
 
 
 def run_isolated_backtest(
@@ -568,6 +598,13 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
             qqq_df=qqq_df,
             momentum_settings=momentum_settings,
         )
+        bench = summarize_strategy_vs_benchmarks(
+            result.total_return_pct,
+            window_ohlcv,
+            spy_df=spy_df,
+            window_start=start,
+            window_end=end,
+        )
         summary_rows.append(
             {
                 "label": label,
@@ -577,6 +614,7 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
                 "trades": result.total_trades,
                 "wins": result.winning_trades,
                 "final_equity": result.final_equity,
+                **bench,
             }
         )
         print_portfolio_summary(

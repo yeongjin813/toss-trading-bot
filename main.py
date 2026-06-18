@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -74,6 +75,7 @@ from session_manager import (
 )
 from telegram_notifier import (
     TelegramConfig,
+    send_eod_report,
     send_system_alert,
     send_trade_report,
 )
@@ -84,6 +86,14 @@ from momentum_ranker import (
     build_cycle_tickers,
     is_new_buy_allowed,
     rebalance_active_tickers,
+)
+from daily_report import (
+    compile_eod_metrics,
+    format_eod_report_text,
+    is_dry_run_mode,
+    mark_eod_report_sent,
+    should_send_eod_report,
+    use_daily_telegram_report,
 )
 
 load_dotenv(override=True)
@@ -1144,6 +1154,20 @@ def execute_broker_order(
     quantity: int,
     reference_price: float,
 ) -> dict[str, Any]:
+    if is_dry_run_mode():
+        side = "BUY" if signal == "BUY" else "SELL"
+        odno = f"DRY-{uuid.uuid4().hex[:8].upper()}"
+        print(
+            f"[DRY-RUN] {side} {ticker} | qty={quantity} | "
+            f"ref={reference_price:.2f} | odno={odno} (no KIS API call)"
+        )
+        return {
+            "rt_cd": "0",
+            "dry_run": True,
+            "msg1": "DRY_RUN simulated order",
+            "output": {"ODNO": odno},
+        }
+
     ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
     use_limit = KIS_ORDER_TYPE == "limit"
     side = "BUY" if signal == "BUY" else "SELL"
@@ -1279,6 +1303,57 @@ def _finalize_order_acceptance(
     )
 
 
+def _apply_dry_run_fill(
+    *,
+    ticker: str,
+    signal: str,
+    execution_qty: int,
+    reference_price: float,
+    runtime: PositionState,
+    engine: LiveSignalEngine,
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+    current_bar_date: str,
+) -> None:
+    side = "BUY" if signal == "BUY" else "SELL"
+    buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
+    fill_price = (
+        limit_order_price(side, reference_price, buffer_bps)
+        if KIS_ORDER_TYPE == "limit"
+        else reference_price
+    )
+
+    engine.apply_post_order_transition(
+        runtime,
+        signal=signal,
+        filled_quantity=execution_qty,
+        current_bar_date=current_bar_date,
+        allow_crossover=True,
+    )
+    if signal == "BUY":
+        runtime.entry_price = fill_price
+
+    runtime.last_failed_order_key = None
+    states[ticker] = engine.dump_state(runtime)
+    save_persisted_states(states)
+    TRADE_LOG.append(
+        ticker=ticker,
+        signal=signal,
+        qty=execution_qty,
+        order_price=fill_price,
+        fill_price=fill_price,
+        status="DRY_RUN",
+        reason="KIS_DRY_RUN instant fill",
+        cash_after=ledger.available_cash_usd,
+        held_qty=int(runtime.held_quantity or 0),
+    )
+    _handle_trade_fill(ticker, side, execution_qty, fill_price, "DRY_RUN")
+    print(
+        f"[DRY-RUN/FILL] {ticker} {signal} qty={execution_qty} "
+        f"@ {fill_price:.2f} — state updated immediately"
+    )
+
+
 def dispatch_order_with_state_machine(
     client: KISApiClient,
     engine: LiveSignalEngine,
@@ -1382,6 +1457,20 @@ def dispatch_order_with_state_machine(
             f"rt_cd={order_payload.get('rt_cd')}"
         )
         return "HOLD"
+
+    if order_payload.get("dry_run"):
+        _apply_dry_run_fill(
+            ticker=ticker,
+            signal=signal,
+            execution_qty=execution_qty,
+            reference_price=reference_price,
+            runtime=runtime,
+            engine=engine,
+            states=states,
+            ledger=ledger,
+            current_bar_date=current_bar_date,
+        )
+        return signal
 
     odno = extract_order_odno(order_payload)
     _finalize_order_acceptance(
@@ -1940,6 +2029,32 @@ def run_watchlist_cycle(
     return states, ledger
 
 
+def _maybe_send_eod_report(
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+    *,
+    now: datetime | None = None,
+) -> None:
+    if not should_send_eod_report(now, states):
+        return
+
+    metrics = compile_eod_metrics(
+        states,
+        WATCHLIST,
+        trade_log_path=TRADE_LOG_FILE,
+        available_cash=ledger.available_cash_usd,
+        now=now,
+    )
+    text = format_eod_report_text(metrics)
+    print(f"[EOD] Sending daily report for {metrics['date']}...")
+    if _telegram_enabled():
+        _run_telegram(send_eod_report(text))
+    else:
+        print(text.replace("\\", ""))
+    mark_eod_report_sent(states)
+    save_persisted_states(states)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1999,6 +2114,12 @@ def main() -> None:
         f"Telegram Alerts     : "
         f"{'ON' if _telegram_enabled() else 'OFF (USE_TELEGRAM_ALERTS=false)'}"
     )
+    print(
+        f"EOD Telegram Report : "
+        f"{'ON (after 16:00 ET)' if use_daily_telegram_report() else 'OFF'}"
+    )
+    if is_dry_run_mode():
+        print("*** KIS DRY-RUN MODE — orders simulated locally, no broker API ***")
     print("=" * 88)
 
     client = KISApiClient()
@@ -2076,6 +2197,7 @@ def main() -> None:
                 continue
 
             if not is_us_regular_market_hours(cycle_started):
+                _maybe_send_eod_report(states, ledger, now=cycle_started)
                 sleep_seconds = seconds_until_us_rth_open(cycle_started)
                 print()
                 print(

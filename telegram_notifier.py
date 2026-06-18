@@ -324,6 +324,15 @@ async def send_system_alert(
     return await _send_message_safe(text, config=config)
 
 
+async def send_eod_report(
+    text: str,
+    *,
+    config: TelegramConfig | None = None,
+) -> Any:
+    """Send a pre-formatted MarkdownV2 end-of-day report."""
+    return await _send_message_safe(text, config=config)
+
+
 def run_telegram_sync(coro) -> Any:
     """Run an async Telegram coroutine from synchronous code."""
     try:

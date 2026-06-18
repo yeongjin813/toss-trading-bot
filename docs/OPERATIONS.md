@@ -21,6 +21,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 10. [Log Management](#log-management)
 11. [Troubleshooting](#troubleshooting)
 12. [Phase 8 — Hardening](#phase-8--hardening)
+13. [Phase 9 — Momentum, Dry-Run & EOD Report](#phase-9--momentum-dry-run--eod-report)
 
 ---
 
@@ -37,7 +38,8 @@ KIS_CANO=your_account_number
 KIS_ACNT_PRDT_CD=01
 
 WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
-USE_SPY_MARKET_FILTER=true
+USE_SPY_MARKET_FILTER=false
+USE_QQQ_REGIME_FILTER=true
 CAPITAL_AT_RISK=100000
 RISK_PER_TRADE=0.01
 LOOP_COOLDOWN_SECONDS=60
@@ -47,6 +49,14 @@ KIS_ORDER_MAX_RETRIES=3
 KIS_ORDER_RETRY_BACKOFF_SECONDS=2.0
 USE_EOD_ATR_STOPS=false
 KIS_ORDER_TYPE=limit
+
+# Momentum Top-N (new BUY only)
+MOMENTUM_RANK_ENABLED=true
+MOMENTUM_TOP_N=5
+
+# Safety & reporting
+KIS_DRY_RUN=false
+USE_DAILY_TELEGRAM_REPORT=true
 
 USE_TELEGRAM_ALERTS=false
 TELEGRAM_BOT_TOKEN=your_bot_token_here
@@ -76,8 +86,11 @@ Stop with `Ctrl+C`. State persists to `trading_state.json`.
 | Calendar | NY time (ET) | Behavior | KIS API |
 |---|---|---|---|
 | Weekend / holiday | any | Sleep `MARKET_CLOSED_SLEEP_SECONDS` (3600s) | **None** |
-| Weekday | Outside 09:30–16:00 | Sleep until RTH (wake ≤ every 3600s) | **None** |
+| Weekday | Before 09:30 | Sleep until RTH (wake ≤ every 3600s) | **None** |
 | Weekday | 09:30–16:00 (RTH) | Watchlist cycle every 60s | **Active** |
+| Weekday | After 16:00 | EOD Telegram report (once), then sleep until next RTH | **None** (report only) |
+
+See [Live System Flow](../README.md#live-system-flow) for the full gate and fill pipeline.
 
 **Log tags**
 
@@ -303,6 +316,9 @@ sudo truncate -s 0 project_metrics.log
 | CRITICAL reconcile `500` | Transient KIS error — bot continues; retry next RTH cycle |
 | All HOLD, no trades | Normal — liquidity/signal gates; not necessarily a bug |
 | Alerts on PC but not EC2 | Add Telegram vars to server `.env` and restart |
+| ccnl/nccs HTTP 500 + pending lock | Bot retries + broker holdings fallback; check `[FILL/BROKER-FB]` logs |
+| TSLA filled but state stuck | Run reconcile at startup; verify `held_quantity` in `trading_state.json` |
+| Test signals without broker risk | Set `KIS_DRY_RUN=true` — instant local fills, no KIS order API |
 
 VTS incident history: [README Appendix A](../README.md#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses).
 
@@ -322,10 +338,40 @@ Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-ha
 
 ---
 
+## Phase 9 — Momentum, Dry-Run & EOD Report
+
+| Feature | Env / file | What it does |
+|---|---|---|
+| Momentum Top-N | `MOMENTUM_RANK_ENABLED`, `MOMENTUM_TOP_N` | Friday rebalance; only Top-N tickers get new BUY (exits always run) |
+| QQQ half-size regime | `USE_QQQ_REGIME_FILTER=true` | Half position when SPY &lt; 200MA and QQQ &gt; 200MA |
+| Fill sync fallback | `execution_engine.py` | On ccnl/nccs HTTP 500, infer fill from `present-balance` |
+| Walk-forward benchmarks | `python run_backtest.py --walk-forward --yfinance` | Strat vs equal-weight B&H vs SPY alpha table |
+| Dry-run | `KIS_DRY_RUN=true` | Simulate instant fills; logs `DRY_RUN` in `trade_log.csv` |
+| EOD report | `USE_DAILY_TELEGRAM_REPORT=true` | Telegram summary after 16:00 ET once per session |
+
+**Production EC2 defaults (live trading):**
+
+```ini
+MOMENTUM_RANK_ENABLED=true
+MOMENTUM_TOP_N=5
+USE_QQQ_REGIME_FILTER=true
+KIS_DRY_RUN=false
+USE_DAILY_TELEGRAM_REPORT=true
+```
+
+**Safe signal testing on EC2:** set `KIS_DRY_RUN=true`, restart `toss-bot`, confirm startup banner shows `*** KIS DRY-RUN MODE ***`, then set back to `false` before real orders.
+
+Full architecture: [README Live System Flow](../README.md#live-system-flow) · [Phase 9](../README.md#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06).
+
+---
+
 ## Verification Tests
 
 ```powershell
 python test_analytics.py
 python test_execution_engine.py
+python test_momentum_ranker.py
+python test_backtest_benchmarks.py
+python test_daily_report.py
 python test_telegram_notifier.py
 ```

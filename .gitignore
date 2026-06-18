@@ -3,6 +3,8 @@ kis_token_cache.json
 __pycache__/
 *.pyc
 project_metrics.log
+project_metrics_aws.log
 trade_log.csv
+trade_log_test.csv
 trading_state.json
 order_retry_queue.json

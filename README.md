@@ -4,9 +4,10 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | Phase 8 — Hardening: NYSE calendar merge, API latency telemetry, order retry queue, EOD ATR parity mode, CI |
-| **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — signal params isolated per symbol |
-| **Regime Filter** | Dual MA: ticker-isolated `SMA_SHORT` + fixed 50-day `SMA_LONG` baseline |
+| **System Status** | Phase 9 — Strategy overhaul: momentum Top-N, dual entry/staged exits, SPY+QQQ regime, dry-run, EOD Telegram, walk-forward benchmarks |
+| **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM entry regimes |
+| **Universe Filter** | `momentum_ranker.py` — weekly Top-N from 15-ticker watchlist; gates **new BUY only** |
+| **Regime Filter** | SPY 200MA gate + optional QQQ half-size when SPY bear / QQQ bull (`USE_QQQ_REGIME_FILTER`) |
 | **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
 | **Account** | Set in `.env` — `KIS_CANO`, `KIS_ACNT_PRDT_CD` (never commit) |
@@ -17,7 +18,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Timeline Alignment** | All dispatchable signals (`BUY`/`SELL`/`DYNAMIC_ATR_SELL`) bound to NY RTH 09:30–16:00 ET |
 | **Reconciliation** | `PortfolioReconciliationEngine` — KIS `VTRP6504R` broker-vs-local sync at startup + daily RTH |
 | **Fill Verification** | `OrderFillMonitor` — ccnl/nccs poll; state mutates only on confirmed fills; `trade_log.csv` |
-| **Mobile Alerts** | `telegram_notifier.py` — trade reports + system alerts via Telegram Bot API (optional) |
+| **Mobile Alerts** | `telegram_notifier.py` — trade reports + system alerts + **EOD summary** (after 16:00 ET) |
+| **Dry-Run Mode** | `KIS_DRY_RUN=true` — simulate instant fills locally (no broker API) |
 | **Risk Posture** | Documented in Sections 11–14 — backtest/live parity gaps, reconciliation vectors, monitoring telemetry |
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
@@ -33,7 +35,51 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **[docs/OPERATIONS.md](docs/OPERATIONS.md)** | **Operators** | Deploy, monitor, `.env`, EC2, Telegram, troubleshooting |
 | **README.md** (this file) | Engineers / researchers | Strategy math, architecture, backtest parity, API reference |
 
-**Quick links:** [Improvement journey (why & how)](#improvement-journey--what-changed-and-why) · [Run the bot](docs/OPERATIONS.md#local-setup) · [EC2 deploy](docs/OPERATIONS.md#deploy-to-ec2) · [Env vars](#appendix-c-configuration-externalization-matrix)
+**Quick links:** [Live system flow](#live-system-flow) · [Improvement journey (why & how)](#improvement-journey--what-changed-and-why) · [Run the bot](docs/OPERATIONS.md#local-setup) · [EC2 deploy](docs/OPERATIONS.md#deploy-to-ec2) · [Env vars](#appendix-c-configuration-externalization-matrix)
+
+---
+
+## Live System Flow
+
+End-to-end path from startup through one trading day. Operator commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
+
+```mermaid
+flowchart TD
+    A[Startup: load .env + KIS token] --> B[Bootstrap 756-bar OHLCV cache]
+    B --> C[Portfolio reconcile VTRP6504R]
+    C --> D{Friday or forced?}
+    D -->|Yes| E[Momentum rebalance Top-N]
+    D -->|No| F[RTH watchlist cycle]
+    E --> F
+    F --> G[Per ticker: signals + gates]
+    G --> H{Signal BUY/SELL?}
+    H -->|Dry-run| I[Instant local fill]
+    H -->|Live| J[KIS order + fill poll]
+    I --> K[Update state + trade_log + Telegram]
+    J --> K
+    K --> L{More tickers?}
+    L -->|Yes| G
+    L -->|No| M[60s cooldown]
+    M --> N{Still RTH?}
+    N -->|Yes| F
+    N -->|No| O{After 16:00 ET?}
+    O -->|Yes| P[EOD Telegram report once/day]
+    O -->|No| Q[Sleep until RTH]
+    P --> Q
+    Q --> F
+```
+
+**Gate order inside each ticker evaluation** (all must pass for a new BUY):
+
+1. **Calendar** — NYSE session day (not weekend/holiday)
+2. **RTH** — 09:30–16:00 America/New_York
+3. **Pending lock** — no open unfilled order on this ticker
+4. **Momentum** — ticker in Top-N active list (new BUY only; exits always run)
+5. **SPY/QQQ regime** — SPY ≤ 200MA blocks BUY; half size when SPY bear + QQQ bull
+6. **RiskGuard** — daily loss, max positions, per-ticker exposure
+7. **Signal engine** — regime-specific entry (dual / breakout / crossover) + staged exits
+
+**Fill path:** `rt_cd=0` → ccnl/nccs poll → on HTTP 500 fallback to `present-balance` holdings → state mutates only on confirmed fill.
 
 ---
 
@@ -59,7 +105,12 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 | **8.4** | Live intraday `session_low` ≠ backtest daily `Low` → false confidence in backtest P&L. | `USE_EOD_ATR_STOPS=true` switches to daily bar low (backtest parity). | Set in `.env`; log `ATR Stop Mode : EOD` |
 | **8.5** | Stop proximity visible only on `DYNAMIC_ATR_SELL` banner. | `Trigger Floor Dist` every cycle when positioned. | `[METRICS]` block in Section 9 |
 | **8.6** | Tests only run manually before deploy. | GitHub Actions runs all `test_*.py` on push/PR. | `.github/workflows/ci.yml` |
-| **—** | *Still open:* strategy alpha vs buy-and-hold, VTS≠real account, 60s poll latency. | Documented in Phase 8 footer + Section 11; not auto-fixable in one patch. | Track in Section 14 checklist |
+| **9.0** | Fixed 15-ticker trading dilutes capital; no alpha vs B&H benchmark. | Weekly **momentum ranker** — trade Top 5 from universe; walk-forward vs B&H/SPY. | `momentum_ranker.py`, `run_backtest.py --walk-forward` |
+| **9.1** | One entry/exit style for all vol profiles; weak staged risk management. | **MEGA / HIGH_BETA / MOMENTUM** regimes; dual entry + hard stop + profit trail + 2-day below 50MA. | `config.py`, `analytics.py` |
+| **9.2** | SPY-only macro gate missed QQQ-led rallies in SPY bear. | **SPY+QQQ regime** — half position size when SPY&lt;200MA and QQQ&gt;200MA. | `USE_QQQ_REGIME_FILTER`, `market_registry.py` |
+| **9.3** | VTS ccnl/nccs HTTP 500 left fills unsynced (e.g. TSLA phantom pending). | Retry + broker `present-balance` fallback + reconcile pending clear. | `execution_engine.py`, `5ed98ac` |
+| **9.4** | No safe way to test signals on EC2; no daily P&L push. | `KIS_DRY_RUN` instant-fill sim; **EOD Telegram** after 16:00 ET. | `daily_report.py`, `KIS_DRY_RUN`, `USE_DAILY_TELEGRAM_REPORT` |
+| **—** | *Still open:* strategy alpha vs buy-and-hold, VIX filter, real-account guard. | Documented in Phase 8 footer + Section 11. | Track in Section 14 checklist |
 
 > **Operator path:** after Step 8.0, day-to-day commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.  
 > **Researcher path:** strategy math stays in Sections 2–8 below.
@@ -179,7 +230,30 @@ Closed gaps from [Section 12](#12-pre-deployment-critical-architectural-flaws--h
 | **8.7** | Ops mixed into 2k-line README | Split [docs/OPERATIONS.md](docs/OPERATIONS.md) | `docs/` |
 
 **Recommended for backtest-aligned live runs:** set `USE_EOD_ATR_STOPS=true` in `.env`.  
-**Still open (not auto-fixable):** strategy alpha vs buy-and-hold, VTS→real-account migration, 60s polling latency, per-ticker parameter tuning.
+**Recommended for production VTS:** `MOMENTUM_RANK_ENABLED=true`, `USE_QQQ_REGIME_FILTER=true`, `USE_DAILY_TELEGRAM_REPORT=true`, `KIS_DRY_RUN=false`.  
+**Still open (not auto-fixable):** sustained alpha vs buy-and-hold, VTS→real-account migration, 60s polling latency, VIX filter.
+
+### Phase 9: Momentum Universe, Strategy Overhaul & Ops Polish *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **Momentum Top-N ranker** | `momentum_ranker.py` | 3M/6M/12M return + volume stability; Friday rebalance; gates new BUY only |
+| **Three entry regimes** | `config.py` | MEGA (dual), HIGH_BETA (dual), MOMENTUM (breakout-only) |
+| **Staged exits** | `analytics.py` | Hard stop (−5% or 2×ATR), profit trail (+15% arms, −10% from peak), 2-day below 50MA |
+| **SPY+QQQ regime sizing** | `analytics.py` + `main.py` | Normal / half size / risk-off from SPY+QQQ 200MA |
+| **Fill sync hardening** | `execution_engine.py` | ccnl/nccs retry + broker holdings fallback on VTS HTTP 500 |
+| **Walk-forward benchmarks** | `backtest_benchmarks.py` | Equal-weight B&H + SPY alpha columns in `--walk-forward` table |
+| **Dry-run mode** | `main.py` | `KIS_DRY_RUN=true` — instant simulated fills, no KIS order API |
+| **EOD Telegram report** | `daily_report.py` | Once per NY session after 16:00 ET — equity, day PnL, fills, holdings |
+
+**Verify:**
+
+```powershell
+python run_backtest.py --walk-forward --yfinance
+python test_momentum_ranker.py
+python test_backtest_benchmarks.py
+python test_daily_report.py
+```
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -1629,6 +1703,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `MARKET_CLOSED_SLEEP_SECONDS` | No | `3600` | Holiday/weekend sleep |
 | `KIS_REQUEST_TIMEOUT_SECONDS` | No | `30` | KIS HTTP read timeout (all API calls) |
 | `USE_SPY_MARKET_FILTER` | No | `true` | Block BUY when SPY ≤ 200MA |
+| `USE_QQQ_REGIME_FILTER` | No | `true` | Half position size when SPY bear + QQQ bull |
 | `KIS_ORDER_TYPE` | No | `limit` on VTS URL | `limit` or `market` |
 | `KIS_LIMIT_PRICE_BUFFER_BPS` | No | `10` | Default limit buffer vs reference close |
 | `KIS_HIGH_VOL_LIMIT_BUFFER_BPS` | No | `15` | NVDA/TSLA/PLTR/CRWD/AMD/META buffer |
@@ -1644,8 +1719,23 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `KIS_ORDER_MAX_RETRIES` | No | `3` | Inline + queued order retry attempts for transient failures |
 | `KIS_ORDER_RETRY_BACKOFF_SECONDS` | No | `2.0` | Base exponential backoff between order retries |
 | `ORDER_RETRY_QUEUE_FILE` | No | `./order_retry_queue.json` | Persistent retry queue (auto-generated) |
+| `KIS_DRY_RUN` | No | `false` | `true` = simulate orders locally (instant fill, no KIS order API) |
 
-#### Telegram Alerts (Phase 7)
+#### Momentum Rank (Phase 9)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MOMENTUM_RANK_ENABLED` | No | `true` | Enable weekly Top-N universe filter |
+| `MOMENTUM_TOP_N` | No | `5` | Number of tickers eligible for new BUY |
+| `MOMENTUM_REBALANCE_WEEKDAY` | No | `4` | Rebalance day (0=Mon … 4=Fri) |
+| `MOMENTUM_WEIGHT_3M` | No | `0.4` | 3-month return weight |
+| `MOMENTUM_WEIGHT_6M` | No | `0.3` | 6-month return weight |
+| `MOMENTUM_WEIGHT_12M` | No | `0.2` | 12-month return weight |
+| `MOMENTUM_WEIGHT_VOLUME` | No | `0.1` | Volume stability weight |
+| `MOMENTUM_REQUIRE_SMA50` | No | `true` | Require price above 50MA for ranking |
+| `MOMENTUM_REQUIRE_SMA200` | No | `false` | Require price above 200MA for ranking |
+
+#### Telegram Alerts (Phase 7 + 9)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -1654,6 +1744,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `TELEGRAM_CHAT_ID` | If alerts on | — | Numeric user or group chat id |
 | `TELEGRAM_MAX_RETRIES` | No | `3` | Send retry count |
 | `TELEGRAM_BACKOFF_SECONDS` | No | `1.0` | Base backoff (exponential: `2^attempt` seconds) |
+| `USE_DAILY_TELEGRAM_REPORT` | No | `true` | EOD summary after 16:00 ET (once per NY session) |
 
 > **Deprecated for signal generation:** `SMA_PERIOD`, `ATR_MULTIPLIER`, `RSI_BUY_THRESHOLD`, `VOLUME_THRESHOLD`, `RSI_EXIT_MODE`, and related strategy keys in `.env` are **ignored**. Edit `config.py` to change execution parameters.
 
@@ -1691,8 +1782,14 @@ Toss Trading Bot/
 ├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing
 ├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates
 ├── portfolio_backtest.py   # Consolidated portfolio backtest (default live-parity path)
+├── momentum_ranker.py      # P9: weekly Top-N momentum universe filter
+├── backtest_benchmarks.py  # P9: B&H / SPY benchmark helpers for walk-forward
+├── daily_report.py         # P9: EOD metrics + Telegram report formatting
 ├── run_backtest.py         # CLI: portfolio backtest, --walk-forward, --isolated legacy, --random smoke test
 ├── test_analytics.py       # Engine verification (trend filter + conditional RSI tests)
+├── test_momentum_ranker.py
+├── test_backtest_benchmarks.py
+├── test_daily_report.py
 ├── requirements.txt        # Python dependencies (includes python-telegram-bot>=21.0)
 ├── .env.example            # Configuration template (copy to .env)
 ├── .gitignore              # Excludes .env, kis_token_cache.json, trading_state.json
