@@ -133,8 +133,9 @@ def verify_o1_replay(engine: LiveSignalEngine, enriched: pd.DataFrame) -> Positi
     return state
 
 
-def verify_bar_transitions(engine: LiveSignalEngine) -> None:
+def verify_bar_transitions() -> None:
     """Simulate BUY, peak tracking, and intra-bar DYNAMIC_ATR_SELL transitions."""
+    engine = LiveSignalEngine("NVDA")
     print("=" * 88)
     print("TEST 3: BAR-BY-BAR STATE TRANSITIONS")
     print("=" * 88)
@@ -180,9 +181,9 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
     rise_bar = BarSnapshot(
         date=datetime(2024, 6, 3).date(),
         open=101.0,
-        high=112.0,
-        low=108.5,
-        close=110.0,
+        high=122.0,
+        low=118.5,
+        close=120.0,
         volume=2_200_000.0,
         sma_short=100.0,
         sma_long=97.0,
@@ -194,10 +195,12 @@ def verify_bar_transitions(engine: LiveSignalEngine) -> None:
     print(f"Step 2 - HOLD signal : {hold_result['signal']}")
     print(f"         Updated peak : {state.highest_price_achieved}")
     print(f"         Trigger floor: {state.trigger_floor}")
+    print(f"         Profit trail armed: {state.profit_trail_armed}")
 
     assert hold_result["signal"] == "HOLD"
-    assert state.highest_price_achieved == 110.0
-    assert state.trigger_floor == 110.0 - (2.0 * engine.config.atr_multiplier)
+    assert state.highest_price_achieved == 120.0
+    assert state.profit_trail_armed is True
+    assert state.trigger_floor == 120.0 - (2.0 * engine.config.atr_multiplier)
 
     prev_bar = rise_bar
     trigger_floor = float(state.trigger_floor)
@@ -312,7 +315,7 @@ def verify_config_registry() -> None:
 
     print(f"NVDA regime          : SMA={nvda.sma_period} ATR={nvda.atr_multiplier}")
     print(f"PLTR regime          : trend_filter={pltr.use_trend_filter}")
-    print(f"AAPL (DEFAULT)       : SMA={aapl.sma_period} vol={aapl.volume_threshold}")
+    print(f"AAPL (MEGA)          : SMA={aapl.sma_period} mode={aapl.entry_mode}")
     print("Config isolation     : PASS")
     print()
 
@@ -475,7 +478,7 @@ def main() -> int:
     raw_df = build_synthetic_market_data(rows=120)
     enriched = verify_indicator_computation(engine, raw_df)
     verify_o1_replay(engine, enriched)
-    verify_bar_transitions(engine)
+    verify_bar_transitions()
     verify_external_state_roundtrip(engine, enriched)
     verify_trend_filter_and_conditional_rsi(engine)
     verify_trend_filter_and_conditional_rsi(LiveSignalEngine("NVDA"))

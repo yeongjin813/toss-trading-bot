@@ -40,6 +40,7 @@ from analytics import (
     describe_us_market_closure,
     is_us_equity_session,
     is_us_regular_market_hours,
+    market_regime_snapshot,
     seconds_until_us_rth_open,
     spy_regime_snapshot,
     use_eod_atr_stops,
@@ -49,6 +50,7 @@ from market_registry import (
     BENCHMARK_SMA_PERIOD,
     BENCHMARK_TICKER,
     MARKET_META,
+    SECONDARY_BENCHMARK_TICKER,
     parse_watchlist,
     validate_watchlist_routing,
 )
@@ -112,6 +114,7 @@ ORDER_RVSECNCL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 
 WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
 USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
+USE_QQQ_REGIME_FILTER = StrategyConfigMapper.use_qqq_regime_filter()
 MOMENTUM_SETTINGS = MomentumRankSettings.from_env()
 
 ANALYTICS_SMA_PERIOD = 20
@@ -305,6 +308,10 @@ def validate_environment() -> None:
     if USE_SPY_MARKET_FILTER and BENCHMARK_TICKER not in MARKET_META:
         raise RuntimeError(
             f"SPY market filter enabled but {BENCHMARK_TICKER} is missing MARKET_META routing."
+        )
+    if USE_QQQ_REGIME_FILTER and SECONDARY_BENCHMARK_TICKER not in MARKET_META:
+        raise RuntimeError(
+            f"QQQ regime filter enabled but {SECONDARY_BENCHMARK_TICKER} is missing MARKET_META routing."
         )
 
 
@@ -1619,16 +1626,28 @@ def process_ticker(
     RISK_GUARD.update_daily_equity_anchor(states, portfolio_equity)
 
     market_bullish = True
+    position_size_multiplier = 1.0
+    market_regime_label = "normal"
     spy_close: float | None = None
     spy_sma: float | None = None
     if USE_SPY_MARKET_FILTER:
         try:
             spy_df = cache.get_frame(BENCHMARK_TICKER)
-            market_bullish, spy_close, spy_sma = spy_regime_snapshot(
+            qqq_df = None
+            if USE_QQQ_REGIME_FILTER:
+                try:
+                    qqq_df = cache.get_frame(SECONDARY_BENCHMARK_TICKER)
+                except KeyError:
+                    print(f"[WARN] {SECONDARY_BENCHMARK_TICKER} not bootstrapped — QQQ regime skipped")
+            regime, spy_close, spy_sma = market_regime_snapshot(
                 spy_df,
+                qqq_df,
                 current_bar_date,
                 StrategyConfigMapper.MARKET_BENCHMARK_SMA_PERIOD,
             )
+            market_bullish = regime.allow_new_buys
+            position_size_multiplier = regime.position_size_multiplier
+            market_regime_label = regime.label
         except KeyError:
             print(f"[WARN] {BENCHMARK_TICKER} not bootstrapped — market filter skipped")
 
@@ -1642,7 +1661,10 @@ def process_ticker(
         portfolio_equity=portfolio_equity,
         current_price=current_price,
         market_bullish=market_bullish,
+        position_size_multiplier=position_size_multiplier,
     )
+    cycle["market_regime"] = market_regime_label
+    cycle["position_size_multiplier"] = position_size_multiplier
     cycle["spy_close"] = spy_close
     cycle["spy_sma"] = spy_sma
     cycle["available_capital"] = ledger.available_cash_usd
@@ -1698,6 +1720,12 @@ def process_ticker(
             return "HOLD"
 
         if signal == "BUY":
+            if position_size_multiplier <= 0:
+                print(f"[GATE/REGIME] {ticker} BUY blocked — market risk-off")
+                states[ticker] = engine.dump_state(runtime)
+                save_persisted_states(states)
+                return "HOLD"
+
             if active_trade_tickers is not None and not is_new_buy_allowed(
                 ticker,
                 active_trade_tickers,
@@ -1935,7 +1963,11 @@ def main() -> None:
     )
     print(
         f"SPY Market Filter   : "
-        f"{'ON (BUY only when SPY > 200MA)' if USE_SPY_MARKET_FILTER else 'OFF'}"
+        f"{'ON (regime gate)' if USE_SPY_MARKET_FILTER else 'OFF'}"
+    )
+    print(
+        f"QQQ Regime Filter   : "
+        f"{'ON (half size when SPY<200MA & QQQ>200MA)' if USE_QQQ_REGIME_FILTER else 'OFF'}"
     )
     print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
     print(
@@ -1984,6 +2016,8 @@ def main() -> None:
     bootstrap_tickers = list(WATCHLIST)
     if USE_SPY_MARKET_FILTER and BENCHMARK_TICKER not in bootstrap_tickers:
         bootstrap_tickers.append(BENCHMARK_TICKER)
+    if USE_QQQ_REGIME_FILTER and SECONDARY_BENCHMARK_TICKER not in bootstrap_tickers:
+        bootstrap_tickers.append(SECONDARY_BENCHMARK_TICKER)
     cache.bootstrap(bootstrap_tickers)
 
     states = load_persisted_states()

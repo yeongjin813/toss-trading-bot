@@ -17,12 +17,14 @@ from analytics import (
     BarSnapshot,
     LiveSignalEngine,
     PositionState,
+    build_market_regime_lookup,
     build_spy_regime_lookup,
     calculate_position_size,
+    resolve_market_regime,
     resolve_spy_market_bullish,
 )
 from config import StrategyConfig, StrategyConfigMapper
-from market_registry import BENCHMARK_SMA_PERIOD
+from market_registry import BENCHMARK_SMA_PERIOD, SECONDARY_BENCHMARK_TICKER
 from momentum_ranker import (
     MomentumRankSettings,
     is_new_buy_allowed,
@@ -175,6 +177,9 @@ def _apply_buy_state(
     series.state.in_position = True
     series.state.held_quantity = shares
     series.state.highest_price_achieved = bar.close
+    series.state.entry_price = bar.close
+    series.state.days_below_sma_long = 0
+    series.state.profit_trail_armed = False
     series.engine._update_trailing_state(series.state, bar.close, bar.atr)
     series.state.last_processed_date = bar_date
 
@@ -188,6 +193,9 @@ def _apply_sell_state(series: TickerBacktestSeries, bar_date: str) -> None:
     series.state.dynamic_stop_distance = None
     series.state.trigger_floor = None
     series.state.session_low = None
+    series.state.entry_price = None
+    series.state.days_below_sma_long = 0
+    series.state.profit_trail_armed = False
     series.state.last_processed_date = bar_date
 
 
@@ -231,6 +239,7 @@ class PortfolioBacktestEngine:
         commission_rate: float = 0.001,
         use_spy_market_filter: bool | None = None,
         spy_df: pd.DataFrame | None = None,
+        qqq_df: pd.DataFrame | None = None,
         momentum_settings: MomentumRankSettings | None = None,
     ) -> None:
         self.initial_cash = initial_cash
@@ -244,8 +253,20 @@ class PortfolioBacktestEngine:
             else use_spy_market_filter
         )
         self.spy_lookup: dict[str, bool] | None = None
+        self.regime_lookup = None
         if self.use_spy_market_filter and spy_df is not None and not spy_df.empty:
-            self.spy_lookup = build_spy_regime_lookup(spy_df, BENCHMARK_SMA_PERIOD)
+            if (
+                StrategyConfigMapper.use_qqq_regime_filter()
+                and qqq_df is not None
+                and not qqq_df.empty
+            ):
+                self.regime_lookup = build_market_regime_lookup(
+                    spy_df,
+                    qqq_df,
+                    sma_period=BENCHMARK_SMA_PERIOD,
+                )
+            else:
+                self.spy_lookup = build_spy_regime_lookup(spy_df, BENCHMARK_SMA_PERIOD)
         self.series_map: dict[str, TickerBacktestSeries] = {}
 
         for ticker in tickers:
@@ -324,7 +345,7 @@ class PortfolioBacktestEngine:
             holdings = self._holdings_snapshot(mark_prices)
 
             exit_events: list[tuple[TickerBacktestSeries, BarSnapshot, str]] = []
-            entry_events: list[tuple[TickerBacktestSeries, BarSnapshot]] = []
+            entry_events: list[tuple[TickerBacktestSeries, BarSnapshot, float]] = []
             trailing_updates: list[tuple[TickerBacktestSeries, BarSnapshot, BarSnapshot]] = []
 
             for ticker in self.watchlist:
@@ -341,7 +362,7 @@ class PortfolioBacktestEngine:
                         series.state,
                         bar,
                         prev_bar,
-                        mutate_state=False,
+                        mutate_state=True,
                         allow_crossover=True,
                     )
                     if exit_check["signal"] in {"SELL", "DYNAMIC_ATR_SELL"}:
@@ -351,10 +372,16 @@ class PortfolioBacktestEngine:
                     else:
                         trailing_updates.append((series, bar, prev_bar))
                 else:
-                    market_bullish = resolve_spy_market_bullish(
-                        self.spy_lookup,
-                        bar_date,
-                    )
+                    if self.regime_lookup is not None:
+                        regime = resolve_market_regime(self.regime_lookup, bar_date)
+                        market_bullish = regime.allow_new_buys
+                        size_multiplier = regime.position_size_multiplier
+                    else:
+                        market_bullish = resolve_spy_market_bullish(
+                            self.spy_lookup,
+                            bar_date,
+                        )
+                        size_multiplier = 1.0 if market_bullish else 0.0
                     entry_check = series.engine.evaluate_bar(
                         series.state,
                         bar,
@@ -368,7 +395,7 @@ class PortfolioBacktestEngine:
                         self._active_trade_tickers,
                         settings=self.momentum_settings,
                     ):
-                        entry_events.append((series, bar))
+                        entry_events.append((series, bar, size_multiplier))
 
             for series, bar, signal in exit_events:
                 if series.shares <= 0:
@@ -401,8 +428,12 @@ class PortfolioBacktestEngine:
             for series, bar, prev_bar in trailing_updates:
                 _update_in_position_trailing(series, bar, prev_bar)
 
-            for series, bar in entry_events:
+            for series, bar, size_multiplier in entry_events:
                 if series.shares > 0:
+                    continue
+
+                if size_multiplier <= 0:
+                    series.engine._clear_position_fields(series.state)
                     continue
 
                 mark_prices = self._mark_prices(bar_date)
@@ -420,6 +451,8 @@ class PortfolioBacktestEngine:
                 )
                 if shares <= 0:
                     continue
+                if size_multiplier < 1.0:
+                    shares = max(1, int(shares * size_multiplier))
 
                 gross = shares * bar.close
                 commission = gross * self.commission_rate
@@ -518,6 +551,7 @@ def run_portfolio_backtest(
     commission_rate: float = 0.001,
     use_spy_market_filter: bool | None = None,
     spy_df: pd.DataFrame | None = None,
+    qqq_df: pd.DataFrame | None = None,
     momentum_settings: MomentumRankSettings | None = None,
 ) -> PortfolioBacktestResult:
     """Convenience wrapper for consolidated portfolio simulation."""
@@ -529,6 +563,7 @@ def run_portfolio_backtest(
         commission_rate=commission_rate,
         use_spy_market_filter=use_spy_market_filter,
         spy_df=spy_df,
+        qqq_df=qqq_df,
         momentum_settings=momentum_settings,
     )
     return engine.run()

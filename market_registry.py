@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 BENCHMARK_TICKER = "SPY"
+SECONDARY_BENCHMARK_TICKER = "QQQ"
 BENCHMARK_SMA_PERIOD = 200
 
 DEFAULT_WATCHLIST: list[str] = [
@@ -41,6 +42,7 @@ MARKET_META: dict[str, dict[str, str]] = {
     "SHOP": {"excd": "NYS", "ovrs_excg_cd": "NYSE"},
     "UBER": {"excd": "NYS", "ovrs_excg_cd": "NYSE"},
     "SPY": {"excd": "AMS", "ovrs_excg_cd": "AMEX"},
+    "QQQ": {"excd": "NAS", "ovrs_excg_cd": "NASD"},
 }
 
 

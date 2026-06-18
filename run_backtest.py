@@ -28,7 +28,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from config import StrategyConfigMapper
-from market_registry import BENCHMARK_TICKER, DEFAULT_WATCHLIST, parse_watchlist
+from market_registry import BENCHMARK_TICKER, DEFAULT_WATCHLIST, SECONDARY_BENCHMARK_TICKER, parse_watchlist
 from momentum_ranker import MomentumRankSettings
 from portfolio_backtest import (
     PortfolioBacktestResult,
@@ -531,12 +531,19 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
         return 1
 
     spy_df: pd.DataFrame | None = None
+    qqq_df: pd.DataFrame | None = None
     if use_spy_filter:
         try:
             spy_df = fetch_yfinance_ohlcv(BENCHMARK_TICKER, start=YFINANCE_WARMUP_START)
+            if StrategyConfigMapper.use_qqq_regime_filter():
+                qqq_df = fetch_yfinance_ohlcv(
+                    SECONDARY_BENCHMARK_TICKER,
+                    start=YFINANCE_WARMUP_START,
+                )
         except Exception as exc:
             print(f"[WARN] Could not load {BENCHMARK_TICKER}: {exc} - filter disabled.")
             use_spy_filter = False
+            qqq_df = None
 
     summary_rows: list[dict[str, Any]] = []
     for label, start, end in WALK_FORWARD_WINDOWS:
@@ -558,6 +565,7 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
             commission_rate=args.commission,
             use_spy_market_filter=use_spy_filter,
             spy_df=spy_df,
+            qqq_df=qqq_df,
             momentum_settings=momentum_settings,
         )
         summary_rows.append(
@@ -667,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     spy_df: pd.DataFrame | None = None
+    qqq_df: pd.DataFrame | None = None
     if use_spy_filter and not args.random:
         try:
             if args.yfinance or args.walk_forward:
@@ -680,9 +689,16 @@ def main(argv: list[str] | None = None) -> int:
                 spy_df = load_daily_csv(spy_path)
                 if spy_df is None:
                     spy_df = fetch_yfinance_ohlcv(BENCHMARK_TICKER, start=YFINANCE_WARMUP_START)
+            if StrategyConfigMapper.use_qqq_regime_filter():
+                qqq_df = fetch_yfinance_ohlcv(
+                    SECONDARY_BENCHMARK_TICKER,
+                    start=args.start or YFINANCE_WARMUP_START,
+                    end=args.end,
+                )
         except Exception as exc:
             print(f"[WARN] SPY benchmark unavailable ({exc}) - market filter disabled.")
             use_spy_filter = False
+            qqq_df = None
 
     if args.isolated:
         rows = [
@@ -700,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
         commission_rate=args.commission,
         use_spy_market_filter=use_spy_filter,
         spy_df=spy_df,
+        qqq_df=qqq_df,
         momentum_settings=momentum_settings,
     )
 

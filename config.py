@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import ClassVar, Mapping
+from typing import ClassVar, Literal, Mapping
 
 from market_registry import BENCHMARK_SMA_PERIOD, BENCHMARK_TICKER
+
+EntryMode = Literal["dual", "breakout", "crossover"]
 
 
 @dataclass(frozen=True)
@@ -19,12 +21,10 @@ class TickerConfig:
     """
     Regime-scoped parameter bundle keyed to volatility/trend personality.
 
-    Fields map directly to the optimization matrix:
-      sma_period       — short-term crossover window (entry/exit SMA)
-      rsi_buy_threshold — minimum RSI for long entry authorization
-      volume_threshold  — volume_mult: current volume / volume_sma gate
-      atr_multiplier    — ATR trailing stop width multiplier
-      use_trend_filter  — enable 50-day SMA regime gate + conditional RSI exit
+    entry_mode:
+      dual      — breakout OR pullback OR golden cross
+      breakout  — 20-day high breakout (momentum names)
+      crossover — legacy golden cross only
     """
 
     sma_period: int
@@ -32,16 +32,21 @@ class TickerConfig:
     volume_threshold: float
     atr_multiplier: float
     use_trend_filter: bool
+    entry_mode: EntryMode = "dual"
+    breakout_lookback: int = 20
+    stop_loss_pct: float = 0.05
+    hard_stop_atr_mult: float = 2.0
+    trend_exit_days: int = 2
+    profit_trail_activation_pct: float = 0.15
+    profit_trail_drawdown_pct: float = 0.10
+    pullback_rsi_low: float = 40.0
+    pullback_rsi_high: float = 60.0
+    pullback_ma_tolerance_pct: float = 3.0
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """
-    Fully resolved, ticker-bound configuration for live and backtest engines.
-
-    sma_period is ticker-isolated (short SMA / Golden-Death cross).
-    sma_long_period is fixed at 50 (macro regime filter baseline).
-    """
+    """Fully resolved, ticker-bound configuration for live and backtest engines."""
 
     ticker: str
     sma_period: int
@@ -49,6 +54,16 @@ class StrategyConfig:
     volume_threshold: float
     atr_multiplier: float
     use_trend_filter: bool
+    entry_mode: EntryMode
+    breakout_lookback: int
+    stop_loss_pct: float
+    hard_stop_atr_mult: float
+    trend_exit_days: int
+    profit_trail_activation_pct: float
+    profit_trail_drawdown_pct: float
+    pullback_rsi_low: float
+    pullback_rsi_high: float
+    pullback_ma_tolerance_pct: float
     rsi_period: int = 14
     atr_period: int = 14
     volume_sma_period: int = 20
@@ -58,7 +73,6 @@ class StrategyConfig:
 
     @classmethod
     def from_ticker_config(cls, ticker: str, regime: TickerConfig) -> StrategyConfig:
-        """Materialize a StrategyConfig from an isolated TickerConfig regime."""
         return cls(
             ticker=ticker.upper(),
             sma_period=regime.sma_period,
@@ -66,6 +80,16 @@ class StrategyConfig:
             volume_threshold=regime.volume_threshold,
             atr_multiplier=regime.atr_multiplier,
             use_trend_filter=regime.use_trend_filter,
+            entry_mode=regime.entry_mode,
+            breakout_lookback=regime.breakout_lookback,
+            stop_loss_pct=regime.stop_loss_pct,
+            hard_stop_atr_mult=regime.hard_stop_atr_mult,
+            trend_exit_days=regime.trend_exit_days,
+            profit_trail_activation_pct=regime.profit_trail_activation_pct,
+            profit_trail_drawdown_pct=regime.profit_trail_drawdown_pct,
+            pullback_rsi_low=regime.pullback_rsi_low,
+            pullback_rsi_high=regime.pullback_rsi_high,
+            pullback_ma_tolerance_pct=regime.pullback_ma_tolerance_pct,
         )
 
 
@@ -73,29 +97,44 @@ class StrategyConfigMapper:
     """
     Parameter isolation matrix: ticker symbol -> StrategyConfig.
 
-    Hardcoded optimized regimes (no .env execution overrides):
-
-      NVDA    — high volatility / strong trend
-      PLTR    — high volatility / breakout (no trend filter)
-      DEFAULT — conservative baseline (AAPL and all unlisted symbols)
+    Regimes:
+      MEGA_CAP   — AAPL, MSFT, GOOGL, AMZN (dual entry, SMA 20)
+      HIGH_BETA  — NVDA, META, AVGO, NFLX (dual, SMA 10, wider ATR)
+      MOMENTUM   — PLTR, TSLA, CRWD, AMD (breakout-first, no 50MA gate)
+      DEFAULT    — TSM, SHOP, UBER and unlisted symbols
     """
 
     SMA_LONG_PERIOD: ClassVar[int] = 50
 
-    _NVDA: ClassVar[TickerConfig] = TickerConfig(
+    _MEGA: ClassVar[TickerConfig] = TickerConfig(
+        sma_period=20,
+        rsi_buy_threshold=45.0,
+        volume_threshold=0.65,
+        atr_multiplier=2.5,
+        use_trend_filter=True,
+        entry_mode="dual",
+        stop_loss_pct=0.05,
+    )
+
+    _HIGH_BETA: ClassVar[TickerConfig] = TickerConfig(
         sma_period=10,
         rsi_buy_threshold=40.0,
         volume_threshold=0.55,
         atr_multiplier=3.0,
         use_trend_filter=True,
+        entry_mode="dual",
+        profit_trail_drawdown_pct=0.12,
     )
 
-    _PLTR: ClassVar[TickerConfig] = TickerConfig(
+    _MOMENTUM: ClassVar[TickerConfig] = TickerConfig(
         sma_period=10,
-        rsi_buy_threshold=42.0,
+        rsi_buy_threshold=40.0,
         volume_threshold=0.60,
-        atr_multiplier=2.5,
+        atr_multiplier=3.5,
         use_trend_filter=False,
+        entry_mode="breakout",
+        profit_trail_activation_pct=0.12,
+        profit_trail_drawdown_pct=0.12,
     )
 
     _DEFAULT: ClassVar[TickerConfig] = TickerConfig(
@@ -104,17 +143,25 @@ class StrategyConfigMapper:
         volume_threshold=0.65,
         atr_multiplier=2.0,
         use_trend_filter=True,
+        entry_mode="dual",
     )
 
     _EXPLICIT: ClassVar[Mapping[str, TickerConfig]] = {
-        "NVDA": _NVDA,
-        "PLTR": _PLTR,
-        "TSLA": _PLTR,
-        "AMD": _PLTR,
-        "CRWD": _PLTR,
-        "META": _NVDA,
-        "NFLX": _NVDA,
-        "AVGO": _NVDA,
+        # Mega-cap trend
+        "AAPL": _MEGA,
+        "MSFT": _MEGA,
+        "GOOGL": _MEGA,
+        "AMZN": _MEGA,
+        # High-beta trend
+        "NVDA": _HIGH_BETA,
+        "META": _HIGH_BETA,
+        "AVGO": _HIGH_BETA,
+        "NFLX": _HIGH_BETA,
+        # Speculative momentum
+        "PLTR": _MOMENTUM,
+        "TSLA": _MOMENTUM,
+        "CRWD": _MOMENTUM,
+        "AMD": _MOMENTUM,
     }
 
     MARKET_BENCHMARK_TICKER: ClassVar[str] = BENCHMARK_TICKER
@@ -130,23 +177,28 @@ class StrategyConfigMapper:
         }
 
     @classmethod
+    def use_qqq_regime_filter(cls) -> bool:
+        return os.getenv("USE_QQQ_REGIME_FILTER", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @classmethod
     def resolve_regime(cls, ticker: str) -> TickerConfig:
-        """Return the hardcoded TickerConfig for a symbol."""
         normalized = ticker.strip().upper()
         return cls._EXPLICIT.get(normalized, cls._DEFAULT)
 
     @classmethod
     def for_ticker(cls, ticker: str) -> StrategyConfig:
-        """Return the fully resolved StrategyConfig for execution."""
         normalized = ticker.strip().upper()
         regime = cls.resolve_regime(normalized)
         return StrategyConfig.from_ticker_config(normalized, regime)
 
     @classmethod
     def registered_tickers(cls) -> tuple[str, ...]:
-        """Symbols with explicit regime mappings (others use DEFAULT)."""
         return tuple(sorted(cls._EXPLICIT.keys()))
 
 
-# Backward-compatible alias
 StrategyConfigRegistry = StrategyConfigMapper
