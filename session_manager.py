@@ -6,7 +6,7 @@ and broker-vs-local portfolio reconciliation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from analytics import (
@@ -184,11 +184,14 @@ def _parse_broker_holdings(
     watchset = set(watchlist)
     qty_fields = (
         "ovrs_stck_tot_qty",
+        "cblc_qty13",
         "hldg_qty",
         "cblc_qty",
         "ovrs_cblc_qty",
         "tot_qty",
         "ord_psbl_qty",
+        "ord_psbl_qty1",
+        "ccld_qty_smtl1",
     )
     symbol_fields = ("ovrs_pdno", "pdno", "symb", "prdt_name")
 
@@ -219,6 +222,117 @@ def _parse_broker_holdings(
         holdings[symbol] = max(quantity, 0)
 
     return holdings
+
+
+def _present_balance_qty_unreliable(
+    payload: dict[str, Any],
+    broker_holdings: dict[str, int],
+) -> bool:
+    """VTS present-balance often lists symbols but returns zero qty fields."""
+    if sum(broker_holdings.values()) > 0:
+        return False
+
+    rows = payload.get("output1") or []
+    if not isinstance(rows, list) or not rows:
+        return False
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ("frcr_evlu_amt2", "frcr_pchs_amt", "evlu_pfls_rt1"):
+            raw = row.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                if float(str(raw).replace(",", "")) != 0.0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+
+    output3 = payload.get("output3") or {}
+    if isinstance(output3, list):
+        output3 = output3[0] if output3 else {}
+    if isinstance(output3, dict):
+        for key in ("evlu_amt_smtl", "tot_asst_amt", "frcr_evlu_tota"):
+            try:
+                if float(output3.get(key) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+
+    return any(isinstance(row, dict) and row.get("pdno") for row in rows)
+
+
+def _holdings_from_ccnl(
+    client: Any,
+    watchlist: list[str],
+    *,
+    lookback_days: int = 120,
+) -> dict[str, int]:
+    """Aggregate net filled overseas qty from ccnl when present-balance qty is empty."""
+    holdings: dict[str, int] = {ticker: 0 for ticker in watchlist}
+    watchset = set(watchlist)
+    end = datetime.now()
+    start = end - timedelta(days=lookback_days)
+
+    try:
+        rows = client.fetch_overseas_order_ccnl(
+            start.strftime("%Y%m%d"),
+            end.strftime("%Y%m%d"),
+        )
+    except Exception as exc:
+        print(f"[RECONCILE/CCNL-FB] ccnl aggregation failed: {exc}")
+        return holdings
+
+    if not isinstance(rows, list):
+        return holdings
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("pdno") or "").strip().upper()
+        if not symbol or symbol not in watchset:
+            continue
+
+        raw_qty = row.get("ccld_qty") or row.get("ft_ord_qty") or row.get("ord_qty")
+        if raw_qty in (None, ""):
+            continue
+        try:
+            qty = int(float(str(raw_qty).replace(",", "")))
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+
+        side = str(row.get("sll_buy_dvsn_cd") or row.get("sll_buy_dvsn") or "")
+        if side in {"01", "1"}:
+            holdings[symbol] -= qty
+        else:
+            holdings[symbol] += qty
+
+    return {ticker: max(qty, 0) for ticker, qty in holdings.items()}
+
+
+def resolve_broker_holdings(
+    client: Any,
+    watchlist: list[str],
+    payload: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Present-balance first; ccnl fill aggregation when VTS qty fields are empty."""
+    if payload is None:
+        payload = client.fetch_overseas_present_balance(natn_cd="840")
+
+    broker_holdings = _parse_broker_holdings(payload, watchlist)
+    if _present_balance_qty_unreliable(payload, broker_holdings):
+        ccnl_holdings = _holdings_from_ccnl(client, watchlist)
+        if sum(ccnl_holdings.values()) > 0:
+            print(
+                "[RECONCILE/CCNL-FB] present-balance qty empty — "
+                "using ccnl fill aggregation"
+            )
+            broker_holdings = ccnl_holdings
+
+    return broker_holdings
 
 
 def _parse_broker_cash(payload: dict[str, Any]) -> tuple[float, float]:
@@ -282,7 +396,11 @@ class PortfolioReconciliationEngine:
 
         try:
             payload = client.fetch_overseas_present_balance(natn_cd="840")
-            broker_holdings = _parse_broker_holdings(payload, self.watchlist)
+            broker_holdings = resolve_broker_holdings(
+                client,
+                self.watchlist,
+                payload,
+            )
             broker_cash, available_cash = _parse_broker_cash(payload)
 
             if available_cash <= 0 and broker_cash > 0:

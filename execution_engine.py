@@ -405,10 +405,10 @@ class OrderFillMonitor:
             or 0
         )
         try:
-            from session_manager import _parse_broker_holdings
+            from session_manager import resolve_broker_holdings
 
             payload = client.fetch_overseas_present_balance(natn_cd="840")
-            holdings = _parse_broker_holdings(payload, [ticker])
+            holdings = resolve_broker_holdings(client, [ticker], payload)
             qty = int(holdings.get(ticker, 0))
             portfolio = states.setdefault("_portfolio", {})
             portfolio.setdefault("broker_holdings", {})[ticker] = qty
