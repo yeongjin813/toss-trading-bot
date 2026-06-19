@@ -109,10 +109,13 @@ def compute_top3_rebalance_orders(
     now: datetime | None = None,
     settings: MomentumRankSettings | None = None,
     force: bool = False,
+    broker_holdings: Mapping[str, int] | None = None,
 ) -> tuple[Top3ShadowState, list[Top3SimulatedOrder], list[str]]:
     """
     Return updated shadow state and simulated orders for a rebalance pass.
-    Does not mutate broker state.
+
+    When broker_holdings is supplied (Phase 4 live), deltas use the shared
+    broker account as source-of-truth instead of shadow-only quantities.
     """
     cfg = settings or MomentumRankSettings.from_env()
     cfg = MomentumRankSettings(
@@ -165,7 +168,23 @@ def compute_top3_rebalance_orders(
     orders: list[Top3SimulatedOrder] = []
     logs: list[str] = []
 
-    for ticker, shares in list(shadow.holdings.items()):
+    def current_shares(ticker: str) -> int:
+        if broker_holdings is not None:
+            return int(broker_holdings.get(ticker, 0) or 0)
+        return int(shadow.holdings.get(ticker, 0) or 0)
+
+    held_tickers: set[str] = set()
+    if broker_holdings is not None:
+        held_tickers = {
+            ticker
+            for ticker in universe
+            if int(broker_holdings.get(ticker, 0) or 0) > 0
+        }
+    else:
+        held_tickers = {t for t, q in shadow.holdings.items() if q > 0}
+
+    for ticker in held_tickers:
+        shares = current_shares(ticker)
         if shares > 0 and ticker not in target and ticker in prices:
             orders.append(
                 Top3SimulatedOrder(
@@ -193,7 +212,7 @@ def compute_top3_rebalance_orders(
         if ticker not in prices:
             continue
         price = prices[ticker]
-        current = shadow.holdings.get(ticker, 0)
+        current = current_shares(ticker)
         target_shares = int(per_slot / price) if price > 0 else 0
         delta = target_shares - current
         if delta < 0:

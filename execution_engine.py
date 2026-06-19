@@ -37,6 +37,7 @@ class ExecutionSettings:
     max_daily_loss_usd: float
     max_open_positions: int
     max_ticker_exposure_usd: float
+    max_portfolio_usd: float
     rth_buy_block_open_minutes: int
     rth_buy_block_close_minutes: int
     pending_order_stale_minutes: int
@@ -50,6 +51,12 @@ class ExecutionSettings:
             max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "100")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
             max_ticker_exposure_usd=float(os.getenv("MAX_TICKER_EXPOSURE_USD", "1000")),
+            max_portfolio_usd=float(
+                os.getenv(
+                    "MAX_PORTFOLIO_USD",
+                    os.getenv("CAPITAL_AT_RISK", "10000"),
+                )
+            ),
             rth_buy_block_open_minutes=int(os.getenv("RTH_BUY_BLOCK_OPEN_MINUTES", "10")),
             rth_buy_block_close_minutes=int(os.getenv("RTH_BUY_BLOCK_CLOSE_MINUTES", "5")),
             pending_order_stale_minutes=int(
@@ -216,10 +223,15 @@ class RiskGuard:
         states: dict[str, Any],
         *,
         now: datetime | None = None,
+        deployable_cash_usd: float | None = None,
+        portfolio_deployed_usd: float = 0.0,
     ) -> str | None:
         block = self._portfolio_block(states, now)
         if block:
             return block
+
+        if deployable_cash_usd is not None and deployable_cash_usd <= 0:
+            return "no deployable cash (portfolio at or above capital cap)"
 
         open_positions = sum(
             1
@@ -237,10 +249,27 @@ class RiskGuard:
             )
 
         notional = proposed_size * entry_price
-        if notional > self.settings.max_ticker_exposure_usd:
+        held_qty = int(ticker_state.get("held_quantity", 0) or 0)
+        existing_notional = held_qty * entry_price
+        if existing_notional + notional > self.settings.max_ticker_exposure_usd:
             return (
-                f"max ticker exposure (${notional:.2f} > "
+                f"max ticker exposure (${existing_notional + notional:.2f} > "
                 f"${self.settings.max_ticker_exposure_usd:.2f})"
+            )
+
+        if portfolio_deployed_usd + notional > self.settings.max_portfolio_usd:
+            return (
+                f"portfolio cap (${portfolio_deployed_usd + notional:.2f} > "
+                f"${self.settings.max_portfolio_usd:.2f})"
+            )
+
+        if (
+            deployable_cash_usd is not None
+            and notional > deployable_cash_usd * 1.01
+        ):
+            return (
+                f"insufficient deployable cash (${notional:.2f} > "
+                f"${deployable_cash_usd:.2f})"
             )
         return None
 

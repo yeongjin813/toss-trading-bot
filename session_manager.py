@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Mapping
 
 from analytics import (
     BarSnapshot,
@@ -374,6 +374,45 @@ def _parse_broker_cash(payload: dict[str, Any]) -> tuple[float, float]:
     return broker_cash, available_cash
 
 
+def holdings_notional_usd(
+    states: Mapping[str, Any],
+    watchlist: list[str],
+    prices: Mapping[str, float],
+) -> float:
+    """Mark-to-market notional for open watchlist positions."""
+    total = 0.0
+    for ticker in watchlist:
+        payload = states.get(ticker, {})
+        qty = 0
+        if isinstance(payload, dict):
+            qty = int(payload.get("held_quantity", 0) or 0)
+        if qty <= 0:
+            continue
+        mark = float(prices.get(ticker, 0.0) or 0.0)
+        if mark > 0:
+            total += qty * mark
+    return total
+
+
+def align_deployable_cash(
+    *,
+    broker_cash_usd: float,
+    capital_at_risk: float,
+    holdings_notional_usd: float,
+    fallback_cash_usd: float,
+) -> float:
+    """
+    Infer deployable cash when VTS returns broker USD=0.
+
+    Caps deployment at capital_at_risk minus marked holdings; returns 0 when over-deployed.
+    """
+    if broker_cash_usd > 0:
+        return broker_cash_usd
+    if holdings_notional_usd <= 0:
+        return fallback_cash_usd
+    return max(0.0, min(capital_at_risk, capital_at_risk - holdings_notional_usd))
+
+
 class PortfolioReconciliationEngine:
     """
     Synchronize local trading_state.json with broker-held quantities and cash.
@@ -391,6 +430,8 @@ class PortfolioReconciliationEngine:
         states: dict[str, Any],
         *,
         fallback_cash: float,
+        capital_at_risk: float | None = None,
+        mark_prices: Mapping[str, float] | None = None,
     ) -> tuple[dict[str, Any], PortfolioLedger, ReconciliationReport]:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -402,11 +443,7 @@ class PortfolioReconciliationEngine:
                 payload,
             )
             broker_cash, available_cash = _parse_broker_cash(payload)
-
-            if available_cash <= 0 and broker_cash > 0:
-                available_cash = broker_cash
-            if available_cash <= 0:
-                available_cash = fallback_cash
+            cap = float(capital_at_risk or fallback_cash)
 
             mismatches: list[ReconciliationMismatch] = []
 
@@ -466,6 +503,23 @@ class PortfolioReconciliationEngine:
                 )
             else:
                 print("[RECONCILE] Broker holdings match local ledger - no override required")
+
+            marked_notional = holdings_notional_usd(
+                states,
+                self.watchlist,
+                mark_prices or {},
+            )
+            available_cash = align_deployable_cash(
+                broker_cash_usd=broker_cash,
+                capital_at_risk=cap,
+                holdings_notional_usd=marked_notional,
+                fallback_cash_usd=fallback_cash,
+            )
+            if marked_notional > cap and broker_cash <= 0:
+                print(
+                    f"[RECONCILE/CAP] Marked holdings ${marked_notional:,.2f} "
+                    f"exceed ${cap:,.2f} cap — deployable cash set to $0"
+                )
 
             print(
                 f"[RECONCILE] Broker cash USD={broker_cash:,.2f} | "

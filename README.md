@@ -25,7 +25,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Holdings ccnl-fb reconcile · `f1bf7fc` · EOD/Top3 sync · `4689c11` · Phase 4 dual 60/40 · `8ae5852`
+**Latest production commits:** Capital cap + deployable cash inference · `HEAD` · ccnl-fb reconcile · `f1bf7fc` · EOD/Top3 sync · `4689c11`
 
 ---
 
@@ -306,11 +306,14 @@ python test_analytics.py
 | **ccnl reconcile fallback** | `session_manager.py` | `[RECONCILE/CCNL-FB]` when present-balance qty is empty — aggregates `ccld_qty` by symbol over a date window |
 | **EOD holdings fallback** | `daily_report.py` | Telegram EOD prefers `_portfolio.broker_holdings` when local `held_quantity` lags; ⚠️ sync warning if reconcile failed |
 | **Top3 Phase 4 lifecycle** | `main.py` | Live Top3 orders append `trade_log.csv` (`top3 odno=…`); post-batch `force=True` reconcile + fill monitor |
+| **Deployable cash inference** | `session_manager.py` + `main.py` | When VTS USD cash=0: `available_cash = max(0, CAPITAL_AT_RISK − marked holdings)`; `[RECONCILE/CAP]` when over-deployed |
+| **Portfolio buy gates** | `execution_engine.py` + `main.py` | `MAX_PORTFOLIO_USD` (defaults to `CAPITAL_AT_RISK`); blocks new BUY when deployable cash ≤ 0 or ticker/portfolio cap exceeded |
+| **Top3 broker-aware rebalance** | `top3_strategy.py` | Phase 4 uses live `held_quantity` as current — trims over-size (e.g. duplicate Legacy+Top3 fills) toward Top3 slice targets |
 
 **Known VTS limitations (not auto-fixed):**
 
 - **Off-watchlist holdings** — symbols outside `WATCHLIST` (e.g. RDW) are not tracked; reconcile ignores them.
-- **Cash API zeros** — when broker cash fields return 0, equity sizing may fall back to `CAPITAL_AT_RISK` until the next successful reconcile.
+- **Broker USD cash field** — when nonzero, used directly; otherwise deployable cash is inferred from marks (not broker ledger).
 - **ccnl HTTP 500** — intermittent on VTS; fill poll and reconcile retry on the next RTH cycle.
 
 **Operator check:** `[RECONCILE/CCNL-FB]` / `[RECONCILE/MISMATCH]` in logs; compare KIS app vs `held_quantity` in `trading_state.json`.

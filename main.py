@@ -72,6 +72,8 @@ from session_manager import (
     PortfolioLedger,
     PortfolioReconciliationEngine,
     RegularHoursGate,
+    align_deployable_cash,
+    holdings_notional_usd,
 )
 from telegram_notifier import (
     TelegramConfig,
@@ -1429,25 +1431,51 @@ def print_session_telemetry(
         print(f"Portfolio Equity     : ${cycle['portfolio_equity']:,.2f}")
 
 
+def _watchlist_mark_prices(
+    cache: MarketDataCache,
+    watchlist: list[str],
+) -> dict[str, float]:
+    prices: dict[str, float] = {}
+    for ticker in watchlist:
+        try:
+            frame = cache.get_frame(ticker)
+            prices[ticker] = float(frame.iloc[-1]["Close"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return prices
+
+
+def _refresh_ledger_deployable_cash(
+    ledger: PortfolioLedger,
+    states: dict[str, Any],
+    cache: MarketDataCache,
+) -> PortfolioLedger:
+    """Recompute deployable cash from marks when VTS broker USD is zero."""
+    prices = _watchlist_mark_prices(cache, WATCHLIST)
+    marked = holdings_notional_usd(states, WATCHLIST, prices)
+    ledger.available_cash_usd = align_deployable_cash(
+        broker_cash_usd=ledger.broker_cash_usd,
+        capital_at_risk=CAPITAL_AT_RISK,
+        holdings_notional_usd=marked,
+        fallback_cash_usd=CAPITAL_AT_RISK,
+    )
+    portfolio = states.setdefault("_portfolio", {})
+    portfolio["available_cash_usd"] = ledger.available_cash_usd
+    portfolio["marked_holdings_usd"] = marked
+    return ledger
+
+
 def _estimate_portfolio_equity(
     ledger: PortfolioLedger,
     states: dict[str, Any],
     cache: MarketDataCache,
 ) -> float:
-    """Mark-to-market equity: broker cash + open position notionals."""
-    equity = ledger.available_cash_usd
-    for ticker in WATCHLIST:
-        ticker_state = states.get(ticker, {})
-        shares = int(ticker_state.get("held_quantity", 0) or 0)
-        if shares <= 0:
-            continue
-        try:
-            frame = cache.get_frame(ticker)
-            mark = float(frame.iloc[-1]["Close"])
-            equity += shares * mark
-        except (KeyError, IndexError, TypeError, ValueError):
-            continue
-    return max(equity, ledger.available_cash_usd)
+    """Mark-to-market equity: broker cash (when known) + open position notionals."""
+    prices = _watchlist_mark_prices(cache, WATCHLIST)
+    holdings_val = holdings_notional_usd(states, WATCHLIST, prices)
+    if ledger.broker_cash_usd > 0:
+        return ledger.broker_cash_usd + holdings_val
+    return holdings_val + max(0.0, ledger.available_cash_usd)
 
 
 def _should_run_session_reconciliation(states: dict[str, Any], now: datetime) -> bool:
@@ -1475,6 +1503,7 @@ def run_session_reconciliation(
     states: dict[str, Any],
     *,
     force: bool = False,
+    cache: MarketDataCache | None = None,
 ) -> tuple[dict[str, Any], PortfolioLedger]:
     """Broker-vs-local sync with automatic override on quantity mismatch."""
     now = datetime.now()
@@ -1487,14 +1516,19 @@ def run_session_reconciliation(
             ),
             last_reconciled_at=cached.get("last_reconciled_at"),
         )
+        if cache is not None:
+            ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
         return states, ledger
 
     print("[RECONCILE] Starting broker portfolio synchronization...")
     states.setdefault("_portfolio", {})["last_reconcile_attempt_at"] = now.isoformat()
+    mark_prices = _watchlist_mark_prices(cache, WATCHLIST) if cache is not None else {}
     states, ledger, report = _reconciliation_engine.reconcile(
         client,
         states,
         fallback_cash=CAPITAL_AT_RISK,
+        capital_at_risk=CAPITAL_AT_RISK,
+        mark_prices=mark_prices,
     )
     if not report.reconciled and report.error:
         level = (
@@ -1727,6 +1761,16 @@ def process_ticker(
                 current_price,
                 states,
                 now=datetime.now(),
+                deployable_cash_usd=(
+                    ledger.available_cash_usd * legacy_fraction
+                    if DEPLOYMENT.is_dual
+                    else ledger.available_cash_usd
+                ),
+                portfolio_deployed_usd=holdings_notional_usd(
+                    states,
+                    WATCHLIST,
+                    _watchlist_mark_prices(cache, WATCHLIST),
+                ),
             )
             if risk_block:
                 print(f"[GATE/RISK] {ticker} BUY blocked — {risk_block}")
@@ -1827,6 +1871,10 @@ def run_top3_shadow_cycle(
 
     portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
     shadow = load_top3_state(states)
+    broker_holdings = {
+        ticker: int(states.get(ticker, {}).get("held_quantity", 0) or 0)
+        for ticker in WATCHLIST
+    }
     shadow, orders, logs = compute_top3_rebalance_orders(
         cache,
         WATCHLIST,
@@ -1835,6 +1883,7 @@ def run_top3_shadow_cycle(
         deploy=DEPLOYMENT,
         now=datetime.now(),
         settings=_MOMENTUM_RAW,
+        broker_holdings=broker_holdings if DEPLOYMENT.top3_live_orders else None,
     )
 
     if not logs and not orders:
@@ -1848,8 +1897,17 @@ def run_top3_shadow_cycle(
         print(line)
 
     if DEPLOYMENT.top3_live_orders:
+        top3_cash = ledger.available_cash_usd * DEPLOYMENT.top3_capital_fraction()
         for order in orders:
             side = "BUY" if order.side == "BUY" else "SELL"
+            if side == "BUY":
+                est_cost = order.shares * order.reference_price
+                if top3_cash <= 0 or est_cost > top3_cash * 1.01:
+                    print(
+                        f"[TOP3/GATE] {order.ticker} BUY {order.shares} blocked — "
+                        f"deployable ${top3_cash:,.2f} < est ${est_cost:,.2f}"
+                    )
+                    continue
             try:
                 payload = execute_broker_order(
                     client,
@@ -1875,7 +1933,10 @@ def run_top3_shadow_cycle(
                 )
             except Exception as exc:
                 print(f"[TOP3/ERROR] {order.ticker} {order.side} failed: {exc}")
-        states, ledger = run_session_reconciliation(client, states, force=True)
+        states, ledger = run_session_reconciliation(
+            client, states, force=True, cache=cache
+        )
+        ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
         FILL_MONITOR.resolve_all_pending(
             client,
             states,
@@ -1927,7 +1988,8 @@ def run_watchlist_cycle(
         )
         return states, ledger
 
-    states, ledger = run_session_reconciliation(client, states)
+    states, ledger = run_session_reconciliation(client, states, cache=cache)
+    ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
     FILL_MONITOR.resolve_all_pending(
         client,
         states,
@@ -2029,13 +2091,18 @@ def _maybe_send_eod_report(
     ledger: PortfolioLedger,
     *,
     client: KISApiClient | None = None,
+    cache: MarketDataCache | None = None,
     now: datetime | None = None,
 ) -> None:
     if not should_send_eod_report(now, states):
         return
 
     if client is not None:
-        states, ledger = run_session_reconciliation(client, states, force=True)
+        states, ledger = run_session_reconciliation(
+            client, states, force=True, cache=cache
+        )
+        if cache is not None:
+            ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
         FILL_MONITOR.resolve_all_pending(
             client,
             states,
@@ -2186,7 +2253,8 @@ def main() -> None:
     log_configured_capital_model()
 
     print("[P3] Running startup portfolio reconciliation...")
-    states, ledger = run_session_reconciliation(client, states, force=True)
+    states, ledger = run_session_reconciliation(client, states, force=True, cache=cache)
+    ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
     FILL_MONITOR.resolve_all_pending(
         client,
         states,
@@ -2241,7 +2309,9 @@ def main() -> None:
                         f"[CACHE] Finalized {finalized} forming bar(s) into "
                         "completed EOD history (disk-safe)"
                     )
-                _maybe_send_eod_report(states, ledger, client=client, now=cycle_started)
+                _maybe_send_eod_report(
+                    states, ledger, client=client, cache=cache, now=cycle_started
+                )
                 sleep_seconds = seconds_until_us_rth_open(cycle_started)
                 print()
                 print(
