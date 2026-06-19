@@ -25,7 +25,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Phase 4 dual 60/40 · `8ae5852` · Phase 11 crossover hold · `8879f61` · Phase 10 · `770d2b4`
+**Latest production commits:** Holdings ccnl-fb reconcile · `f1bf7fc` · EOD/Top3 sync · `4689c11` · Phase 4 dual 60/40 · `8ae5852`
 
 ---
 
@@ -111,7 +111,9 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 | **9.2** | SPY-only macro gate missed QQQ-led rallies in SPY bear. | **SPY+QQQ regime** — half position size when SPY&lt;200MA and QQQ&gt;200MA. | `USE_QQQ_REGIME_FILTER`, `market_registry.py` |
 | **9.3** | VTS ccnl/nccs HTTP 500 left fills unsynced (e.g. TSLA phantom pending). | Retry + broker `present-balance` fallback + reconcile pending clear. | `execution_engine.py`, `5ed98ac` |
 | **9.4** | No safe way to test signals on EC2; no daily P&L push. | `KIS_DRY_RUN` instant-fill sim; **EOD Telegram** after 16:00 ET. | `daily_report.py`, `KIS_DRY_RUN`, `USE_DAILY_TELEGRAM_REPORT` |
-| **—** | *Still open:* strategy alpha vs buy-and-hold, VIX filter, real-account guard. | Documented in Phase 8 footer + Section 11. | Track in Section 14 checklist |
+| **9.5** | VTS `present-balance` lists symbols but **qty fields are zero** while holdings exist. | Reconcile substitutes net qty from `inquire-ccnl` aggregation (`[RECONCILE/CCNL-FB]`). | `session_manager.py`, `f1bf7fc` |
+| **9.6** | EOD report showed stale local qty; Top3 Phase 4 orders skipped trade log + reconcile. | EOD prefers `broker_holdings` + sync warning; Top3 live orders → `trade_log` + `force=True` reconcile. | `daily_report.py`, `main.py`, `4689c11` |
+| **—** | *Still open:* strategy alpha vs buy-and-hold, VIX filter, real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency. | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
 
 > **Operator path:** after Step 8.0, day-to-day commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.  
 > **Researcher path:** strategy math stays in Sections 2–8 below.
@@ -295,6 +297,23 @@ python test_analytics.py
 | **Compare CLI** | `run_backtest.py --strategy compare` | Legacy vs Top3 side-by-side on same window |
 
 **Production (Phase 4):** `CAPITAL_AT_RISK=100000` → Legacy **$60,000** sizing + Top3 **$40,000** sizing. See [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases-env).
+
+### Phase 13: Broker Holdings Sync & Report Parity *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **VTS qty bug workaround** | `session_manager.py` | When `present-balance` rows show symbols but all qty fields are 0, net position from ccnl fill history replaces the snapshot |
+| **ccnl reconcile fallback** | `session_manager.py` | `[RECONCILE/CCNL-FB]` when present-balance qty is empty — aggregates `ccld_qty` by symbol over a date window |
+| **EOD holdings fallback** | `daily_report.py` | Telegram EOD prefers `_portfolio.broker_holdings` when local `held_quantity` lags; ⚠️ sync warning if reconcile failed |
+| **Top3 Phase 4 lifecycle** | `main.py` | Live Top3 orders append `trade_log.csv` (`top3 odno=…`); post-batch `force=True` reconcile + fill monitor |
+
+**Known VTS limitations (not auto-fixed):**
+
+- **Off-watchlist holdings** — symbols outside `WATCHLIST` (e.g. RDW) are not tracked; reconcile ignores them.
+- **Cash API zeros** — when broker cash fields return 0, equity sizing may fall back to `CAPITAL_AT_RISK` until the next successful reconcile.
+- **ccnl HTTP 500** — intermittent on VTS; fill poll and reconcile retry on the next RTH cycle.
+
+**Operator check:** `[RECONCILE/CCNL-FB]` / `[RECONCILE/MISMATCH]` in logs; compare KIS app vs `held_quantity` in `trading_state.json`.
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -722,6 +741,8 @@ main() startup
 | `output3` | `frcr_use_psbl_amt` | Usable foreign cash (max with output2) |
 
 Watchlist symbols not present in `output1` default to `broker_quantity = 0`.
+
+**VTS qty unreliability:** sandbox `output1` rows may list held symbols with **all quantity fields empty/zero** while ccnl confirms real fills. `resolve_broker_holdings()` detects this and substitutes net quantities from `inquire-ccnl` aggregation. Log tag: `[RECONCILE/CCNL-FB]`. Symbols not in `WATCHLIST` are never ingested.
 
 #### Mismatch Resolution Handler
 
@@ -1386,7 +1407,7 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 
 **Backtest decision (2026-06):** Four-window compare — Top3 wins recent bull windows; Legacy wins 2020–22 bear. **60/40 split** chosen over either strategy alone. No live shadow wait required.
 
-**Limitations:** KIS VTS does not tag orders by strategy. Top3 state in `trading_state.json` → `_portfolio._top3_shadow`. Broker positions are shared — reconcile before phase changes.
+**Limitations:** KIS VTS does not tag orders by strategy. Top3 state in `trading_state.json` → `_portfolio._top3_shadow`. Broker positions are shared — reconcile before phase changes. Off-watchlist holdings are invisible to the bot. EOD equity may lag when broker cash returns 0. ccnl HTTP 500 remains intermittent on VTS — see [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06).
 
 #### Shared Infrastructure Constants
 
