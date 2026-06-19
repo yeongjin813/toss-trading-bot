@@ -25,7 +25,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Capital cap + deployable cash inference · `HEAD` · ccnl-fb reconcile · `f1bf7fc` · EOD/Top3 sync · `4689c11`
+**Latest production commits:** Over-deploy auto-trim · `8a5b6e7` · Capital cap + deployable cash · `290e071` · ccnl-fb reconcile · `f1bf7fc`
 
 ---
 
@@ -214,6 +214,18 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 - **Why it mattered**: Operator had to SSH + `tail -f` to learn the bot failed or traded.
 - **Fix**: `telegram_notifier.py` + fill callbacks; `async with Bot` per message; gated by `USE_TELEGRAM_ALERTS`.
 - **Commit**: `872f7d2` — see [OPERATIONS.md — Phase 7](docs/OPERATIONS.md#phase-7--telegram-integration).
+
+**What Telegram sends (one-way monitor — not a remote control):**
+
+| Channel | Trigger | Example |
+|---|---|---|
+| **Trade report** | `FILLED` / `PARTIAL` on Legacy path | 🟢 BUY 23 TSLA @ $405 |
+| **System CRITICAL** | Auth fail, loop crash, startup validation | 🚨 always pushes (throttled duplicates) |
+| **System WARNING** | KIS 500, reconcile fail, ticker timeout | ⚠️ **RTH only** (09:30–16:00 ET) |
+| **System INFO** | Top3 shadow summary, **over-deploy trim queued/submitted** | ℹ️ trim plan before RTH; trim batch after submit |
+| **EOD report** | Once per NY session after 16:00 ET | Equity, PnL, fills, holdings, deployable cash |
+
+Duplicate CRITICAL spam is suppressed by `TELEGRAM_ALERT_THROTTLE_SECONDS` (default **900**). Diagnose setup: `python telegram_notifier.py --diagnose`.
 
 ### Phase 7.1: RTH-Only Polling & Alert Hardening *(2026-06)*
 
@@ -1885,7 +1897,18 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `TELEGRAM_CHAT_ID` | If alerts on | — | Numeric user or group chat id |
 | `TELEGRAM_MAX_RETRIES` | No | `3` | Send retry count |
 | `TELEGRAM_BACKOFF_SECONDS` | No | `1.0` | Base backoff (exponential: `2^attempt` seconds) |
-| `USE_DAILY_TELEGRAM_REPORT` | No | `true` | EOD summary after 16:00 ET (once per NY session) |
+| `TELEGRAM_ALERT_THROTTLE_SECONDS` | No | `900` | Min seconds between duplicate **CRITICAL** Telegram texts (same message prefix) |
+| `USE_DAILY_TELEGRAM_REPORT` | No | `true` | EOD summary after 16:00 ET (once per NY session); uses `broker_holdings` when local qty lags |
+
+#### Capital Cap & Over-Deployment Trim *(Phase 13)*
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MAX_PORTFOLIO_USD` | No | `CAPITAL_AT_RISK` | Hard portfolio notional cap for new BUY gates |
+| `OVERDEPLOYMENT_TRIM_ENABLED` | No | `false` | At RTH, auto-SELL from largest holdings when marks exceed cap (once/day) |
+| `OVERDEPLOYMENT_TRIM_TARGET_PCT` | No | `0.98` | Trim target = `CAPITAL_AT_RISK ×` this value (e.g. 0.98 → $98k on $100k cap) |
+
+When trim is enabled, **INFO** Telegram messages announce the planned trim (off-hours queue) and submitted trim batch at RTH.
 
 > **Deprecated for signal generation:** `SMA_PERIOD`, `ATR_MULTIPLIER`, `RSI_BUY_THRESHOLD`, `VOLUME_THRESHOLD`, `RSI_EXIT_MODE`, and related strategy keys in `.env` are **ignored**. Edit `config.py` to change execution parameters.
 

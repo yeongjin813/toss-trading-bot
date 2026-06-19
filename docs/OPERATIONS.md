@@ -287,6 +287,20 @@ On EC2: `.venv/bin/python telegram_notifier.py --diagnose`
 - Each message uses `async with Bot(token) as bot:` (v21+ session lifecycle)
 - Gated by `USE_TELEGRAM_ALERTS`
 
+**Message types (monitor only — cannot place orders via Telegram):**
+
+| Type | When | RTH gate |
+|---|---|---|
+| Trade report | Legacy fill `FILLED` / `PARTIAL` | Any time fill occurs |
+| CRITICAL | Crash, auth fail, startup validation | Always (duplicate throttle: `TELEGRAM_ALERT_THROTTLE_SECONDS`) |
+| WARNING | KIS 500, reconcile error, timeouts | Telegram **only during RTH** |
+| INFO | Top3 shadow rebalance, over-deploy trim queued/submitted | Any time |
+| EOD report | After 16:00 ET, once per NY session | `USE_DAILY_TELEGRAM_REPORT` |
+
+Diagnose: `python telegram_notifier.py --diagnose` (EC2: `.venv/bin/python telegram_notifier.py --diagnose`).
+
+**Related capital env (not Telegram-specific but drives INFO trim alerts):** `MAX_PORTFOLIO_USD`, `OVERDEPLOYMENT_TRIM_ENABLED`, `OVERDEPLOYMENT_TRIM_TARGET_PCT` — see [Phase 13 in README](../README.md#phase-13-broker-holdings-sync--report-parity-2026-06).
+
 ---
 
 ## Phase 7.1 — RTH-Only Polling
