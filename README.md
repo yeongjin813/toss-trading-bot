@@ -309,6 +309,7 @@ python test_analytics.py
 | **Deployable cash inference** | `session_manager.py` + `main.py` | When VTS USD cash=0: `available_cash = max(0, CAPITAL_AT_RISK − marked holdings)`; `[RECONCILE/CAP]` when over-deployed |
 | **Portfolio buy gates** | `execution_engine.py` + `main.py` | `MAX_PORTFOLIO_USD` (defaults to `CAPITAL_AT_RISK`); blocks new BUY when deployable cash ≤ 0 or ticker/portfolio cap exceeded |
 | **Top3 broker-aware rebalance** | `top3_strategy.py` | Phase 4 uses live `held_quantity` as current — trims over-size (e.g. duplicate Legacy+Top3 fills) toward Top3 slice targets |
+| **Over-deployment auto-trim** | `overdeployment_trim.py` + `main.py` | When marked holdings > cap: plan SELL from largest positions at RTH (`OVERDEPLOYMENT_TRIM_ENABLED`); one batch per calendar day |
 
 **Known VTS limitations (not auto-fixed):**
 

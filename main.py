@@ -104,6 +104,10 @@ from top3_strategy import (
     load_top3_state,
     save_top3_state,
 )
+from overdeployment_trim import (
+    format_trim_plan_text,
+    plan_overdeployment_trims,
+)
 
 load_dotenv(override=True)
 
@@ -172,6 +176,12 @@ KIS_ORDER_RETRY_BACKOFF_SECONDS = float(os.getenv("KIS_ORDER_RETRY_BACKOFF_SECON
 RECONCILE_RETRY_COOLDOWN_SECONDS = int(os.getenv("RECONCILE_RETRY_COOLDOWN_SECONDS", "900"))
 TELEGRAM_ALERT_THROTTLE_SECONDS = int(os.getenv("TELEGRAM_ALERT_THROTTLE_SECONDS", "900"))
 KIS_SLOW_API_MS = int(os.getenv("KIS_SLOW_API_MS", "3000"))
+OVERDEPLOYMENT_TRIM_ENABLED = os.getenv(
+    "OVERDEPLOYMENT_TRIM_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+OVERDEPLOYMENT_TRIM_TARGET_PCT = float(
+    os.getenv("OVERDEPLOYMENT_TRIM_TARGET_PCT", "0.98")
+)
 _alert_last_sent: dict[str, float] = {}
 
 
@@ -898,6 +908,11 @@ def log_configured_capital_model() -> None:
             f"({DEPLOYMENT.top3_capital_pct:.0f}%)"
         )
     print(f"Risk Per Trade       : {RISK_PER_TRADE * 100:.1f}%")
+    if OVERDEPLOYMENT_TRIM_ENABLED:
+        print(
+            f"Over-Deploy Trim     : enabled "
+            f"(target {OVERDEPLOYMENT_TRIM_TARGET_PCT * 100:.0f}% of cap at RTH)"
+        )
     for ticker in WATCHLIST:
         cfg = StrategyConfigMapper.for_ticker(ticker)
         print(
@@ -1965,6 +1980,107 @@ def run_top3_shadow_cycle(
     return states, ledger
 
 
+def run_overdeployment_trim_if_needed(
+    client: KISApiClient,
+    cache: MarketDataCache,
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+    *,
+    execute: bool = True,
+) -> tuple[dict[str, Any], PortfolioLedger]:
+    """Trim largest holdings when marked notional exceeds CAPITAL_AT_RISK."""
+    if not OVERDEPLOYMENT_TRIM_ENABLED:
+        return states, ledger
+
+    prices = _watchlist_mark_prices(cache, WATCHLIST)
+    trims, marked, target = plan_overdeployment_trims(
+        states,
+        WATCHLIST,
+        prices,
+        capital_at_risk=CAPITAL_AT_RISK,
+        target_pct=OVERDEPLOYMENT_TRIM_TARGET_PCT,
+    )
+    if not trims:
+        return states, ledger
+
+    plan_text = format_trim_plan_text(
+        trims,
+        marked=marked,
+        target=target,
+        capital_at_risk=CAPITAL_AT_RISK,
+    )
+    print(plan_text)
+
+    portfolio = states.setdefault("_portfolio", {})
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if not execute or not is_us_regular_market_hours():
+        print("[TRIM] Deferred until NY regular hours (09:30-16:00 ET)")
+        if _telegram_enabled():
+            _run_telegram(
+                send_system_alert(
+                    "INFO",
+                    plan_text.replace("[TRIM]", "Over-deploy trim queued:"),
+                )
+            )
+        return states, ledger
+
+    if portfolio.get("last_overdeployment_trim_date") == today:
+        print("[TRIM] Trim already submitted today — skipping")
+        return states, ledger
+
+    for order in trims:
+        try:
+            payload = execute_broker_order(
+                client,
+                order.ticker,
+                "SELL",
+                order.shares,
+                order.reference_price,
+            )
+            odno = extract_order_odno(payload) or ""
+            TRADE_LOG.append(
+                {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ticker": order.ticker,
+                    "signal": "SELL",
+                    "qty": order.shares,
+                    "order_price": order.reference_price,
+                    "fill_price": "",
+                    "status": "ACCEPTED",
+                    "reason": f"overdeploy_trim odno={odno}",
+                    "cash_after": ledger.available_cash_usd,
+                    "held_qty": int(
+                        states.get(order.ticker, {}).get("held_quantity", 0) or 0
+                    ),
+                }
+            )
+        except Exception as exc:
+            print(f"[TRIM/ERROR] {order.ticker} SELL {order.shares} failed: {exc}")
+
+    portfolio["last_overdeployment_trim_date"] = today
+    states, ledger = run_session_reconciliation(
+        client, states, force=True, cache=cache
+    )
+    ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
+    FILL_MONITOR.resolve_all_pending(
+        client,
+        states,
+        WATCHLIST,
+        LiveSignalEngine,
+        cash_after=ledger.available_cash_usd,
+    )
+    save_persisted_states(states)
+
+    summary = ", ".join(f"SELL {o.shares} {o.ticker}" for o in trims)
+    print(f"[TRIM] Submitted: {summary}")
+    if _telegram_enabled():
+        _run_telegram(
+            send_system_alert("INFO", f"Over-deployment trim submitted: {summary}")
+        )
+    return states, ledger
+
+
 def run_watchlist_cycle(
     client: KISApiClient,
     cache: MarketDataCache,
@@ -1990,6 +2106,9 @@ def run_watchlist_cycle(
 
     states, ledger = run_session_reconciliation(client, states, cache=cache)
     ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
+    states, ledger = run_overdeployment_trim_if_needed(
+        client, cache, states, ledger, execute=True
+    )
     FILL_MONITOR.resolve_all_pending(
         client,
         states,
@@ -2255,6 +2374,13 @@ def main() -> None:
     print("[P3] Running startup portfolio reconciliation...")
     states, ledger = run_session_reconciliation(client, states, force=True, cache=cache)
     ledger = _refresh_ledger_deployable_cash(ledger, states, cache)
+    states, ledger = run_overdeployment_trim_if_needed(
+        client,
+        cache,
+        states,
+        ledger,
+        execute=is_us_regular_market_hours(),
+    )
     FILL_MONITOR.resolve_all_pending(
         client,
         states,

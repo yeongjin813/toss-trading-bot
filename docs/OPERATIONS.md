@@ -418,12 +418,16 @@ MOMENTUM_TOP_N=3
 MAX_DAILY_LOSS_USD=5000
 MAX_TICKER_EXPOSURE_USD=25000
 MAX_OPEN_POSITIONS=5
+OVERDEPLOYMENT_TRIM_ENABLED=true
+OVERDEPLOYMENT_TRIM_TARGET_PCT=0.98
 USE_QQQ_REGIME_FILTER=true
 KIS_DRY_RUN=false
 USE_DAILY_TELEGRAM_REPORT=true
 ```
 
 **Limitations:** KIS VTS does not tag orders by strategy. Top3 shadow state lives in `trading_state.json` → `_portfolio._top3_shadow`. Phase 4 uses capital-slice sizing; broker positions are shared — reconcile carefully before advancing.
+
+**Over-deployment recovery:** When marked holdings exceed `CAPITAL_AT_RISK`, set `OVERDEPLOYMENT_TRIM_ENABLED=true`. At RTH the bot sells from the largest positions once per day until deployable cash recovers (`[TRIM]` / `[RECONCILE/CAP]` in logs). Manual KIS trim is still valid if you prefer immediate control.
 
 ---
 
