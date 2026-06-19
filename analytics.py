@@ -119,6 +119,10 @@ class PositionState:
     hold_count_bar_date: str | None = None
     days_below_sma_long: int = 0
     profit_trail_armed: bool = False
+    partial_profit_taken: bool = False
+    scale_in_target_qty: int = 0
+    pending_resubmit_side: str | None = None
+    pending_resubmit_qty: int = 0
 
     @property
     def has_position(self) -> bool:
@@ -579,6 +583,51 @@ def build_spy_regime_lookup(
     return lookup
 
 
+def build_spy_golden_cross_lookup(
+    spy_df: pd.DataFrame,
+    *,
+    long_period: int = 200,
+    short_period: int = 50,
+) -> dict[str, bool]:
+    """Map YYYY-MM-DD -> True when SPY short SMA is above long SMA (golden cross)."""
+    frame = spy_df.copy()
+    if "Date" in frame.columns:
+        frame["Date"] = pd.to_datetime(frame["Date"])
+        frame = frame.sort_values("Date").set_index("Date")
+    elif not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index)
+
+    frame = frame.sort_index()
+    frame["SMA_SHORT"] = frame["Close"].rolling(window=short_period, min_periods=short_period).mean()
+    frame["SMA_LONG"] = frame["Close"].rolling(window=long_period, min_periods=long_period).mean()
+    lookup: dict[str, bool] = {}
+    for ts, row in frame.iterrows():
+        short_val = row.get("SMA_SHORT")
+        long_val = row.get("SMA_LONG")
+        if pd.isna(short_val) or pd.isna(long_val):
+            continue
+        lookup[pd.Timestamp(ts).strftime("%Y-%m-%d")] = float(short_val) > float(long_val)
+    return lookup
+
+
+def volatility_adjusted_risk_fraction(
+    base_risk: float,
+    benchmark_atr_pct: float,
+    *,
+    target_vol_pct: float = 0.015,
+) -> float:
+    """
+    Scale per-trade risk down when benchmark realized vol (ATR/close) exceeds target.
+
+    When ATR% is low, risk stays at base_risk (capped at base). When vol spikes,
+    effective risk shrinks proportionally so dollar risk stays vol-normalized.
+    """
+    if base_risk <= 0 or benchmark_atr_pct <= 0 or target_vol_pct <= 0:
+        return base_risk
+    scale = min(1.0, target_vol_pct / benchmark_atr_pct)
+    return base_risk * scale
+
+
 def resolve_spy_market_bullish(
     spy_lookup: dict[str, bool] | None,
     bar_date: str,
@@ -599,6 +648,9 @@ class MarketRegime:
     spy_bullish: bool
     qqq_bullish: bool
     label: str = "normal"
+    max_open_positions: int | None = None
+    spy_golden_cross: bool = True
+    atr_stop_multiplier: float = 1.0
 
     @property
     def market_bullish(self) -> bool:
@@ -611,34 +663,50 @@ def build_market_regime_lookup(
     qqq_df: pd.DataFrame | None,
     *,
     sma_period: int = 200,
+    confirm_sma_period: int = 50,
+    require_golden_cross: bool = True,
+    cautious_max_positions: int = 2,
 ) -> dict[str, MarketRegime]:
-    """Map session date -> market regime using SPY and optional QQQ 200MA."""
+    """Map session date -> market regime using SPY/QQQ 200MA + optional golden cross."""
     spy_lookup = build_spy_regime_lookup(spy_df, sma_period)
+    golden_lookup = build_spy_golden_cross_lookup(
+        spy_df,
+        long_period=sma_period,
+        short_period=confirm_sma_period,
+    )
     qqq_lookup: dict[str, bool] = {}
     if qqq_df is not None and not qqq_df.empty:
         qqq_lookup = build_spy_regime_lookup(qqq_df, sma_period)
 
-    all_dates = set(spy_lookup) | set(qqq_lookup)
+    all_dates = set(spy_lookup) | set(qqq_lookup) | set(golden_lookup)
     regimes: dict[str, MarketRegime] = {}
     for bar_date in sorted(all_dates):
         spy_bull = spy_lookup.get(bar_date, True)
         qqq_bull = qqq_lookup.get(bar_date, spy_bull) if qqq_lookup else spy_bull
+        golden = golden_lookup.get(bar_date, True)
+        if not require_golden_cross:
+            golden = True
 
-        if spy_bull and qqq_bull:
+        if spy_bull and qqq_bull and golden:
             regimes[bar_date] = MarketRegime(
                 allow_new_buys=True,
                 position_size_multiplier=1.0,
                 spy_bullish=True,
                 qqq_bullish=qqq_bull,
                 label="normal",
+                spy_golden_cross=golden,
+                atr_stop_multiplier=1.0,
             )
-        elif not spy_bull and qqq_bull:
+        elif (not spy_bull and qqq_bull) or (spy_bull and qqq_bull and not golden):
             regimes[bar_date] = MarketRegime(
                 allow_new_buys=True,
                 position_size_multiplier=0.5,
-                spy_bullish=False,
-                qqq_bullish=True,
+                spy_bullish=spy_bull,
+                qqq_bullish=qqq_bull,
                 label="cautious",
+                max_open_positions=cautious_max_positions,
+                spy_golden_cross=golden,
+                atr_stop_multiplier=0.85,
             )
         else:
             regimes[bar_date] = MarketRegime(
@@ -647,6 +715,9 @@ def build_market_regime_lookup(
                 spy_bullish=spy_bull,
                 qqq_bullish=qqq_bull,
                 label="risk_off",
+                max_open_positions=0,
+                spy_golden_cross=golden,
+                atr_stop_multiplier=0.7,
             )
     return regimes
 
@@ -675,19 +746,62 @@ def market_regime_snapshot(
     bar_date: str,
     *,
     sma_period: int = 200,
+    confirm_sma_period: int = 50,
+    require_golden_cross: bool = True,
+    cautious_max_positions: int = 2,
 ) -> tuple[MarketRegime, float | None, float | None]:
     """Live snapshot: regime + SPY close/SMA for telemetry."""
     bullish, spy_close, spy_sma = spy_regime_snapshot(spy_df, bar_date, sma_period)
-    lookup = build_market_regime_lookup(spy_df, qqq_df, sma_period=sma_period)
+    lookup = build_market_regime_lookup(
+        spy_df,
+        qqq_df,
+        sma_period=sma_period,
+        confirm_sma_period=confirm_sma_period,
+        require_golden_cross=require_golden_cross,
+        cautious_max_positions=cautious_max_positions,
+    )
     regime = resolve_market_regime(lookup, bar_date)
-    if not qqq_df:
-        regime = MarketRegime(
-            allow_new_buys=bullish,
-            position_size_multiplier=1.0 if bullish else 0.0,
-            spy_bullish=bullish,
-            qqq_bullish=bullish,
-            label="normal" if bullish else "risk_off",
+    if qqq_df is None or getattr(qqq_df, "empty", True):
+        golden_lookup = build_spy_golden_cross_lookup(
+            spy_df,
+            long_period=sma_period,
+            short_period=confirm_sma_period,
         )
+        golden = golden_lookup.get(bar_date, True)
+        if not require_golden_cross:
+            golden = True
+        if bullish and golden:
+            regime = MarketRegime(
+                allow_new_buys=True,
+                position_size_multiplier=1.0,
+                spy_bullish=True,
+                qqq_bullish=True,
+                label="normal",
+                spy_golden_cross=golden,
+                atr_stop_multiplier=1.0,
+            )
+        elif bullish:
+            regime = MarketRegime(
+                allow_new_buys=True,
+                position_size_multiplier=0.5,
+                spy_bullish=True,
+                qqq_bullish=True,
+                label="cautious",
+                max_open_positions=cautious_max_positions,
+                spy_golden_cross=golden,
+                atr_stop_multiplier=0.85,
+            )
+        else:
+            regime = MarketRegime(
+                allow_new_buys=False,
+                position_size_multiplier=0.0,
+                spy_bullish=False,
+                qqq_bullish=False,
+                label="risk_off",
+                max_open_positions=0,
+                spy_golden_cross=golden,
+                atr_stop_multiplier=0.7,
+            )
     return regime, spy_close, spy_sma
 
 
@@ -833,7 +947,12 @@ class LiveSignalEngine:
         return self._in_weak_regime(bar)
 
     def _update_trailing_state(
-        self, state: PositionState, close: float, atr: float
+        self,
+        state: PositionState,
+        close: float,
+        atr: float,
+        *,
+        atr_regime_multiplier: float = 1.0,
     ) -> None:
         if not state.in_position:
             return
@@ -844,8 +963,11 @@ class LiveSignalEngine:
         ):
             state.highest_price_achieved = close
 
+        regime_mult = max(float(atr_regime_multiplier), 0.5)
         state.current_atr = atr
-        state.dynamic_stop_distance = atr * self.config.atr_multiplier
+        state.dynamic_stop_distance = (
+            atr * self.config.atr_multiplier * regime_mult
+        )
         state.trigger_floor = state.highest_price_achieved - state.dynamic_stop_distance
         self._maybe_arm_profit_trail(state, close)
 
@@ -874,6 +996,8 @@ class LiveSignalEngine:
         state.hold_count_bar_date = None
         state.days_below_sma_long = 0
         state.profit_trail_armed = False
+        state.partial_profit_taken = False
+        state.scale_in_target_qty = 0
 
     def _advance_bars_held(self, state: PositionState, bar: BarSnapshot) -> None:
         bar_date = _format_bar_date(bar.date)
@@ -889,19 +1013,49 @@ class LiveSignalEngine:
     def _soft_exit_blocked(self, state: PositionState) -> bool:
         return int(state.bars_held or 0) < int(self.config.min_hold_days or 0)
 
-    def _hard_stop_floor(self, state: PositionState, bar: BarSnapshot) -> float | None:
+    def _hard_stop_floor(
+        self,
+        state: PositionState,
+        bar: BarSnapshot,
+        *,
+        atr_regime_multiplier: float = 1.0,
+    ) -> float | None:
         entry = state.entry_price
         if entry is None or entry <= 0:
             return None
+        regime_mult = max(float(atr_regime_multiplier), 0.5)
         pct_floor = entry * (1.0 - self.config.stop_loss_pct)
-        atr_floor = entry - (bar.atr * self.config.hard_stop_atr_mult)
+        atr_floor = entry - (bar.atr * self.config.hard_stop_atr_mult * regime_mult)
         return min(pct_floor, atr_floor)
 
-    def _hard_stop_triggered(self, state: PositionState, bar: BarSnapshot) -> bool:
-        floor = self._hard_stop_floor(state, bar)
+    def _hard_stop_triggered(
+        self,
+        state: PositionState,
+        bar: BarSnapshot,
+        *,
+        atr_regime_multiplier: float = 1.0,
+    ) -> bool:
+        floor = self._hard_stop_floor(
+            state,
+            bar,
+            atr_regime_multiplier=atr_regime_multiplier,
+        )
         if floor is None:
             return False
         return bar.low <= floor
+
+    def _partial_scale_out_triggered(
+        self,
+        state: PositionState,
+        bar: BarSnapshot,
+    ) -> bool:
+        if state.partial_profit_taken or int(state.held_quantity or 0) < 3:
+            return False
+        entry = state.entry_price
+        if entry is None or entry <= 0:
+            return False
+        gain = (bar.close / entry) - 1.0
+        return gain >= self.config.profit_trail_activation_pct
 
     def _update_trend_exit_counter(
         self, state: PositionState, bar: BarSnapshot, *, mutate: bool
@@ -1096,6 +1250,8 @@ class LiveSignalEngine:
         session_volume_fraction: float = 1.0,
         market_bullish: bool = True,
         momentum_ranked_hold: bool = False,
+        atr_regime_multiplier: float = 1.0,
+        enable_scale_out: bool = True,
     ) -> dict[str, Any]:
         """
         Evaluate one bar using unified priority:
@@ -1129,7 +1285,11 @@ class LiveSignalEngine:
 
             soft_blocked = self._soft_exit_blocked(working_state)
 
-            if self._hard_stop_triggered(working_state, bar):
+            if self._hard_stop_triggered(
+                working_state,
+                bar,
+                atr_regime_multiplier=atr_regime_multiplier,
+            ):
                 if mutate_state:
                     self._clear_position_fields(state)
                 return {
@@ -1140,9 +1300,32 @@ class LiveSignalEngine:
                     "state": working_state.to_dict(),
                 }
 
-            self._update_trailing_state(working_state, bar.close, bar.atr)
+            self._update_trailing_state(
+                working_state,
+                bar.close,
+                bar.atr,
+                atr_regime_multiplier=atr_regime_multiplier,
+            )
             if mutate_state:
                 state.profit_trail_armed = working_state.profit_trail_armed
+
+            if (
+                enable_scale_out
+                and not soft_blocked
+                and self._partial_scale_out_triggered(working_state, bar)
+            ):
+                sell_qty = max(1, int(working_state.held_quantity or 0) // 3)
+                if mutate_state:
+                    state.partial_profit_taken = True
+                    working_state.partial_profit_taken = True
+                return {
+                    "signal": "PARTIAL_SELL",
+                    "exit_reason": "scale_out_partial",
+                    "sell_quantity": sell_qty,
+                    "dynamic_atr_stop": None,
+                    "liquidity_ok": liquidity_ok,
+                    "state": working_state.to_dict(),
+                }
 
             if not soft_blocked and self._profit_trail_triggered(working_state, bar):
                 if mutate_state:
@@ -1358,6 +1541,11 @@ class LiveSignalEngine:
         market_bullish: bool = True,
         position_size_multiplier: float = 1.0,
         momentum_ranked_hold: bool = False,
+        atr_regime_multiplier: float = 1.0,
+        enable_scale_in: bool = True,
+        enable_scale_out: bool = True,
+        entry_filter_df: pd.DataFrame | None = None,
+        entry_filter_date: str | None = None,
     ) -> dict[str, Any]:
         """
         Evaluate one live monitoring cycle with bar-trailing and session gates.
@@ -1487,6 +1675,8 @@ class LiveSignalEngine:
                 session_volume_fraction=session_volume_fraction,
                 market_bullish=market_bullish,
                 momentum_ranked_hold=momentum_ranked_hold,
+                atr_regime_multiplier=atr_regime_multiplier,
+                enable_scale_out=enable_scale_out,
             )
             runtime.days_below_sma_long = eval_state.days_below_sma_long
             runtime.profit_trail_armed = eval_state.profit_trail_armed
@@ -1495,9 +1685,46 @@ class LiveSignalEngine:
             runtime.bars_held = eval_state.bars_held
             runtime.hold_count_bar_date = eval_state.hold_count_bar_date
 
+        if signal_result.get("signal") == "PARTIAL_SELL":
+            runtime.partial_profit_taken = True
+
+        if (
+            enable_scale_in
+            and eval_state.in_position
+            and int(eval_state.scale_in_target_qty or 0) > int(runtime.held_quantity or 0)
+            and int(eval_state.bars_held or 0) >= 3
+            and today.close > today.sma_long
+            and market_bullish
+            and not runtime.pending_order
+        ):
+            signal_result = {
+                "signal": "SCALE_IN_BUY",
+                "liquidity_ok": True,
+                "scale_in_add_qty": int(eval_state.scale_in_target_qty)
+                - int(runtime.held_quantity or 0),
+            }
+
+        if (
+            signal_result.get("signal") == "BUY"
+            and entry_filter_df is not None
+        ):
+            from entry_filters import passes_entry_filters
+
+            ok, block_reason = passes_entry_filters(
+                entry_filter_df,
+                entry_filter_date or current_bar_date,
+            )
+            if not ok:
+                signal_result = {
+                    **signal_result,
+                    "signal": "HOLD",
+                    "entry_filter_blocked": block_reason,
+                }
+
         if (
             not regular_market_hours
-            and signal_result.get("signal") in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}
+            and signal_result.get("signal")
+            in {"BUY", "SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL", "SCALE_IN_BUY"}
         ):
             signal_result = {
                 "signal": "HOLD",
@@ -1507,7 +1734,7 @@ class LiveSignalEngine:
             }
 
         if (
-            signal_result.get("signal") in {"SELL", "DYNAMIC_ATR_SELL"}
+            signal_result.get("signal") in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"}
             and runtime.held_quantity <= 0
         ):
             signal_result = {
@@ -1535,6 +1762,20 @@ class LiveSignalEngine:
         elif multiplier < 1.0 and position_size > 0:
             position_size = max(1, int(position_size * multiplier))
 
+        if (
+            enable_scale_in
+            and signal_result.get("signal") == "BUY"
+            and not eval_state.in_position
+            and position_size > 1
+        ):
+            full_size = position_size
+            position_size = max(1, full_size // 2)
+            runtime.scale_in_target_qty = full_size
+        elif signal_result.get("signal") == "SCALE_IN_BUY":
+            position_size = int(signal_result.get("scale_in_add_qty") or 0)
+        elif signal_result.get("signal") == "PARTIAL_SELL":
+            position_size = int(signal_result.get("sell_quantity") or 0)
+
         return {
             "metrics": {
                 "today": today.to_metrics_dict(),
@@ -1550,6 +1791,7 @@ class LiveSignalEngine:
             "allow_crossover": allow_crossover,
             "market_bullish": market_bullish,
             "position_size_multiplier": position_size_multiplier,
+            "atr_regime_multiplier": atr_regime_multiplier,
             "calendar_open": calendar_open,
             "regular_market_hours": regular_market_hours,
             "market_open": regular_market_hours,
@@ -1571,21 +1813,37 @@ class LiveSignalEngine:
         allow_crossover: bool,
     ) -> None:
         """Mutate runtime registry after a confirmed KIS order (rt_cd == 0)."""
-        if signal == "BUY":
-            runtime.in_position = filled_quantity > 0
-            runtime.held_quantity = filled_quantity
+        if signal in {"BUY", "SCALE_IN_BUY"}:
+            if signal == "SCALE_IN_BUY":
+                runtime.held_quantity = int(runtime.held_quantity or 0) + int(
+                    filled_quantity
+                )
+            else:
+                runtime.held_quantity = filled_quantity
+            runtime.in_position = runtime.held_quantity > 0
             runtime.pending_order = False
             runtime.last_processed_date = current_bar_date
             if runtime.entry_price is None:
                 runtime.entry_price = runtime.open_order_price
-            runtime.entry_bar_date = current_bar_date
-            runtime.bars_held = 0
-            runtime.hold_count_bar_date = current_bar_date
-            runtime.days_below_sma_long = 0
-            runtime.profit_trail_armed = False
+            if runtime.entry_bar_date is None:
+                runtime.entry_bar_date = current_bar_date
+            if signal == "BUY":
+                runtime.bars_held = 0
+                runtime.hold_count_bar_date = current_bar_date
+                runtime.days_below_sma_long = 0
+                runtime.profit_trail_armed = False
+            if runtime.scale_in_target_qty <= 0:
+                runtime.scale_in_target_qty = filled_quantity
+            if (
+                runtime.scale_in_target_qty > 0
+                and filled_quantity >= runtime.scale_in_target_qty
+            ):
+                runtime.scale_in_target_qty = 0
+            runtime.pending_resubmit_side = None
+            runtime.pending_resubmit_qty = 0
             return
 
-        if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
+        if signal in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"}:
             remaining = max(int(runtime.held_quantity) - int(filled_quantity), 0)
             runtime.in_position = remaining > 0
             runtime.held_quantity = remaining
@@ -1601,6 +1859,8 @@ class LiveSignalEngine:
                 runtime.hold_count_bar_date = None
                 runtime.days_below_sma_long = 0
                 runtime.profit_trail_armed = False
+                runtime.partial_profit_taken = False
+                runtime.scale_in_target_qty = 0
             runtime.pending_order = False
             runtime.last_processed_date = current_bar_date
             return

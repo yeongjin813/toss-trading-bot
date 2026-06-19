@@ -8,7 +8,7 @@ Setup:
     KIS_APP_SECRET=your_app_secret
     KIS_CANO=your_account_number
     KIS_ACNT_PRDT_CD=01
-    WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
+    WATCHLIST=AAPL,MSFT,NVDA,...,LLY,UNH,JNJ,JPM,V,XOM,COST,WMT,KO,CAT
     USE_SPY_MARKET_FILTER=true
     CAPITAL_AT_RISK=100000
     KIS_ORDER_TYPE=limit
@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 from analytics import (
     LiveSignalEngine,
     PositionState,
+    calculate_atr,
     describe_us_market_closure,
     is_us_equity_session,
     is_us_regular_market_hours,
@@ -45,9 +46,11 @@ from analytics import (
     seconds_until_us_rth_open,
     spy_regime_snapshot,
     use_eod_atr_stops,
+    volatility_adjusted_risk_fraction,
 )
 from config import StrategyConfigMapper
 from market_registry import (
+    BENCHMARK_CONFIRM_SMA_PERIOD,
     BENCHMARK_SMA_PERIOD,
     BENCHMARK_TICKER,
     MARKET_META,
@@ -108,6 +111,13 @@ from overdeployment_trim import (
     format_trim_plan_text,
     plan_overdeployment_trims,
 )
+from strategy_ownership import (
+    check_buy_collision,
+    claim_ownership,
+    reconcile_ownership,
+    release_ownership,
+)
+from trading_features import TradingFeatureFlags
 
 load_dotenv(override=True)
 
@@ -150,8 +160,14 @@ MOMENTUM_SETTINGS = MomentumRankSettings(
     weight_volume=_MOMENTUM_RAW.weight_volume,
     require_above_sma50=_MOMENTUM_RAW.require_above_sma50,
     require_above_sma200=_MOMENTUM_RAW.require_above_sma200,
+    require_near_52w_high=_MOMENTUM_RAW.require_near_52w_high,
+    near_52w_high_pct=_MOMENTUM_RAW.near_52w_high_pct,
+    sector_diversify=_MOMENTUM_RAW.sector_diversify,
+    max_per_sector=_MOMENTUM_RAW.max_per_sector,
     min_bars=_MOMENTUM_RAW.min_bars,
 )
+
+FEATURES = TradingFeatureFlags.from_env()
 
 ANALYTICS_SMA_PERIOD = 20
 MIN_DATA_BARS = 22
@@ -167,6 +183,12 @@ LEGACY_CAPITAL_AT_RISK = scaled_capital(
     CAPITAL_AT_RISK, DEPLOYMENT.legacy_capital_fraction()
 )
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+USE_VOL_ADJUSTED_RISK = FEATURES.use_vol_adjusted_risk
+VOL_TARGET_PCT = FEATURES.vol_target_pct
+USE_REGIME_GOLDEN_CROSS = FEATURES.use_regime_golden_cross
+REGIME_CAUTIOUS_MAX_POSITIONS = FEATURES.regime_cautious_max_positions
+USE_SCALE_IN = FEATURES.use_scale_in
+USE_SCALE_OUT = FEATURES.use_scale_out
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
@@ -992,14 +1014,38 @@ def _resolve_execution_quantity(
     signal: str,
     proposed_size: int,
     runtime: PositionState,
+    *,
+    cycle: dict[str, Any] | None = None,
 ) -> int:
-    if signal == "BUY":
+    if signal in {"BUY", "SCALE_IN_BUY"}:
         return max(int(proposed_size), 0)
+
+    if signal == "PARTIAL_SELL":
+        sell_qty = int(proposed_size or 0)
+        if sell_qty <= 0 and cycle:
+            sell_qty = int(cycle.get("signal_result", {}).get("sell_quantity") or 0)
+        return min(max(sell_qty, 0), max(int(runtime.held_quantity or 0), 0))
 
     if signal in {"SELL", "DYNAMIC_ATR_SELL"}:
         return max(int(runtime.held_quantity), 0)
 
     return 0
+
+
+def _dispatchable_signal(signal: str) -> bool:
+    return signal in {
+        "BUY",
+        "SCALE_IN_BUY",
+        "SELL",
+        "DYNAMIC_ATR_SELL",
+        "PARTIAL_SELL",
+    }
+
+
+def _broker_side_for_signal(signal: str) -> str:
+    if signal in {"BUY", "SCALE_IN_BUY"}:
+        return "BUY"
+    return "SELL"
 
 
 def execute_broker_order(
@@ -1009,8 +1055,8 @@ def execute_broker_order(
     quantity: int,
     reference_price: float,
 ) -> dict[str, Any]:
+    side = _broker_side_for_signal(signal)
     if is_dry_run_mode():
-        side = "BUY" if signal == "BUY" else "SELL"
         odno = f"DRY-{uuid.uuid4().hex[:8].upper()}"
         print(
             f"[DRY-RUN] {side} {ticker} | qty={quantity} | "
@@ -1025,7 +1071,6 @@ def execute_broker_order(
 
     ovrs_excg_cd = MARKET_META[ticker]["ovrs_excg_cd"]
     use_limit = KIS_ORDER_TYPE == "limit"
-    side = "BUY" if signal == "BUY" else "SELL"
     buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
     order_price = (
         limit_order_price(side, reference_price, buffer_bps) if use_limit else 0.0
@@ -1033,10 +1078,10 @@ def execute_broker_order(
     order_kind = "limit order" if use_limit else "market order"
     price_suffix = f" @{order_price:.2f}" if use_limit else ""
 
-    if signal == "BUY" and quantity > 0:
+    if side == "BUY" and quantity > 0:
         print(
             f"[KIS ORDER] BUY  {ticker} | qty={quantity} | {order_kind}{price_suffix} | "
-            f"tr_id={TR_ID_US_BUY}"
+            f"tr_id={TR_ID_US_BUY} | signal={signal}"
         )
         return _place_order_with_retries(
             client,
@@ -1047,10 +1092,10 @@ def execute_broker_order(
             order_price=order_price,
         )
 
-    if signal in {"SELL", "DYNAMIC_ATR_SELL"} and quantity > 0:
+    if side == "SELL" and quantity > 0:
         print(
             f"[KIS ORDER] SELL {ticker} | qty={quantity} | close-position | "
-            f"{order_kind}{price_suffix} | tr_id={TR_ID_US_SELL}"
+            f"{order_kind}{price_suffix} | tr_id={TR_ID_US_SELL} | signal={signal}"
         )
         return _place_order_with_retries(
             client,
@@ -1113,7 +1158,7 @@ def _finalize_order_acceptance(
     ledger: PortfolioLedger,
 ) -> None:
     odno = extract_order_odno(order_payload)
-    side = "BUY" if signal == "BUY" else "SELL"
+    side = _broker_side_for_signal(signal)
     buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
     order_price = (
         limit_order_price(side, reference_price, buffer_bps)
@@ -1125,7 +1170,7 @@ def _finalize_order_acceptance(
         assign_open_order(
             runtime,
             odno=odno,
-            side=side,
+            side=signal if signal in {"PARTIAL_SELL", "SCALE_IN_BUY"} else side,
             qty=execution_qty,
             price=order_price,
             submitted_at=submitted_at,
@@ -1170,7 +1215,7 @@ def _apply_dry_run_fill(
     ledger: PortfolioLedger,
     current_bar_date: str,
 ) -> None:
-    side = "BUY" if signal == "BUY" else "SELL"
+    side = _broker_side_for_signal(signal)
     buffer_bps = limit_buffer_bps_for_ticker(ticker, EXECUTION_SETTINGS)
     fill_price = (
         limit_order_price(side, reference_price, buffer_bps)
@@ -1234,16 +1279,16 @@ def dispatch_order_with_state_machine(
         return "LOCKED"
 
     execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
-    if signal in {"SELL", "DYNAMIC_ATR_SELL"} and execution_qty <= 0:
+    if signal in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"} and execution_qty <= 0:
         print(f"[SKIP] {ticker} liquidation skipped — no held quantity tracked")
         runtime.in_position = False
         return "HOLD"
 
-    if signal == "BUY" and execution_qty <= 0:
-        print(f"[SKIP] {ticker} BUY skipped — zero share size")
+    if signal in {"BUY", "SCALE_IN_BUY"} and execution_qty <= 0:
+        print(f"[SKIP] {ticker} {signal} skipped — zero share size")
         return "HOLD"
 
-    if signal not in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
+    if not _dispatchable_signal(signal):
         return signal
 
     fail_key = _failed_order_key(signal, current_bar_date)
@@ -1560,6 +1605,8 @@ def run_session_reconciliation(
         states.setdefault("_portfolio", {})["last_reconcile_session_date"] = now.strftime(
             "%Y-%m-%d"
         )
+    shadow = load_top3_state(states)
+    reconcile_ownership(states, WATCHLIST, top3_active=shadow.active_tickers)
     save_persisted_states(states)
     return states, ledger
 
@@ -1631,6 +1678,38 @@ def process_ticker(
             return "PENDING"
         ticker_state = states.get(ticker, engine.dump_state(runtime))
 
+    runtime = engine.load_state(ticker_state if isinstance(ticker_state, dict) else {})
+    if (
+        runtime.pending_resubmit_side == "BUY"
+        and int(runtime.pending_resubmit_qty or 0) > 0
+        and not runtime.pending_order
+    ):
+        resubmit_qty = int(runtime.pending_resubmit_qty)
+        runtime.pending_resubmit_side = None
+        runtime.pending_resubmit_qty = 0
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        print(
+            f"[RESUBMIT] {ticker} BUY qty={resubmit_qty} after limit cancel"
+        )
+        dispatch_order_with_state_machine(
+            client,
+            engine,
+            ticker,
+            runtime,
+            "BUY",
+            resubmit_qty,
+            current_bar_date,
+            True,
+            states,
+            reference_price=current_price,
+            ledger=ledger,
+        )
+        states[ticker] = engine.dump_state(runtime)
+        save_persisted_states(states)
+        if runtime.pending_order:
+            return "PENDING"
+
     portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
     RISK_GUARD.update_daily_equity_anchor(states, portfolio_equity)
 
@@ -1647,8 +1726,11 @@ def process_ticker(
     market_bullish = True
     position_size_multiplier = 1.0
     market_regime_label = "normal"
+    regime_max_open_positions: int | None = None
+    atr_regime_multiplier = 1.0
     spy_close: float | None = None
     spy_sma: float | None = None
+    effective_risk = RISK_PER_TRADE
     if USE_SPY_MARKET_FILTER:
         try:
             spy_df = cache.get_frame(BENCHMARK_TICKER)
@@ -1662,11 +1744,25 @@ def process_ticker(
                 spy_df,
                 qqq_df,
                 current_bar_date,
-                StrategyConfigMapper.MARKET_BENCHMARK_SMA_PERIOD,
+                sma_period=StrategyConfigMapper.MARKET_BENCHMARK_SMA_PERIOD,
+                confirm_sma_period=BENCHMARK_CONFIRM_SMA_PERIOD,
+                require_golden_cross=USE_REGIME_GOLDEN_CROSS,
+                cautious_max_positions=REGIME_CAUTIOUS_MAX_POSITIONS,
             )
             market_bullish = regime.allow_new_buys
             position_size_multiplier = regime.position_size_multiplier
             market_regime_label = regime.label
+            regime_max_open_positions = regime.max_open_positions
+            atr_regime_multiplier = regime.atr_stop_multiplier
+            if USE_VOL_ADJUSTED_RISK and spy_close and spy_close > 0:
+                atr_series = calculate_atr(spy_df, 14)
+                if len(atr_series) > 0:
+                    benchmark_atr_pct = float(atr_series.iloc[-1]) / float(spy_close)
+                    effective_risk = volatility_adjusted_risk_fraction(
+                        RISK_PER_TRADE,
+                        benchmark_atr_pct,
+                        target_vol_pct=VOL_TARGET_PCT,
+                    )
         except KeyError:
             print(f"[WARN] {BENCHMARK_TICKER} not bootstrapped — market filter skipped")
 
@@ -1674,7 +1770,7 @@ def process_ticker(
         df,
         runtime_state=states.get(ticker, ticker_state if isinstance(ticker_state, dict) else {}),
         capital_at_risk=effective_capital,
-        risk_per_trade=RISK_PER_TRADE,
+        risk_per_trade=effective_risk,
         now=datetime.now(),
         available_capital=effective_cash,
         portfolio_equity=portfolio_equity * legacy_fraction
@@ -1684,17 +1780,27 @@ def process_ticker(
         market_bullish=market_bullish,
         position_size_multiplier=position_size_multiplier,
         momentum_ranked_hold=_ticker_in_active_momentum(states, ticker),
+        atr_regime_multiplier=atr_regime_multiplier,
+        enable_scale_in=USE_SCALE_IN,
+        enable_scale_out=USE_SCALE_OUT,
+        entry_filter_df=df,
+        entry_filter_date=current_bar_date,
     )
     cycle["market_regime"] = market_regime_label
     cycle["position_size_multiplier"] = position_size_multiplier
+    cycle["effective_risk_per_trade"] = effective_risk
     cycle["spy_close"] = spy_close
     cycle["spy_sma"] = spy_sma
     cycle["available_capital"] = effective_cash
     cycle["portfolio_equity"] = (
         portfolio_equity * legacy_fraction if DEPLOYMENT.is_dual else portfolio_equity
     )
+    cycle["atr_regime_multiplier"] = atr_regime_multiplier
 
     runtime = engine.load_state(cycle["runtime_state"])
+    entry_block = cycle.get("signal_result", {}).get("entry_filter_blocked")
+    if entry_block:
+        print(f"[GATE/ENTRY] {ticker} blocked — {entry_block}")
     _execution_gatekeeper.evaluate_live_signals(
         engine,
         runtime,
@@ -1724,7 +1830,7 @@ def process_ticker(
         save_persisted_states(states)
         return "HOLD"
 
-    if signal in {"SELL", "DYNAMIC_ATR_SELL"} and runtime.held_quantity <= 0:
+    if signal in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"} and runtime.held_quantity <= 0:
         print(
             f"[SKIP] {ticker} {signal} suppressed — held_qty=0 "
             "(no broker shares)"
@@ -1734,8 +1840,8 @@ def process_ticker(
         save_persisted_states(states)
         return "HOLD"
 
-    if signal in {"BUY", "SELL", "DYNAMIC_ATR_SELL"}:
-        if signal == "BUY" and data_source == "yfinance":
+    if signal in {"BUY", "SCALE_IN_BUY", "SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"}:
+        if signal in {"BUY", "SCALE_IN_BUY"} and data_source == "yfinance":
             print(
                 f"[GATE/DATA] {ticker} BUY blocked — bar history loaded via yfinance fallback"
             )
@@ -1743,7 +1849,7 @@ def process_ticker(
             save_persisted_states(states)
             return "HOLD"
 
-        if signal == "BUY":
+        if signal in {"BUY", "SCALE_IN_BUY"}:
             if position_size_multiplier <= 0:
                 print(f"[GATE/REGIME] {ticker} BUY blocked — market risk-off")
                 states[ticker] = engine.dump_state(runtime)
@@ -1762,6 +1868,14 @@ def process_ticker(
                 states[ticker] = engine.dump_state(runtime)
                 save_persisted_states(states)
                 return "HOLD"
+
+            if DEPLOYMENT.is_dual:
+                collision = check_buy_collision(states, ticker, "legacy")
+                if collision:
+                    print(f"[GATE/OWNERSHIP] {ticker} BUY blocked — {collision}")
+                    states[ticker] = engine.dump_state(runtime)
+                    save_persisted_states(states)
+                    return "HOLD"
 
             rth_block = block_new_buy_rth_window(datetime.now(), EXECUTION_SETTINGS)
             if rth_block:
@@ -1786,6 +1900,7 @@ def process_ticker(
                     WATCHLIST,
                     _watchlist_mark_prices(cache, WATCHLIST),
                 ),
+                max_open_positions_override=regime_max_open_positions,
             )
             if risk_block:
                 print(f"[GATE/RISK] {ticker} BUY blocked — {risk_block}")
@@ -1793,7 +1908,12 @@ def process_ticker(
                 save_persisted_states(states)
                 return "HOLD"
 
-        execution_qty = _resolve_execution_quantity(signal, proposed_size, runtime)
+        execution_qty = _resolve_execution_quantity(
+            signal,
+            proposed_size,
+            runtime,
+            cycle=cycle,
+        )
         final_signal = dispatch_order_with_state_machine(
             client,
             engine,
@@ -1829,6 +1949,11 @@ def process_ticker(
             if runtime.pending_order:
                 return "PENDING"
             return signal
+        if signal in {"BUY", "SCALE_IN_BUY"} and final_signal in {"PENDING", "BUY", "SCALE_IN_BUY"}:
+            claim_ownership(states, ticker, "legacy")
+        if signal in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"} and int(runtime.held_quantity or 0) <= 0:
+            release_ownership(states, ticker)
+        save_persisted_states(states)
     else:
         final_signal = signal
         states[ticker] = engine.dump_state(runtime)
@@ -1923,6 +2048,12 @@ def run_top3_shadow_cycle(
                         f"deployable ${top3_cash:,.2f} < est ${est_cost:,.2f}"
                     )
                     continue
+                collision = check_buy_collision(states, order.ticker, "top3")
+                if collision:
+                    print(
+                        f"[TOP3/GATE] {order.ticker} BUY blocked — {collision}"
+                    )
+                    continue
             try:
                 payload = execute_broker_order(
                     client,
@@ -1932,6 +2063,14 @@ def run_top3_shadow_cycle(
                     order.reference_price,
                 )
                 odno = extract_order_odno(payload) or ""
+                if side == "BUY":
+                    claim_ownership(states, order.ticker, "top3")
+                elif side == "SELL":
+                    held = int(
+                        states.get(order.ticker, {}).get("held_quantity", 0) or 0
+                    )
+                    if held <= order.shares:
+                        release_ownership(states, order.ticker)
                 TRADE_LOG.append(
                     {
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

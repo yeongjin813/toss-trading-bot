@@ -2,7 +2,7 @@
 Consolidated multi-ticker portfolio backtest engine.
 
 Simulates NVDA / PLTR / AAPL (or any watchlist) sharing a single cash ledger
-with live-parity dual-clamp position sizing from analytics.calculate_position_size().
+with live-parity dual-clamp sizing, entry filters, regime stops, and scale-in/out.
 """
 
 from __future__ import annotations
@@ -17,20 +17,25 @@ from analytics import (
     BarSnapshot,
     LiveSignalEngine,
     PositionState,
-    build_market_regime_lookup,
     build_spy_regime_lookup,
-    calculate_position_size,
-    resolve_market_regime,
-    resolve_spy_market_bullish,
 )
 from config import StrategyConfig, StrategyConfigMapper
-from market_registry import BENCHMARK_SMA_PERIOD, SECONDARY_BENCHMARK_TICKER
+from entry_filters import passes_entry_filters
+from market_registry import BENCHMARK_SMA_PERIOD
 from momentum_ranker import (
     MomentumRankSettings,
     is_new_buy_allowed,
     rank_universe_frames,
     select_top_tickers,
+    select_top_tickers_diversified,
     should_rebalance_today,
+)
+from trading_features import (
+    TradingFeatureFlags,
+    build_regime_lookup,
+    build_spy_atr_pct_lookup,
+    effective_risk_per_trade,
+    resolve_bar_regime,
 )
 
 
@@ -89,6 +94,8 @@ def dual_clamp_portfolio_size(
     Capital clamp: int((available_cash * 0.95) / entry_price)
     Execution:     min(risk, capital), scaled down if commission exceeds cash.
     """
+    from analytics import calculate_position_size
+
     if entry_price <= 0 or stop_distance <= 0 or available_cash <= 0:
         return 0
 
@@ -118,48 +125,47 @@ def compute_portfolio_equity(
 ) -> float:
     """Total equity = free cash + sum(shares * mark_price)."""
     equity = cash
-    for _ticker, (shares, mark_price) in holdings.items():
-        if shares > 0:
-            equity += shares * mark_price
+    for shares, price in holdings.values():
+        equity += shares * price
     return equity
 
 
-def compute_max_drawdown(equity_series: pd.Series) -> float:
-    """Peak-to-trough drawdown as a positive percentage."""
-    if equity_series.empty:
+def compute_max_drawdown(equity_curve: pd.Series) -> float:
+    if equity_curve.empty:
         return 0.0
-    running_peak = equity_series.cummax()
-    drawdown = (equity_series - running_peak) / running_peak
+    peak = equity_curve.cummax()
+    drawdown = (equity_curve - peak) / peak.replace(0, math.nan)
     return float(abs(drawdown.min()) * 100.0)
 
 
 def compute_sharpe_ratio(
-    equity_series: pd.Series,
-    trading_days: int = 252,
-    risk_free_rate: float = 0.0,
+    equity_curve: pd.Series,
+    *,
+    periods_per_year: int = 252,
 ) -> float:
-    """Annualized Sharpe from daily equity returns."""
-    if len(equity_series) < 2:
+    if len(equity_curve) < 2:
         return 0.0
-    daily_returns = equity_series.pct_change().dropna()
-    if daily_returns.empty or daily_returns.std() == 0:
+    returns = equity_curve.pct_change().dropna()
+    if returns.empty or returns.std() == 0:
         return 0.0
-    excess = daily_returns - (risk_free_rate / trading_days)
-    return float(excess.mean() / excess.std() * math.sqrt(trading_days))
+    return float((returns.mean() / returns.std()) * math.sqrt(periods_per_year))
 
 
-def _prepare_ticker_series(ticker: str, ohlcv: pd.DataFrame) -> TickerBacktestSeries:
+def _prepare_ticker_series(ticker: str, raw: pd.DataFrame) -> TickerBacktestSeries:
     engine = LiveSignalEngine(ticker)
-    config = StrategyConfigMapper.for_ticker(ticker)
-    raw = ohlcv.reset_index()
-    if "Date" not in raw.columns:
-        raw = raw.rename(columns={raw.columns[0]: "Date"})
-    raw["Date"] = pd.to_datetime(raw["Date"])
-    enriched = engine.enrich(raw)
-    date_to_index = {
-        pd.Timestamp(row["Date"]).strftime("%Y-%m-%d"): idx
-        for idx, row in enriched.iterrows()
-    }
+    config = engine.config
+    frame = raw.copy()
+    if "Date" not in frame.columns:
+        if isinstance(frame.index, pd.DatetimeIndex):
+            frame = frame.reset_index()
+        if frame.columns[0] != "Date":
+            frame = frame.rename(columns={frame.columns[0]: "Date"})
+    frame["Date"] = pd.to_datetime(frame["Date"])
+    enriched = engine.enrich(frame)
+    date_to_index: dict[str, int] = {}
+    for pos in range(len(enriched)):
+        bar_date = pd.Timestamp(enriched.iloc[pos]["Date"]).strftime("%Y-%m-%d")
+        date_to_index[bar_date] = pos
     return TickerBacktestSeries(
         ticker=ticker,
         engine=engine,
@@ -174,17 +180,23 @@ def _apply_buy_state(
     bar: BarSnapshot,
     shares: int,
     bar_date: str,
+    *,
+    scale_in_target: int = 0,
 ) -> None:
     series.shares = shares
     series.state.in_position = True
     series.state.held_quantity = shares
     series.state.highest_price_achieved = bar.close
-    series.state.entry_price = bar.close
-    series.state.entry_bar_date = bar_date
-    series.state.bars_held = 0
-    series.state.hold_count_bar_date = bar_date
+    if series.state.entry_price is None:
+        series.state.entry_price = bar.close
+    if series.state.entry_bar_date is None:
+        series.state.entry_bar_date = bar_date
+        series.state.bars_held = 0
+        series.state.hold_count_bar_date = bar_date
     series.state.days_below_sma_long = 0
     series.state.profit_trail_armed = False
+    if scale_in_target > shares:
+        series.state.scale_in_target_qty = scale_in_target
     series.engine._update_trailing_state(series.state, bar.close, bar.atr)
     series.state.last_processed_date = bar_date
 
@@ -204,38 +216,46 @@ def _apply_sell_state(series: TickerBacktestSeries, bar_date: str) -> None:
     series.state.hold_count_bar_date = None
     series.state.days_below_sma_long = 0
     series.state.profit_trail_armed = False
+    series.state.partial_profit_taken = False
+    series.state.scale_in_target_qty = 0
     series.state.last_processed_date = bar_date
 
 
-def _update_in_position_trailing(
+def _apply_partial_sell_state(
+    series: TickerBacktestSeries,
+    sold_shares: int,
+    bar_date: str,
+) -> None:
+    remaining = max(series.shares - sold_shares, 0)
+    series.shares = remaining
+    series.state.held_quantity = remaining
+    series.state.in_position = remaining > 0
+    series.state.partial_profit_taken = True
+    series.state.last_processed_date = bar_date
+    if remaining <= 0:
+        _apply_sell_state(series, bar_date)
+
+
+def _scale_in_eligible(
     series: TickerBacktestSeries,
     bar: BarSnapshot,
-    prev_bar: BarSnapshot,
-) -> None:
-    """Advance trailing stop state on HOLD bars without triggering crossover exits."""
-    if series.shares <= 0:
-        return
-    result = series.engine.evaluate_bar(
-        series.state,
-        bar,
-        prev_bar,
-        mutate_state=True,
-        allow_crossover=False,
-    )
-    if result["signal"] in {"SELL", "DYNAMIC_ATR_SELL"}:
-        raise RuntimeError(
-            f"Unexpected exit signal during trailing update for {series.ticker}"
-        )
+    *,
+    market_bullish: bool,
+) -> bool:
+    target = int(series.state.scale_in_target_qty or 0)
+    held = int(series.shares or 0)
+    if target <= held or held <= 0:
+        return False
+    if int(series.state.bars_held or 0) < 3:
+        return False
+    if bar.close <= bar.sma_long:
+        return False
+    return market_bullish
 
 
 class PortfolioBacktestEngine:
     """
-    Multi-ticker consolidated portfolio simulator.
-
-    - Single starting cash pool shared across all tickers
-    - Per-ticker LiveSignalEngine + StrategyConfig isolation
-    - Dual-clamp sizing on total equity with available-cash cap
-    - Exits processed before entries each day (watchlist order)
+    Multi-ticker consolidated portfolio simulator with live-parity gates.
     """
 
     def __init__(
@@ -249,12 +269,14 @@ class PortfolioBacktestEngine:
         spy_df: pd.DataFrame | None = None,
         qqq_df: pd.DataFrame | None = None,
         momentum_settings: MomentumRankSettings | None = None,
+        features: TradingFeatureFlags | None = None,
     ) -> None:
         self.initial_cash = initial_cash
-        self.risk_per_trade = risk_per_trade
+        self.base_risk_per_trade = risk_per_trade
         self.commission_rate = commission_rate
         self.watchlist = tickers
         self.momentum_settings = momentum_settings or MomentumRankSettings.from_env()
+        self.features = features or TradingFeatureFlags.from_env()
         self.use_spy_market_filter = (
             StrategyConfigMapper.use_spy_market_filter()
             if use_spy_market_filter is None
@@ -262,19 +284,12 @@ class PortfolioBacktestEngine:
         )
         self.spy_lookup: dict[str, bool] | None = None
         self.regime_lookup = None
+        self.spy_atr_lookup: dict[str, float] | None = None
         if self.use_spy_market_filter and spy_df is not None and not spy_df.empty:
-            if (
-                StrategyConfigMapper.use_qqq_regime_filter()
-                and qqq_df is not None
-                and not qqq_df.empty
-            ):
-                self.regime_lookup = build_market_regime_lookup(
-                    spy_df,
-                    qqq_df,
-                    sma_period=BENCHMARK_SMA_PERIOD,
-                )
-            else:
+            self.regime_lookup = build_regime_lookup(spy_df, qqq_df, features=self.features)
+            if self.regime_lookup is None:
                 self.spy_lookup = build_spy_regime_lookup(spy_df, BENCHMARK_SMA_PERIOD)
+            self.spy_atr_lookup = build_spy_atr_pct_lookup(spy_df)
         self.series_map: dict[str, TickerBacktestSeries] = {}
 
         for ticker in tickers:
@@ -316,7 +331,14 @@ class PortfolioBacktestEngine:
             as_of_date=bar_date,
             settings=cfg,
         )
-        active = select_top_tickers(ranked, top_n=cfg.top_n)
+        if cfg.sector_diversify:
+            active = select_top_tickers_diversified(
+                ranked,
+                top_n=cfg.top_n,
+                max_per_sector=cfg.max_per_sector,
+            )
+        else:
+            active = select_top_tickers(ranked, top_n=cfg.top_n)
         if active:
             self._active_trade_tickers = set(active)
         self._momentum_last_rebalance = bar_date
@@ -339,6 +361,62 @@ class PortfolioBacktestEngine:
                 holdings[ticker] = (series.shares, mark_prices[ticker])
         return holdings
 
+    def _regime_context(self, bar_date: str) -> tuple[bool, float, float]:
+        if not self.use_spy_market_filter:
+            return True, 1.0, 1.0
+        regime = resolve_bar_regime(
+            bar_date,
+            regime_lookup=self.regime_lookup,
+            spy_lookup=self.spy_lookup,
+        )
+        return (
+            regime.allow_new_buys,
+            regime.position_size_multiplier,
+            regime.atr_stop_multiplier,
+        )
+
+    def _entry_filters_ok(self, series: TickerBacktestSeries, bar_date: str) -> bool:
+        ok, _ = passes_entry_filters(
+            self._raw_frames[series.ticker],
+            bar_date,
+            settings=self.features.entry_filter_settings(),
+        )
+        return ok
+
+    def _size_entry_shares(
+        self,
+        series: TickerBacktestSeries,
+        bar: BarSnapshot,
+        *,
+        cash: float,
+        total_equity: float,
+        size_multiplier: float,
+        bar_date: str,
+        shares_hint: int | None = None,
+    ) -> tuple[int, int]:
+        risk = effective_risk_per_trade(
+            self.base_risk_per_trade,
+            bar_date,
+            spy_atr_lookup=self.spy_atr_lookup,
+            features=self.features,
+        )
+        stop_distance = bar.atr * series.config.atr_multiplier
+        full_shares = shares_hint or dual_clamp_portfolio_size(
+            total_equity=total_equity,
+            available_cash=cash,
+            entry_price=bar.close,
+            stop_distance=stop_distance,
+            risk_per_trade=risk,
+            commission_rate=self.commission_rate,
+        )
+        if full_shares <= 0:
+            return 0, 0
+        if size_multiplier < 1.0:
+            full_shares = max(1, int(full_shares * size_multiplier))
+        if self.features.use_scale_in and full_shares > 1 and shares_hint is None:
+            return max(1, full_shares // 2), full_shares
+        return full_shares, 0
+
     def run(self) -> PortfolioBacktestResult:
         cash = self.initial_cash
         trades: list[TradeRecord] = []
@@ -349,11 +427,13 @@ class PortfolioBacktestEngine:
 
         for bar_date in self.timeline:
             self._maybe_rebalance_momentum(bar_date)
-            mark_prices = self._mark_prices(bar_date)
-            holdings = self._holdings_snapshot(mark_prices)
+            market_bullish, size_multiplier, atr_stop_multiplier = self._regime_context(
+                bar_date
+            )
 
-            exit_events: list[tuple[TickerBacktestSeries, BarSnapshot, str, str]] = []
-            entry_events: list[tuple[TickerBacktestSeries, BarSnapshot, float]] = []
+            exit_events: list[tuple[TickerBacktestSeries, BarSnapshot, str, str, int | None]] = []
+            entry_events: list[tuple[TickerBacktestSeries, BarSnapshot, float, int | None]] = []
+            scale_in_events: list[tuple[TickerBacktestSeries, BarSnapshot, int]] = []
 
             for ticker in self.watchlist:
                 series = self.series_map[ticker]
@@ -373,27 +453,45 @@ class PortfolioBacktestEngine:
                         mutate_state=True,
                         allow_crossover=True,
                         momentum_ranked_hold=ranked_hold,
+                        atr_regime_multiplier=atr_stop_multiplier,
+                        enable_scale_out=self.features.use_scale_out,
                     )
-                    if exit_check["signal"] in {"SELL", "DYNAMIC_ATR_SELL"}:
+                    signal = exit_check["signal"]
+                    if signal == "PARTIAL_SELL":
+                        sell_qty = int(
+                            exit_check.get("sell_quantity")
+                            or max(1, series.shares // 3)
+                        )
                         exit_events.append(
                             (
                                 series,
                                 bar,
-                                exit_check["signal"],
-                                str(exit_check.get("exit_reason") or exit_check["signal"]),
+                                signal,
+                                str(exit_check.get("exit_reason") or signal),
+                                sell_qty,
                             )
                         )
-                else:
-                    if self.regime_lookup is not None:
-                        regime = resolve_market_regime(self.regime_lookup, bar_date)
-                        market_bullish = regime.allow_new_buys
-                        size_multiplier = regime.position_size_multiplier
-                    else:
-                        market_bullish = resolve_spy_market_bullish(
-                            self.spy_lookup,
-                            bar_date,
+                    elif signal in {"SELL", "DYNAMIC_ATR_SELL"}:
+                        exit_events.append(
+                            (
+                                series,
+                                bar,
+                                signal,
+                                str(exit_check.get("exit_reason") or signal),
+                                None,
+                            )
                         )
-                        size_multiplier = 1.0 if market_bullish else 0.0
+                    elif _scale_in_eligible(
+                        series,
+                        bar,
+                        market_bullish=market_bullish,
+                    ):
+                        add_qty = int(series.state.scale_in_target_qty) - series.shares
+                        if add_qty > 0:
+                            scale_in_events.append((series, bar, add_qty))
+                else:
+                    if not market_bullish or size_multiplier <= 0:
+                        continue
                     entry_check = series.engine.evaluate_bar(
                         series.state,
                         bar,
@@ -402,24 +500,39 @@ class PortfolioBacktestEngine:
                         allow_crossover=True,
                         market_bullish=market_bullish,
                     )
-                    if entry_check["signal"] == "BUY" and is_new_buy_allowed(
+                    if entry_check["signal"] != "BUY":
+                        continue
+                    if not is_new_buy_allowed(
                         ticker,
                         self._active_trade_tickers,
                         settings=self.momentum_settings,
                     ):
-                        entry_events.append((series, bar, size_multiplier))
+                        continue
+                    if not self._entry_filters_ok(series, bar_date):
+                        continue
+                    entry_events.append((series, bar, size_multiplier, None))
 
-            for series, bar, signal, exit_reason in exit_events:
+            for series, bar, signal, exit_reason, partial_qty in exit_events:
                 if series.shares <= 0:
                     continue
-                shares = series.shares
+                shares = partial_qty if partial_qty else series.shares
+                shares = min(shares, series.shares)
+                if shares <= 0:
+                    continue
                 gross = shares * bar.close
                 commission = gross * self.commission_rate
                 proceeds = gross - commission
-                entry_cost = open_entry_cost.pop(series.ticker, shares * bar.close)
-                closed_trade_pnls.append(proceeds - entry_cost)
+                entry_cost = open_entry_cost.get(series.ticker, shares * bar.close)
+                if partial_qty:
+                    cost_basis = entry_cost * (shares / series.shares)
+                    closed_trade_pnls.append(proceeds - cost_basis)
+                    open_entry_cost[series.ticker] = entry_cost - cost_basis
+                    _apply_partial_sell_state(series, shares, bar_date)
+                else:
+                    closed_trade_pnls.append(proceeds - entry_cost)
+                    open_entry_cost.pop(series.ticker, None)
+                    _apply_sell_state(series, bar_date)
                 cash += proceeds
-                _apply_sell_state(series, bar_date)
                 mark_prices = self._mark_prices(bar_date)
                 holdings = self._holdings_snapshot(mark_prices)
                 equity = compute_portfolio_equity(cash, holdings)
@@ -438,32 +551,22 @@ class PortfolioBacktestEngine:
                     )
                 )
 
-            for series, bar, size_multiplier in entry_events:
+            for series, bar, size_multiplier, _ in entry_events:
                 if series.shares > 0:
                     continue
-
-                if size_multiplier <= 0:
-                    series.engine._clear_position_fields(series.state)
-                    continue
-
                 mark_prices = self._mark_prices(bar_date)
                 holdings = self._holdings_snapshot(mark_prices)
                 total_equity = compute_portfolio_equity(cash, holdings)
-                stop_distance = bar.atr * series.config.atr_multiplier
-
-                shares = dual_clamp_portfolio_size(
+                shares, scale_target = self._size_entry_shares(
+                    series,
+                    bar,
+                    cash=cash,
                     total_equity=total_equity,
-                    available_cash=cash,
-                    entry_price=bar.close,
-                    stop_distance=stop_distance,
-                    risk_per_trade=self.risk_per_trade,
-                    commission_rate=self.commission_rate,
+                    size_multiplier=size_multiplier,
+                    bar_date=bar_date,
                 )
                 if shares <= 0:
                     continue
-                if size_multiplier < 1.0:
-                    shares = max(1, int(shares * size_multiplier))
-
                 gross = shares * bar.close
                 commission = gross * self.commission_rate
                 total_cost = gross + commission
@@ -474,9 +577,14 @@ class PortfolioBacktestEngine:
                     gross = shares * bar.close
                     commission = gross * self.commission_rate
                     total_cost = gross + commission
-
                 cash -= total_cost
-                _apply_buy_state(series, bar, shares, bar_date)
+                _apply_buy_state(
+                    series,
+                    bar,
+                    shares,
+                    bar_date,
+                    scale_in_target=scale_target,
+                )
                 open_entry_cost[series.ticker] = total_cost
                 mark_prices = self._mark_prices(bar_date)
                 holdings = self._holdings_snapshot(mark_prices)
@@ -495,29 +603,65 @@ class PortfolioBacktestEngine:
                     )
                 )
 
+            for series, bar, add_qty in scale_in_events:
+                if series.shares <= 0 or add_qty <= 0:
+                    continue
+                mark_prices = self._mark_prices(bar_date)
+                holdings = self._holdings_snapshot(mark_prices)
+                total_equity = compute_portfolio_equity(cash, holdings)
+                shares, _ = self._size_entry_shares(
+                    series,
+                    bar,
+                    cash=cash,
+                    total_equity=total_equity,
+                    size_multiplier=1.0,
+                    bar_date=bar_date,
+                    shares_hint=add_qty,
+                )
+                shares = min(shares, add_qty)
+                if shares <= 0:
+                    continue
+                gross = shares * bar.close
+                commission = gross * self.commission_rate
+                total_cost = gross + commission
+                if total_cost > cash:
+                    continue
+                prior_cost = open_entry_cost.get(series.ticker, 0.0)
+                cash -= total_cost
+                new_total = series.shares + shares
+                _apply_buy_state(series, bar, new_total, bar_date)
+                series.state.scale_in_target_qty = 0
+                open_entry_cost[series.ticker] = prior_cost + total_cost
+                mark_prices = self._mark_prices(bar_date)
+                holdings = self._holdings_snapshot(mark_prices)
+                equity = compute_portfolio_equity(cash, holdings)
+                trades.append(
+                    TradeRecord(
+                        date=bar_date,
+                        ticker=series.ticker,
+                        side="BUY",
+                        shares=shares,
+                        price=bar.close,
+                        commission=commission,
+                        cash_after=cash,
+                        equity_after=equity,
+                        signal="SCALE_IN_BUY",
+                    )
+                )
+
             mark_prices = self._mark_prices(bar_date)
             holdings = self._holdings_snapshot(mark_prices)
             equity = compute_portfolio_equity(cash, holdings)
-            equity_rows.append(
-                {
-                    "date": bar_date,
-                    "cash": cash,
-                    "equity": equity,
-                    "open_positions": sum(1 for s in self.series_map.values() if s.shares > 0),
-                }
-            )
-
-        equity_curve = pd.DataFrame(equity_rows)
-        if not equity_curve.empty:
-            equity_curve["date"] = pd.to_datetime(equity_curve["date"])
-            equity_curve = equity_curve.set_index("date")
+            equity_rows.append({"date": bar_date, "equity": equity, "cash": cash})
 
         final_mark = self._mark_prices(self.timeline[-1]) if self.timeline else {}
         final_holdings = self._holdings_snapshot(final_mark)
         final_equity = compute_portfolio_equity(cash, final_holdings)
 
-        winning_trades = sum(1 for pnl in closed_trade_pnls if pnl > 0)
-        per_ticker = self._build_per_ticker_summary(trades)
+        equity_series = pd.Series(
+            [row["equity"] for row in equity_rows],
+            index=pd.to_datetime([row["date"] for row in equity_rows]),
+        )
         exit_reason_counts: dict[str, int] = {}
         for trade in trades:
             if trade.side == "SELL" and trade.exit_reason:
@@ -525,44 +669,50 @@ class PortfolioBacktestEngine:
                     exit_reason_counts.get(trade.exit_reason, 0) + 1
                 )
 
+        per_ticker: dict[str, dict[str, Any]] = {}
+        for ticker, series in self.series_map.items():
+            ticker_trades = [t for t in trades if t.ticker == ticker]
+            buys = sum(1 for t in ticker_trades if t.side == "BUY")
+            sells = sum(1 for t in ticker_trades if t.side == "SELL")
+            per_ticker[ticker] = {
+                "buy_count": buys,
+                "sell_count": sells,
+                "final_shares": series.shares,
+                "in_position": series.shares > 0,
+                "trades": len(ticker_trades),
+            }
+
+        winning = sum(1 for pnl in closed_trade_pnls if pnl > 0)
+        total_return = (
+            ((final_equity / self.initial_cash) - 1.0) * 100.0
+            if self.initial_cash > 0
+            else 0.0
+        )
+
+        equity_frame = pd.DataFrame(equity_rows)
+        if not equity_frame.empty:
+            equity_frame["date"] = pd.to_datetime(equity_frame["date"])
+            equity_frame = equity_frame.set_index("date")
+
         return PortfolioBacktestResult(
             initial_cash=self.initial_cash,
             final_equity=final_equity,
-            total_return_pct=(final_equity / self.initial_cash - 1.0) * 100.0,
-            max_drawdown_pct=compute_max_drawdown(equity_curve["equity"])
-            if not equity_curve.empty
-            else 0.0,
-            sharpe_ratio=compute_sharpe_ratio(equity_curve["equity"])
-            if not equity_curve.empty
-            else 0.0,
+            total_return_pct=total_return,
+            max_drawdown_pct=compute_max_drawdown(equity_series),
+            sharpe_ratio=compute_sharpe_ratio(equity_series),
             total_trades=len(trades),
-            winning_trades=winning_trades,
-            equity_curve=equity_curve,
+            winning_trades=winning,
+            equity_curve=equity_frame,
             trades=trades,
             per_ticker_summary=per_ticker,
             exit_reason_counts=exit_reason_counts,
         )
 
-    def _build_per_ticker_summary(
-        self, trades: list[TradeRecord]
-    ) -> dict[str, dict[str, Any]]:
-        summary: dict[str, dict[str, Any]] = {}
-        for ticker in self.watchlist:
-            ticker_trades = [t for t in trades if t.ticker == ticker]
-            buys = [t for t in ticker_trades if t.side == "BUY"]
-            sells = [t for t in ticker_trades if t.side == "SELL"]
-            summary[ticker] = {
-                "buy_count": len(buys),
-                "sell_count": len(sells),
-                "final_shares": self.series_map[ticker].shares,
-                "in_position": self.series_map[ticker].shares > 0,
-            }
-        return summary
-
 
 def run_portfolio_backtest(
     tickers: list[str],
     ohlcv_by_ticker: dict[str, pd.DataFrame],
+    *,
     initial_cash: float = 10_000.0,
     risk_per_trade: float = 0.01,
     commission_rate: float = 0.001,
@@ -570,11 +720,11 @@ def run_portfolio_backtest(
     spy_df: pd.DataFrame | None = None,
     qqq_df: pd.DataFrame | None = None,
     momentum_settings: MomentumRankSettings | None = None,
+    features: TradingFeatureFlags | None = None,
 ) -> PortfolioBacktestResult:
-    """Convenience wrapper for consolidated portfolio simulation."""
     engine = PortfolioBacktestEngine(
-        tickers=tickers,
-        ohlcv_by_ticker=ohlcv_by_ticker,
+        tickers,
+        ohlcv_by_ticker,
         initial_cash=initial_cash,
         risk_per_trade=risk_per_trade,
         commission_rate=commission_rate,
@@ -582,5 +732,6 @@ def run_portfolio_backtest(
         spy_df=spy_df,
         qqq_df=qqq_df,
         momentum_settings=momentum_settings,
+        features=features,
     )
     return engine.run()

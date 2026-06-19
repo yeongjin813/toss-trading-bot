@@ -17,6 +17,7 @@ from momentum_ranker import (
     MomentumRankSettings,
     rank_universe_frames,
     select_top_tickers,
+    select_top_tickers_diversified,
     should_rebalance_on_bar_date,
 )
 from portfolio_backtest import (
@@ -218,7 +219,14 @@ def run_top3_backtest(
                 as_of_date=bar_date,
                 settings=cfg,
             )
-            target = select_top_tickers(ranked, top_n=cfg.top_n)
+            if cfg.sector_diversify:
+                target = select_top_tickers_diversified(
+                    ranked,
+                    top_n=cfg.top_n,
+                    max_per_sector=cfg.max_per_sector,
+                )
+            else:
+                target = select_top_tickers(ranked, top_n=cfg.top_n)
             if not target:
                 target = tickers[: cfg.top_n]
 
@@ -298,6 +306,98 @@ def run_top3_backtest(
         per_ticker_summary=per_ticker,
         rebalance_count=rebalance_count,
     )
+
+
+def _normalized_equity_series(result: Any) -> pd.Series:
+    if result.equity_curve.empty:
+        return pd.Series(dtype=float)
+    frame = result.equity_curve
+    if "equity" not in frame.columns:
+        return pd.Series(dtype=float)
+    if isinstance(frame.index, pd.DatetimeIndex):
+        return frame["equity"].astype(float)
+    if "date" in frame.columns:
+        idx = pd.to_datetime(frame["date"])
+        return pd.Series(frame["equity"].astype(float).values, index=idx)
+    return frame["equity"].astype(float)
+
+
+def combine_dual_equity_curves(
+    legacy: Any,
+    top3: Top3BacktestResult,
+) -> pd.Series:
+    """Sum legacy + Top3 daily equity (separate capital pools, shared calendar)."""
+    leg = _normalized_equity_series(legacy)
+    t3 = _normalized_equity_series(top3)
+    if leg.empty and t3.empty:
+        return pd.Series(dtype=float)
+    combined = pd.concat([leg.rename("legacy"), t3.rename("top3")], axis=1).sort_index()
+    combined = combined.ffill()
+    combined = combined.fillna(
+        {"legacy": legacy.initial_cash, "top3": top3.initial_cash}
+    )
+    return combined.sum(axis=1)
+
+
+def summarize_dual_combined(
+    legacy: Any,
+    top3: Top3BacktestResult,
+    *,
+    legacy_pct: float = 60.0,
+    top3_pct: float = 40.0,
+) -> dict[str, float | int]:
+    """Metrics for Phase 4 split: legacy pool + Top3 pool on one $100k account."""
+    total_initial = legacy.initial_cash + top3.initial_cash
+    total_final = legacy.final_equity + top3.final_equity
+    combined_equity = combine_dual_equity_curves(legacy, top3)
+    return {
+        "legacy_pct": legacy_pct,
+        "top3_pct": top3_pct,
+        "initial_cash": total_initial,
+        "final_equity": total_final,
+        "total_return_pct": (
+            (total_final - total_initial) / total_initial * 100.0
+            if total_initial > 0
+            else 0.0
+        ),
+        "max_drawdown_pct": compute_max_drawdown(combined_equity)
+        if not combined_equity.empty
+        else 0.0,
+        "sharpe_ratio": compute_sharpe_ratio(combined_equity)
+        if not combined_equity.empty
+        else 0.0,
+        "total_trades": legacy.total_trades + top3.total_trades,
+    }
+
+
+def print_dual_combined_summary(
+    legacy: Any,
+    top3: Top3BacktestResult,
+    *,
+    legacy_pct: float = 60.0,
+    top3_pct: float = 40.0,
+    window_label: str = "",
+) -> None:
+    """Print Phase 4 combined ledger (legacy slice + Top3 slice)."""
+    metrics = summarize_dual_combined(
+        legacy, top3, legacy_pct=legacy_pct, top3_pct=top3_pct
+    )
+    width = 88
+    title = f"PHASE 4 DUAL COMBINED ({legacy_pct:.0f}/{top3_pct:.0f})"
+    if window_label:
+        title = f"{title} - {window_label}"
+    print("=" * width)
+    print(title.center(width))
+    print("=" * width)
+    print(f"Legacy pool          : ${legacy.initial_cash:,.2f} -> ${legacy.final_equity:,.2f} ({legacy.total_return_pct:+.2f}%)")
+    print(f"Top3 pool            : ${top3.initial_cash:,.2f} -> ${top3.final_equity:,.2f} ({top3.total_return_pct:+.2f}%)")
+    print(f"Combined initial     : ${metrics['initial_cash']:,.2f}")
+    print(f"Combined final       : ${metrics['final_equity']:,.2f}")
+    print(f"Combined return      : {metrics['total_return_pct']:+.2f}%")
+    print(f"Combined MaxDD       : {metrics['max_drawdown_pct']:.2f}%")
+    print(f"Combined Sharpe      : {metrics['sharpe_ratio']:.2f}")
+    print(f"Combined trades      : {metrics['total_trades']}")
+    print("=" * width)
 
 
 def print_strategy_comparison_table(

@@ -24,6 +24,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 13. [Phase 9 — Momentum, Dry-Run & EOD Report](#phase-9--momentum-dry-run--eod-report)
 14. [Phase 10 — Trend Hold & Exit Discipline](#phase-10--trend-hold--exit-discipline)
 15. [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases)
+16. [Phase 14 — Profit, Risk & Diversified Watchlist](#phase-14--profit-risk--diversified-watchlist)
 
 ---
 
@@ -39,9 +40,20 @@ KIS_APP_SECRET=your_app_secret_here
 KIS_CANO=your_account_number
 KIS_ACNT_PRDT_CD=01
 
-WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER
-USE_SPY_MARKET_FILTER=false
+WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER,LLY,UNH,JNJ,JPM,V,XOM,COST,WMT,KO,CAT
+USE_SPY_MARKET_FILTER=true
 USE_QQQ_REGIME_FILTER=true
+USE_REGIME_GOLDEN_CROSS=true
+USE_VOL_ADJUSTED_RISK=true
+USE_WEEKLY_TREND_FILTER=true
+USE_52W_HIGH_FILTER=true
+USE_SCALE_IN=true
+USE_SCALE_OUT=true
+MAX_POSITIONS_PER_SECTOR=2
+MOMENTUM_SECTOR_DIVERSIFY=true
+MOMENTUM_MAX_PER_SECTOR=1
+PENDING_ORDER_CANCEL_MINUTES=45
+MAX_CONSECUTIVE_LOSS_DAYS=3
 CAPITAL_AT_RISK=100000
 RISK_PER_TRADE=0.01
 LOOP_COOLDOWN_SECONDS=60
@@ -209,6 +221,17 @@ sudo systemctl status toss-bot
 cd ~/toss-trading-bot
 git fetch origin && git reset --hard origin/main
 .venv/bin/pip install -r requirements.txt
+```
+
+**Merge Phase 14 keys into server `.env`** (if not already present — compare with `.env.example`):
+
+```bash
+grep -E '^(WATCHLIST|USE_REGIME_GOLDEN_CROSS|USE_VOL_ADJUSTED_RISK|USE_WEEKLY_TREND_FILTER|USE_52W_HIGH_FILTER|USE_SCALE_IN|USE_SCALE_OUT|MAX_POSITIONS_PER_SECTOR|MOMENTUM_SECTOR_DIVERSIFY)=' .env
+```
+
+Add or update missing lines from `.env.example`, then:
+
+```bash
 sudo systemctl restart toss-bot
 systemctl is-active toss-bot
 ```
@@ -318,7 +341,7 @@ Commit `46767be` — reduces off-hours VTS noise and Telegram spam.
 
 ## Log Management
 
-Growth: ~10–15 MB per US trading day (60s × 15 tickers during RTH).
+Growth: ~15–25 MB per US trading day (60s × 25 tickers during RTH).
 
 Rotate on EC2:
 
@@ -483,6 +506,40 @@ Full strategy matrix: [README Section 8](../README.md#8-strategy-configurations-
 
 ---
 
+## Phase 14 — Profit, Risk & Diversified Watchlist
+
+Phase 14 closes the gap between live, backtest, and production risk posture. Full architecture: [README Phase 14](../README.md#phase-14-profit-risk-parity--diversified-universe-2026-06) · [Live System Flow](../README.md#live-system-flow).
+
+| Feature | Env / file | What it does |
+|---|---|---|
+| 25-ticker universe | `WATCHLIST`, `market_registry.py` | 15 tech core + 10 non-tech (healthcare, finance, energy, consumer, industrial) |
+| Sector caps | `MAX_POSITIONS_PER_SECTOR`, `TICKER_SECTORS` | Blocks new BUY when sector is full |
+| Top3 sector diversify | `MOMENTUM_SECTOR_DIVERSIFY`, `MOMENTUM_MAX_PER_SECTOR` | At most one Top3 name per sector |
+| Legacy/Top3 ownership | `strategy_ownership.py` | Prevents both strategies opening the same ticker |
+| Golden-cross regime | `USE_REGIME_GOLDEN_CROSS` | Cautious / risk-off caps when SPY 50MA ≤ 200MA |
+| Vol-adjusted risk | `USE_VOL_ADJUSTED_RISK`, `VOL_TARGET_PCT` | Scales per-trade risk from SPY ATR% |
+| Entry filters | `USE_WEEKLY_TREND_FILTER`, `USE_52W_HIGH_FILTER` | Shared live ↔ backtest via `trading_features.py` |
+| Scale-in / scale-out | `USE_SCALE_IN`, `USE_SCALE_OUT` | Partial entry + partial profit exit |
+| Stale limit cancel | `PENDING_ORDER_CANCEL_MINUTES` | Cancel unfilled limits after 45 min (default) |
+| Consecutive loss CB | `MAX_CONSECUTIVE_LOSS_DAYS` | Blocks new BUY after N losing days |
+
+**Production EC2 `.env` (Phase 4 + Phase 14):** use the [Local Setup](#local-setup) block — 25-ticker `WATCHLIST` and Phase 14 flags are included.
+
+**Verify after deploy:**
+
+```bash
+.venv/bin/python -m pytest test_market_regime.py test_strategy_ownership.py test_entry_filters.py test_market_registry.py -q
+grep -E 'WATCHLIST|Phase|capital=|top3=' project_metrics.log | tail -20
+```
+
+**Watchlist A/B (optional, on PC):**
+
+```powershell
+python scripts/compare_watchlist.py
+```
+
+---
+
 ## Live OHLCV Cache Hardening (2026-06)
 
 Three production risks addressed in `market_data_cache.py`:
@@ -490,7 +547,7 @@ Three production risks addressed in `market_data_cache.py`:
 | Risk | Fix |
 |---|---|
 | **Intraday CSV pollution** | RTH forming bar kept in memory only; disk stores **completed EOD bars**; startup heals polluted CSV tails |
-| **15-ticker sequential skew** | `PARALLEL_TICKER_REFRESH=true` — all tickers refreshed at cycle start via thread pool |
+| **15-ticker sequential skew** | `PARALLEL_TICKER_REFRESH=true` — optional parallel refresh at cycle start (VTS: keep `false`) |
 | **Pandas memory fragmentation** | In-place row updates during RTH; `pd.concat` only on new session dates; periodic `gc.collect()` |
 
 **Env:**

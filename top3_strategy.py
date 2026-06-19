@@ -20,6 +20,7 @@ from momentum_ranker import (
     MomentumRankSettings,
     rank_universe_cache,
     select_top_tickers,
+    select_top_tickers_diversified,
     should_rebalance_on_bar_date,
 )
 
@@ -141,7 +142,14 @@ def compute_top3_rebalance_orders(
         return shadow, [], []
 
     ranked = rank_universe_cache(cache, universe, as_of_date=as_of, settings=cfg)
-    target = select_top_tickers(ranked, top_n=cfg.top_n)
+    if cfg.sector_diversify:
+        target = select_top_tickers_diversified(
+            ranked,
+            top_n=cfg.top_n,
+            max_per_sector=cfg.max_per_sector,
+        )
+    else:
+        target = select_top_tickers(ranked, top_n=cfg.top_n)
     if not target:
         target = universe[: cfg.top_n]
 

@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 
 from backtest_benchmarks import summarize_strategy_vs_benchmarks
 from config import StrategyConfigMapper
-from deployment_config import DeploymentConfig
+from deployment_config import DeploymentConfig, scaled_capital
 from market_registry import BENCHMARK_TICKER, DEFAULT_WATCHLIST, SECONDARY_BENCHMARK_TICKER, parse_watchlist
 from momentum_ranker import MomentumRankSettings
 from portfolio_backtest import (
@@ -38,6 +38,7 @@ from portfolio_backtest import (
 )
 from top3_backtest import (
     Top3BacktestResult,
+    print_dual_combined_summary,
     print_strategy_comparison_table,
     run_top3_backtest,
 )
@@ -87,6 +88,10 @@ def resolve_momentum_settings(args: argparse.Namespace) -> MomentumRankSettings:
         weight_volume=settings.weight_volume,
         require_above_sma50=settings.require_above_sma50,
         require_above_sma200=settings.require_above_sma200,
+        require_near_52w_high=settings.require_near_52w_high,
+        near_52w_high_pct=settings.near_52w_high_pct,
+        sector_diversify=settings.sector_diversify,
+        max_per_sector=settings.max_per_sector,
         min_bars=settings.min_bars,
     )
 
@@ -547,9 +552,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--strategy",
-        choices=("legacy", "top3", "compare"),
+        choices=("legacy", "top3", "compare", "dual"),
         default="legacy",
-        help="legacy=signal engine, top3=momentum rebalance, compare=both side-by-side",
+        help="legacy=signal engine, top3=momentum rebalance, compare=both side-by-side, dual=Phase4 60/40 combined",
     )
     return parser
 
@@ -584,11 +589,31 @@ def run_strategy_backtests(
     legacy_result: PortfolioBacktestResult | None = None
     top3_result: Top3BacktestResult | None = None
 
-    if args.strategy in {"legacy", "compare"}:
+    legacy_cash = args.cash
+    top3_cash = args.cash
+    legacy_pct = 100.0
+    top3_pct = 0.0
+    if args.strategy == "dual":
+        deploy = DeploymentConfig.from_env()
+        if not deploy.is_dual:
+            deploy = DeploymentConfig(
+                phase=4,
+                strategy_mode="dual",
+                top3_backtest_only=False,
+                top3_dry_run_enabled=False,
+                legacy_capital_pct=float(os.getenv("LEGACY_CAPITAL_PCT", "60")),
+                top3_capital_pct=float(os.getenv("TOP3_CAPITAL_PCT", "40")),
+            )
+        legacy_cash = scaled_capital(args.cash, deploy.legacy_capital_fraction())
+        top3_cash = scaled_capital(args.cash, deploy.top3_capital_fraction())
+        legacy_pct = deploy.legacy_capital_pct
+        top3_pct = deploy.top3_capital_pct
+
+    if args.strategy in {"legacy", "compare", "dual"}:
         legacy_result = run_portfolio_backtest(
             tickers=loaded,
             ohlcv_by_ticker=ohlcv,
-            initial_cash=args.cash,
+            initial_cash=legacy_cash,
             risk_per_trade=args.risk_per_trade,
             commission_rate=args.commission,
             use_spy_market_filter=use_spy_filter,
@@ -602,10 +627,10 @@ def run_strategy_backtests(
             ohlcv,
             commission_rate=args.commission,
             risk_per_trade=args.risk_per_trade,
-            title_suffix=window_label or "LEGACY",
+            title_suffix=window_label or ("LEGACY" if args.strategy != "dual" else f"LEGACY ({legacy_pct:.0f}%)"),
         )
 
-    if args.strategy in {"top3", "compare"}:
+    if args.strategy in {"top3", "compare", "dual"}:
         if args.strategy == "compare":
             print()
         top3_settings = MomentumRankSettings(
@@ -618,13 +643,17 @@ def run_strategy_backtests(
             weight_volume=momentum_settings.weight_volume,
             require_above_sma50=momentum_settings.require_above_sma50,
             require_above_sma200=momentum_settings.require_above_sma200,
+            require_near_52w_high=momentum_settings.require_near_52w_high,
+            near_52w_high_pct=momentum_settings.near_52w_high_pct,
+            sector_diversify=momentum_settings.sector_diversify,
+            max_per_sector=momentum_settings.max_per_sector,
             min_bars=min(momentum_settings.min_bars, 60),
         )
         top3_ohlcv = full_ohlcv if full_ohlcv is not None else ohlcv
         top3_result = run_top3_backtest(
             tickers=loaded,
             ohlcv_by_ticker=top3_ohlcv,
-            initial_cash=args.cash,
+            initial_cash=top3_cash,
             commission_rate=args.commission,
             momentum_settings=top3_settings,
             window_start=args.start,
@@ -632,6 +661,8 @@ def run_strategy_backtests(
         )
         width = 88
         title = "TOP3 MOMENTUM BACKTEST"
+        if args.strategy == "dual":
+            title = f"TOP3 MOMENTUM BACKTEST ({top3_pct:.0f}%)"
         if window_label:
             title = f"{title} - {window_label}"
         print("=" * width)
@@ -651,6 +682,16 @@ def run_strategy_backtests(
         print_strategy_comparison_table(
             legacy_result,
             top3_result,
+            window_label=window_label,
+        )
+
+    if args.strategy == "dual" and legacy_result and top3_result:
+        print()
+        print_dual_combined_summary(
+            legacy_result,
+            top3_result,
+            legacy_pct=legacy_pct,
+            top3_pct=top3_pct,
             window_label=window_label,
         )
 
@@ -797,10 +838,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     print()
 
+    spy_df: pd.DataFrame | None = None
+    qqq_df: pd.DataFrame | None = None
+
     if args.random:
         ohlcv = load_random_watchlist_data(tickers, args.random_bars, args.random_seed)
-        skipped: list[str] = []
-        spy_df = None
+        skipped = []
+        if use_spy_filter:
+            spy_df = generate_random_ohlcv(
+                BENCHMARK_TICKER,
+                bars=args.random_bars,
+                seed=args.random_seed + 1,
+            )
+            if StrategyConfigMapper.use_qqq_regime_filter():
+                qqq_df = generate_random_ohlcv(
+                    SECONDARY_BENCHMARK_TICKER,
+                    bars=args.random_bars,
+                    seed=args.random_seed + 2,
+                )
     elif args.yfinance:
         ohlcv, skipped = load_yfinance_watchlist_data(
             tickers,
@@ -842,9 +897,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     print()
 
-    spy_df: pd.DataFrame | None = None
-    qqq_df: pd.DataFrame | None = None
-    if use_spy_filter and not args.random:
+    if use_spy_filter and spy_df is None:
         try:
             if args.yfinance or args.walk_forward:
                 spy_df = fetch_yfinance_ohlcv(

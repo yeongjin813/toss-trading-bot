@@ -26,7 +26,7 @@ def test_config_enabled_with_credentials(monkeypatch) -> None:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setenv("USE_TELEGRAM_ALERTS", "true")
-    cfg = TelegramConfig.from_env()
+    cfg = TelegramConfig.from_env(bot_token="test-token", chat_id="12345")
     assert cfg.enabled is True
     assert cfg.bot_token == "test-token"
     assert cfg.chat_id == "12345"

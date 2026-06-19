@@ -39,6 +39,10 @@ class MomentumRankSettings:
     weight_volume: float = 0.1
     require_above_sma50: bool = True
     require_above_sma200: bool = False
+    require_near_52w_high: bool = False
+    near_52w_high_pct: float = 0.05
+    sector_diversify: bool = True
+    max_per_sector: int = 1
     min_bars: int = TRADING_DAYS_12M
 
     @classmethod
@@ -56,6 +60,10 @@ class MomentumRankSettings:
             weight_volume=float(os.getenv("MOMENTUM_WEIGHT_VOLUME", "0.1")),
             require_above_sma50=_flag("MOMENTUM_REQUIRE_SMA50", "true"),
             require_above_sma200=_flag("MOMENTUM_REQUIRE_SMA200", "false"),
+            require_near_52w_high=_flag("MOMENTUM_REQUIRE_NEAR_52W_HIGH", "true"),
+            near_52w_high_pct=float(os.getenv("MOMENTUM_NEAR_52W_HIGH_PCT", "0.05")),
+            sector_diversify=_flag("MOMENTUM_SECTOR_DIVERSIFY", "true"),
+            max_per_sector=max(1, int(os.getenv("MOMENTUM_MAX_PER_SECTOR", "1"))),
             min_bars=int(os.getenv("MOMENTUM_MIN_BARS", str(TRADING_DAYS_12M))),
         )
 
@@ -158,6 +166,12 @@ def compute_ticker_momentum(
     if cfg.require_above_sma200 and not above_sma200:
         return None
 
+    high_52w = float(closes.tail(TRADING_DAYS_12M).max()) if len(closes) >= TRADING_DAYS_12M else close
+    if cfg.require_near_52w_high and high_52w > 0:
+        floor = high_52w * (1.0 - cfg.near_52w_high_pct)
+        if close < floor:
+            return None
+
     ret_3m = _period_return(closes, TRADING_DAYS_3M)
     ret_6m = _period_return(closes, TRADING_DAYS_6M)
     ret_12m = _period_return(closes, TRADING_DAYS_12M)
@@ -256,6 +270,30 @@ def select_top_tickers(
     top_n: int,
 ) -> list[str]:
     return [row.ticker for row in ranked[:top_n]]
+
+
+def select_top_tickers_diversified(
+    ranked: list[MomentumScore],
+    *,
+    top_n: int,
+    max_per_sector: int = 1,
+) -> list[str]:
+    """Pick top momentum names with sector concentration cap."""
+    from market_registry import sector_for_ticker
+
+    selected: list[str] = []
+    sector_counts: dict[str, int] = {}
+    for row in ranked:
+        sector = sector_for_ticker(row.ticker)
+        if sector in {"benchmark", "other"}:
+            pass
+        elif sector_counts.get(sector, 0) >= max_per_sector:
+            continue
+        selected.append(row.ticker)
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        if len(selected) >= top_n:
+            break
+    return selected
 
 
 def should_rebalance_today(
@@ -368,7 +406,14 @@ def rebalance_active_tickers(
         as_of_date=as_of_date,
         settings=cfg,
     )
-    active = select_top_tickers(ranked, top_n=cfg.top_n)
+    if cfg.sector_diversify:
+        active = select_top_tickers_diversified(
+            ranked,
+            top_n=cfg.top_n,
+            max_per_sector=cfg.max_per_sector,
+        )
+    else:
+        active = select_top_tickers(ranked, top_n=cfg.top_n)
     if not active:
         active = list(universe[: cfg.top_n])
 

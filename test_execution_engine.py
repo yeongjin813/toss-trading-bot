@@ -15,6 +15,26 @@ from execution_engine import (
 )
 
 
+def _test_settings(**overrides: object) -> ExecutionSettings:
+    base = dict(
+        max_daily_loss_usd=100,
+        max_open_positions=3,
+        max_ticker_exposure_usd=1000,
+        max_portfolio_usd=10000,
+        rth_buy_block_open_minutes=10,
+        rth_buy_block_close_minutes=5,
+        pending_order_stale_minutes=120,
+        pending_order_cancel_minutes=45,
+        fill_inquiry_alert_cooldown_minutes=15,
+        default_limit_buffer_bps=10,
+        high_vol_limit_buffer_bps=15,
+        max_consecutive_loss_days=3,
+        max_positions_per_sector=2,
+    )
+    base.update(overrides)
+    return ExecutionSettings(**base)
+
+
 def test_summarize_ccnl_fills_partial() -> None:
     rows = [
         {
@@ -36,18 +56,7 @@ def test_summarize_ccnl_fills_partial() -> None:
 
 
 def test_risk_guard_blocks_max_positions() -> None:
-    settings = ExecutionSettings(
-        max_daily_loss_usd=100,
-        max_open_positions=2,
-        max_ticker_exposure_usd=5000,
-        max_portfolio_usd=10000,
-        rth_buy_block_open_minutes=10,
-        rth_buy_block_close_minutes=5,
-        pending_order_stale_minutes=120,
-        fill_inquiry_alert_cooldown_minutes=15,
-        default_limit_buffer_bps=10,
-        high_vol_limit_buffer_bps=15,
-    )
+    settings = _test_settings(max_open_positions=2, max_ticker_exposure_usd=5000)
     guard = RiskGuard(settings)
     states = {
         "AAPL": {"held_quantity": 1, "in_position": True},
@@ -64,18 +73,7 @@ def test_risk_guard_blocks_max_positions() -> None:
 
 
 def test_rth_open_buy_block() -> None:
-    settings = ExecutionSettings(
-        max_daily_loss_usd=100,
-        max_open_positions=3,
-        max_ticker_exposure_usd=1000,
-        max_portfolio_usd=10000,
-        rth_buy_block_open_minutes=10,
-        rth_buy_block_close_minutes=5,
-        pending_order_stale_minutes=120,
-        fill_inquiry_alert_cooldown_minutes=15,
-        default_limit_buffer_bps=10,
-        high_vol_limit_buffer_bps=15,
-    )
+    settings = _test_settings()
     ny = pytz.timezone("America/New_York")
     dt = ny.localize(datetime(2026, 6, 16, 9, 35, 0))
     assert block_new_buy_rth_window(dt, settings) is not None
@@ -102,18 +100,7 @@ def test_clear_open_order_fields() -> None:
 def test_broker_fallback_clears_pending_buy() -> None:
     from execution_engine import ExecutionSettings, OrderFillMonitor, TradeLogWriter, assign_open_order
 
-    settings = ExecutionSettings(
-        max_daily_loss_usd=100,
-        max_open_positions=3,
-        max_ticker_exposure_usd=1000,
-        max_portfolio_usd=10000,
-        rth_buy_block_open_minutes=10,
-        rth_buy_block_close_minutes=5,
-        pending_order_stale_minutes=120,
-        fill_inquiry_alert_cooldown_minutes=15,
-        default_limit_buffer_bps=10,
-        high_vol_limit_buffer_bps=15,
-    )
+    settings = _test_settings()
     monitor = OrderFillMonitor(settings, TradeLogWriter("./trade_log_test.csv"))
     runtime = PositionState()
     assign_open_order(
@@ -157,9 +144,44 @@ def test_broker_fallback_clears_pending_buy() -> None:
     assert runtime.in_position is True
 
 
+def test_risk_guard_blocks_sector_concentration() -> None:
+    guard = RiskGuard(_test_settings(max_positions_per_sector=2))
+    states = {
+        "AAPL": {"held_quantity": 10, "in_position": True},
+        "MSFT": {"held_quantity": 5, "in_position": True},
+        "_portfolio": {
+            "daily_pnl_anchor_date": "2026-06-16",
+            "day_start_equity_usd": 10000,
+            "last_equity_usd": 10000,
+        },
+    }
+    reason = guard.check_buy_allowed("GOOGL", 1, 200.0, states)
+    assert reason is not None
+    assert "sector mega_tech" in reason
+
+
+def test_risk_guard_blocks_consecutive_loss_days() -> None:
+    guard = RiskGuard(_test_settings(max_consecutive_loss_days=3))
+    ny = pytz.timezone("America/New_York")
+    now = ny.localize(datetime(2026, 6, 16, 12, 0, 0))
+    states = {
+        "_portfolio": {
+            "daily_pnl_anchor_date": "2026-06-16",
+            "day_start_equity_usd": 10000,
+            "last_equity_usd": 10000,
+            "consecutive_loss_days": 3,
+        },
+    }
+    reason = guard.check_buy_allowed("AAPL", 1, 200.0, states, now=now)
+    assert reason is not None
+    assert "consecutive loss days" in reason
+
+
 def main() -> int:
     test_summarize_ccnl_fills_partial()
     test_risk_guard_blocks_max_positions()
+    test_risk_guard_blocks_sector_concentration()
+    test_risk_guard_blocks_consecutive_loss_days()
     test_rth_open_buy_block()
     test_clear_open_order_fields()
     test_broker_fallback_clears_pending_buy()

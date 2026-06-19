@@ -14,7 +14,7 @@ FillCallback = Callable[[str, str, int, float, str], None]
 AlertCallback = Callable[[str, str], None]
 
 from analytics import PositionState, _to_ny_datetime
-from market_registry import MARKET_META
+from market_registry import MARKET_META, sector_for_ticker
 
 TRADE_LOG_COLUMNS = (
     "timestamp",
@@ -41,9 +41,12 @@ class ExecutionSettings:
     rth_buy_block_open_minutes: int
     rth_buy_block_close_minutes: int
     pending_order_stale_minutes: int
+    pending_order_cancel_minutes: int
     fill_inquiry_alert_cooldown_minutes: int
     default_limit_buffer_bps: float
     high_vol_limit_buffer_bps: float
+    max_consecutive_loss_days: int
+    max_positions_per_sector: int
 
     @classmethod
     def from_env(cls) -> ExecutionSettings:
@@ -62,6 +65,9 @@ class ExecutionSettings:
             pending_order_stale_minutes=int(
                 os.getenv("PENDING_ORDER_STALE_MINUTES", "120")
             ),
+            pending_order_cancel_minutes=int(
+                os.getenv("PENDING_ORDER_CANCEL_MINUTES", "45")
+            ),
             fill_inquiry_alert_cooldown_minutes=int(
                 os.getenv("FILL_INQUIRY_ALERT_COOLDOWN_MINUTES", "15")
             ),
@@ -69,6 +75,8 @@ class ExecutionSettings:
             high_vol_limit_buffer_bps=float(
                 os.getenv("KIS_HIGH_VOL_LIMIT_BUFFER_BPS", "15")
             ),
+            max_consecutive_loss_days=int(os.getenv("MAX_CONSECUTIVE_LOSS_DAYS", "3")),
+            max_positions_per_sector=int(os.getenv("MAX_POSITIONS_PER_SECTOR", "2")),
         )
 
 
@@ -213,7 +221,45 @@ class RiskGuard:
                 f"daily loss limit (${loss:.2f} >= "
                 f"${self.settings.max_daily_loss_usd:.2f})"
             )
+
+        consecutive = int(portfolio.get("consecutive_loss_days", 0) or 0)
+        if (
+            self.settings.max_consecutive_loss_days > 0
+            and consecutive >= self.settings.max_consecutive_loss_days
+        ):
+            return (
+                f"consecutive loss days ({consecutive} >= "
+                f"{self.settings.max_consecutive_loss_days})"
+            )
         return None
+
+    def _effective_max_open_positions(
+        self,
+        *,
+        max_open_positions_override: int | None = None,
+    ) -> int:
+        if max_open_positions_override is not None:
+            return max(0, max_open_positions_override)
+        return self.settings.max_open_positions
+
+    def _sector_position_count(
+        self,
+        states: dict[str, Any],
+        sector: str,
+        *,
+        exclude_ticker: str | None = None,
+    ) -> int:
+        count = 0
+        for key, payload in states.items():
+            if str(key).startswith("_") or not isinstance(payload, dict):
+                continue
+            if exclude_ticker and str(key).upper() == exclude_ticker.upper():
+                continue
+            if int(payload.get("held_quantity", 0) or 0) <= 0:
+                continue
+            if sector_for_ticker(str(key)) == sector:
+                count += 1
+        return count
 
     def check_buy_allowed(
         self,
@@ -225,6 +271,7 @@ class RiskGuard:
         now: datetime | None = None,
         deployable_cash_usd: float | None = None,
         portfolio_deployed_usd: float = 0.0,
+        max_open_positions_override: int | None = None,
     ) -> str | None:
         block = self._portfolio_block(states, now)
         if block:
@@ -233,6 +280,9 @@ class RiskGuard:
         if deployable_cash_usd is not None and deployable_cash_usd <= 0:
             return "no deployable cash (portfolio at or above capital cap)"
 
+        max_positions = self._effective_max_open_positions(
+            max_open_positions_override=max_open_positions_override,
+        )
         open_positions = sum(
             1
             for key, payload in states.items()
@@ -242,11 +292,28 @@ class RiskGuard:
         )
         ticker_state = states.get(ticker, {})
         already_held = int(ticker_state.get("held_quantity", 0) or 0) > 0
-        if not already_held and open_positions >= self.settings.max_open_positions:
+        if not already_held and open_positions >= max_positions:
             return (
                 f"max open positions ({open_positions} >= "
-                f"{self.settings.max_open_positions})"
+                f"{max_positions})"
             )
+
+        sector = sector_for_ticker(ticker)
+        if (
+            self.settings.max_positions_per_sector > 0
+            and sector not in {"benchmark", "other"}
+            and not already_held
+        ):
+            sector_count = self._sector_position_count(
+                states,
+                sector,
+                exclude_ticker=ticker,
+            )
+            if sector_count >= self.settings.max_positions_per_sector:
+                return (
+                    f"sector {sector} concentration "
+                    f"({sector_count} >= {self.settings.max_positions_per_sector})"
+                )
 
         notional = proposed_size * entry_price
         held_qty = int(ticker_state.get("held_quantity", 0) or 0)
@@ -282,6 +349,18 @@ class RiskGuard:
     ) -> None:
         portfolio = states.setdefault("_portfolio", {})
         ny_date = _to_ny_datetime(now).strftime("%Y-%m-%d")
+        prev_date = portfolio.get("daily_pnl_anchor_date")
+        prev_start = float(portfolio.get("day_start_equity_usd", 0.0) or 0.0)
+        prev_close = float(portfolio.get("last_equity_usd", prev_start) or prev_start)
+
+        if prev_date and prev_date != ny_date and prev_start > 0:
+            if prev_close < prev_start:
+                portfolio["consecutive_loss_days"] = int(
+                    portfolio.get("consecutive_loss_days", 0) or 0
+                ) + 1
+            else:
+                portfolio["consecutive_loss_days"] = 0
+
         if portfolio.get("daily_pnl_anchor_date") != ny_date:
             portfolio["daily_pnl_anchor_date"] = ny_date
             portfolio["day_start_equity_usd"] = portfolio_equity
@@ -527,7 +606,7 @@ class OrderFillMonitor:
             )
             return True
 
-        if side in {"SELL", "DYNAMIC_ATR_SELL"}:
+        if side in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"}:
             pre_held = max(int(runtime.held_quantity or 0), order_qty, broker_qty)
             sold_qty = pre_held - broker_qty if pre_held > broker_qty else order_qty
             if sold_qty <= 0 and broker_qty > 0:
@@ -637,7 +716,41 @@ class OrderFillMonitor:
             broker_qty = int(states.get(ticker, {}).get("held_quantity", 0) or 0)
 
         age = pending_order_age_minutes(runtime)
-        if age >= self.settings.pending_order_stale_minutes and filled_qty == 0:
+        cancel_threshold = self.settings.pending_order_cancel_minutes
+        stale_threshold = self.settings.pending_order_stale_minutes
+
+        if (
+            filled_qty == 0
+            and still_open
+            and age >= cancel_threshold
+        ):
+            cancelled = self._try_cancel_open_order(
+                client,
+                ticker,
+                runtime,
+                side,
+                order_qty,
+            )
+            release_reason = "cancel_replace" if cancelled else "stale_cancel_failed"
+            if age >= stale_threshold or cancelled:
+                self._release_stale(
+                    runtime,
+                    ticker,
+                    side,
+                    cash_after,
+                    reason=release_reason,
+                )
+                return True
+            return False
+
+        if age >= stale_threshold and filled_qty == 0:
+            self._try_cancel_open_order(
+                client,
+                ticker,
+                runtime,
+                side,
+                order_qty,
+            )
             self._release_stale(runtime, ticker, side, cash_after, reason="stale_no_fill")
             return True
 
@@ -728,7 +841,7 @@ class OrderFillMonitor:
             )
             return True
 
-        if side in {"SELL", "DYNAMIC_ATR_SELL"}:
+        if side in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"}:
             sold_qty = filled_qty if filled_qty > 0 else max(order_qty - broker_qty, 0)
             pre_held = max(broker_qty + sold_qty, runtime.held_quantity)
             runtime.held_quantity = pre_held
@@ -794,6 +907,36 @@ class OrderFillMonitor:
 
         return False
 
+    def _try_cancel_open_order(
+        self,
+        client: Any,
+        ticker: str,
+        runtime: PositionState,
+        side: str,
+        order_qty: int,
+    ) -> bool:
+        """Cancel an unfilled broker limit order so the next cycle can re-submit."""
+        odno = runtime.open_order_id
+        if not odno or not hasattr(client, "cancel_overseas_order"):
+            return False
+        qty = order_qty or int(runtime.open_order_qty or 0)
+        if qty <= 0:
+            return False
+        try:
+            client.cancel_overseas_order(ticker, odno, qty)
+            print(
+                f"[FILL/CANCEL] {ticker} odno={odno} side={side} "
+                f"cancelled after {pending_order_age_minutes(runtime):.0f}m unfilled"
+            )
+            self._notify_alert(
+                "WARNING",
+                f"{ticker} limit order {odno} cancelled (unfilled) — will re-submit next cycle",
+            )
+            return True
+        except Exception as exc:
+            print(f"[FILL/CANCEL] {ticker} odno={odno} cancel failed: {exc}")
+            return False
+
     def _release_stale(
         self,
         runtime: PositionState,
@@ -804,6 +947,9 @@ class OrderFillMonitor:
         reason: str,
     ) -> None:
         odno = runtime.open_order_id or ""
+        if reason.startswith("cancel") and side == "BUY":
+            runtime.pending_resubmit_side = side
+            runtime.pending_resubmit_qty = int(runtime.open_order_qty or 0)
         runtime.pending_order = False
         clear_open_order(runtime)
         self.trade_log.append(

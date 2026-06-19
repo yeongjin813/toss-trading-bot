@@ -9,7 +9,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top3 momentum rebalance (separate sizing pools) |
 | **Universe Filter** | Legacy: full watchlist signals · Top3: equal-weight Top-3, Friday rebalance (`top3_strategy.py`) |
 | **Regime Filter** | SPY 200MA gate + optional QQQ half-size when SPY bear / QQQ bull (`USE_QQQ_REGIME_FILTER`) |
-| **Watchlist Matrix** | 15 US names (AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) — configurable via `.env` `WATCHLIST`; routing in `market_registry.py` |
+| **Watchlist Matrix** | **25 US names** — 15 tech core + 10 non-tech diversification (LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT); configurable via `.env` `WATCHLIST`; sector tags + KIS routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
 | **Account** | Set in `.env` — `KIS_CANO`, `KIS_ACNT_PRDT_CD` (never commit) |
 | **Execution Loop** | 60s watchlist cycle **during NY RTH only** (09:30–16:00 ET); sleeps off-hours |
@@ -25,9 +25,11 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Over-deploy auto-trim · `8a5b6e7` · Capital cap + deployable cash · `290e071` · ccnl-fb reconcile · `f1bf7fc`
+**Latest production commits:** Phase 14 profit/risk + 25-ticker watchlist · *(this release)* · Over-deploy auto-trim · `8a5b6e7` · ccnl-fb reconcile · `f1bf7fc`
 
 ---
+
+> **Phase 14 (2026-06)** extends the pipeline below: golden-cross regime, vol-adjusted sizing, entry filters, sector caps, Legacy/Top3 ownership, scale-in/out, and a **25-ticker** diversified universe. See [Improvement Journey](#improvement-journey--what-changed-and-why) rows **14.x** and [Phase 14](#phase-14-profit-risk-parity--diversified-universe-2026-06) before [Live System Flow](#live-system-flow).
 
 ## Documentation Map
 
@@ -75,10 +77,12 @@ flowchart TD
 1. **Calendar** — NYSE session day (not weekend/holiday)
 2. **RTH** — 09:30–16:00 America/New_York
 3. **Pending lock** — no open unfilled order on this ticker
-4. **Momentum** — ticker in Top-N active list (new BUY only; exits always run)
-5. **SPY/QQQ regime** — SPY ≤ 200MA blocks BUY; half size when SPY bear + QQQ bull
-6. **RiskGuard** — daily loss, max positions, per-ticker exposure
-7. **Signal engine** — regime-specific entry (dual / breakout / crossover) + staged exits
+4. **Entry filters** — weekly trend + optional 52-week high proximity (`entry_filters.py`)
+5. **Momentum** — ticker in Top-N active list (new BUY only; exits always run)
+6. **SPY/QQQ regime** — SPY ≤ 200MA blocks BUY; golden cross → cautious caps; half size when SPY bear + QQQ bull
+7. **Strategy ownership** — Legacy vs Top3 cannot both open the same ticker (`strategy_ownership.py`)
+8. **RiskGuard** — daily loss, consecutive loss days, max positions, per-ticker exposure, **sector concentration**
+9. **Signal engine** — regime-specific breakout entry + staged exits; optional scale-in / scale-out
 
 **Fill path:** `rt_cd=0` → ccnl/nccs poll → on HTTP 500 fallback to `present-balance` holdings → state mutates only on confirmed fill.
 
@@ -113,7 +117,12 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 | **9.4** | No safe way to test signals on EC2; no daily P&L push. | `KIS_DRY_RUN` instant-fill sim; **EOD Telegram** after 16:00 ET. | `daily_report.py`, `KIS_DRY_RUN`, `USE_DAILY_TELEGRAM_REPORT` |
 | **9.5** | VTS `present-balance` lists symbols but **qty fields are zero** while holdings exist. | Reconcile substitutes net qty from `inquire-ccnl` aggregation (`[RECONCILE/CCNL-FB]`). | `session_manager.py`, `f1bf7fc` |
 | **9.6** | EOD report showed stale local qty; Top3 Phase 4 orders skipped trade log + reconcile. | EOD prefers `broker_holdings` + sync warning; Top3 live orders → `trade_log` + `force=True` reconcile. | `daily_report.py`, `main.py`, `4689c11` |
-| **—** | *Still open:* strategy alpha vs buy-and-hold, VIX filter, real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency. | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
+| **13.7** | Marked holdings could exceed `CAPITAL_AT_RISK` after duplicate fills / VTS drift. | Over-deploy auto-trim at RTH (`OVERDEPLOYMENT_TRIM_ENABLED`); deployable cash cap + buy gates. | `overdeployment_trim.py`, `8a5b6e7` |
+| **14.0** | SPY bear-only gate missed “weak but not crash” regimes; fixed 1% risk ignored vol spikes. | Golden-cross regime (`USE_REGIME_GOLDEN_CROSS`); vol-adjusted `RISK_PER_TRADE` from SPY ATR%. | `analytics.py`, `test_market_regime.py` |
+| **14.1** | Legacy + Top3 could both BUY same ticker; tech-only pool made sector caps cosmetic. | Strategy ownership registry; `MAX_POSITIONS_PER_SECTOR`; Top3 `MOMENTUM_SECTOR_DIVERSIFY`. | `strategy_ownership.py`, `market_registry.py` |
+| **14.2** | Backtest lacked live entry filters / scale signals; limit orders could stale indefinitely. | `trading_features.py` + `entry_filters.py`; scale-in/out; limit cancel/replace (`PENDING_ORDER_CANCEL_MINUTES`). | `portfolio_backtest.py`, `execution_engine.py` |
+| **14.3** | 15-ticker universe was ~100% tech — correlated drawdowns in 2022/2024-style rotations. | **25-ticker** watchlist: 15 tech core + 10 liquid non-tech (healthcare, finance, energy, consumer, industrial). Dual backtest: MaxDD 44%→28%, Sharpe 1.25→1.31 (full period). | `market_registry.py`, `scripts/compare_watchlist.py` |
+| **—** | *Still open:* sustained alpha vs buy-and-hold in all walk-forward windows; VIX filter; real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency. | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
 
 > **Operator path:** after Step 8.0, day-to-day commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.  
 > **Researcher path:** strategy math stays in Sections 2–8 below.
@@ -183,7 +192,7 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 
 ### Phase 4: Dynamic ATR Risk Engine & Mathematical Integrity Corrections
 
-- **Architecture**: Expanded to a **15-ticker** parallel watchlist (default in `market_registry.py`: AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER) executing live routines through the KIS sandbox server (`openapivts.koreainvestment.com:29443`). Optional **SPY > 200MA** market filter blocks new BUY entries in bear regimes (`USE_SPY_MARKET_FILTER=true`).
+- **Architecture**: Expanded to a **25-ticker** parallel watchlist (15 tech core + 10 non-tech diversification in `market_registry.py`) executing live routines through the KIS sandbox server (`openapivts.koreainvestment.com:29443`). Optional **SPY > 200MA** market filter blocks new BUY entries in bear regimes (`USE_SPY_MARKET_FILTER=true`).
 - **Core Engineering Patches**: Mitigated critical production failures by implementing a localized memory bar caching engine (`MarketDataCache`), a state-gated concurrency lock to eliminate duplicate order flooding, an institutional volume liquidity surge gate, and a rigorous series of financial logic patches to eliminate same-bar look-ahead bias, capital over-leverage rejections, and weekend/holiday runtime crashes.
 
 ### Phase 5: Ticker-Specific Configuration & Macro Regime Filtering
@@ -330,6 +339,40 @@ python test_analytics.py
 - **ccnl HTTP 500** — intermittent on VTS; fill poll and reconcile retry on the next RTH cycle.
 
 **Operator check:** `[RECONCILE/CCNL-FB]` / `[RECONCILE/MISMATCH]` in logs; compare KIS app vs `held_quantity` in `trading_state.json`.
+
+### Phase 14: Profit, Risk Parity & Diversified Universe *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **Golden-cross regime** | `analytics.py` + `main.py` | SPY 50MA vs 200MA → `normal` / `cautious` / `risk_off`; tighter ATR stops in weak regimes |
+| **Vol-adjusted risk** | `analytics.py` | `USE_VOL_ADJUSTED_RISK` scales `RISK_PER_TRADE` from SPY ATR% vs `VOL_TARGET_PCT` |
+| **Entry filters** | `entry_filters.py` | Weekly trend SMA + optional 52-week high filter (shared live ↔ backtest via `trading_features.py`) |
+| **Scale-in / scale-out** | `analytics.py` + `portfolio_backtest.py` | 50% initial entry + add after 3 days; partial exit at profit target |
+| **Limit cancel/replace** | `execution_engine.py` | Stale pending limits cancelled after `PENDING_ORDER_CANCEL_MINUTES` (default 45) |
+| **Strategy ownership** | `strategy_ownership.py` | Legacy vs Top3 mutual exclusion on new BUY (shared broker positions) |
+| **Sector concentration** | `market_registry.py` + `execution_engine.py` | `TICKER_SECTORS` tags; `MAX_POSITIONS_PER_SECTOR=2`; Top3 `MOMENTUM_MAX_PER_SECTOR=1` |
+| **Sector-diversified Top-N** | `momentum_ranker.py` | `select_top_tickers_diversified()` for Top3 rebalance |
+| **25-ticker watchlist** | `market_registry.py` | Tech core (15) + diversification sleeve: LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT |
+| **Backtest parity** | `portfolio_backtest.py`, `top3_backtest.py`, `run_backtest.py` | Live feature flags, regime stops, scale signals, dual `--strategy dual` |
+
+**Watchlist backtest trade-off (dual 60/40, yfinance 2017–):**
+
+| Universe | Return | MaxDD | Sharpe |
+|---|---|---|---|
+| 15 tech-only | +1577% | 43.7% | 1.25 |
+| **25 diversified (production default)** | +733% | **27.6%** | **1.31** |
+
+Production default favors **lower drawdown and better risk-adjusted returns** over maximizing tech-bull CAGR.
+
+**Verify:**
+
+```powershell
+python -m pytest test_market_regime.py test_strategy_ownership.py test_entry_filters.py test_market_registry.py
+python run_backtest.py --strategy dual --yfinance
+python scripts/compare_watchlist.py
+```
+
+**Recommended `.env` (Phase 4 + Phase 14):** copy from `.env.example` — includes `USE_REGIME_GOLDEN_CROSS`, `USE_VOL_ADJUSTED_RISK`, `USE_WEEKLY_TREND_FILTER`, `USE_52W_HIGH_FILTER`, `USE_SCALE_IN`, `USE_SCALE_OUT`, `MAX_POSITIONS_PER_SECTOR=2`, `MOMENTUM_SECTOR_DIVERSIFY=true`, and the 25-ticker `WATCHLIST`.
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -1146,7 +1189,7 @@ During NY **regular hours**, `LOOP_COOLDOWN_SECONDS = 60` applies between watchl
 ```
                          ┌─────────────────────────────────────────────┐
                          │             main.py - Orchestrator          │
-                         │  WATCHLIST (15, .env / market_registry.py)  │
+                         │  WATCHLIST (25, .env / market_registry.py)  │
                          │  SPY filter: BUY only when SPY > 200MA      │
                          └─────────────────────┬───────────────────────┘
                                                │
@@ -1234,7 +1277,7 @@ To bypass severe database replication lag on the KIS Virtual Trading Server (VTS
 
 New watchlist tickers must be registered in `market_registry.MARKET_META` before being added to `WATCHLIST` in `.env`.
 
-Default watchlist (15): `AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER`. NYSE names (`TSM`, `SHOP`, `UBER`) use `NYS`/`NYSE`; others use `NAS`/`NASD`.
+Default watchlist (25): tech core `AAPL, MSFT, NVDA, META, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX, PLTR, CRWD, TSM, SHOP, UBER` plus diversification sleeve `LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT`. NYSE names use `NYS`/`NYSE`; NASDAQ names use `NAS`/`NASD`. Sector tags in `TICKER_SECTORS` drive `MAX_POSITIONS_PER_SECTOR` and Top3 sector diversify.
 
 ### Continuous Monitoring Loop
 
@@ -1272,7 +1315,7 @@ To prevent the system from getting flagged or blacklisted by the broker's rate l
 | `TARGET_BARS` | 756 | Rolling window cap |
 | `MIN_DATA_BARS` | 22 | Minimum before analytics run |
 
-| Mode | API Calls per Cycle (15 tickers + SPY) | Bars Transferred (approx.) |
+| Mode | API Calls per Cycle (25 tickers + SPY/QQQ) | Bars Transferred (approx.) |
 |---|---|---|
 | **Pre-Phase-4** | N × ~15 paginated requests | ~N × 756 bars |
 | **Phase-4** | N × 1 request (+ SPY if filter on) | ~N intraday refreshes |
@@ -1443,7 +1486,7 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 |---|---|---|
 | `CAPITAL_AT_RISK` | **100000** | Total deployable portfolio (USD); Phase 4 → Legacy $60k + Top3 $40k |
 | `RISK_PER_TRADE` | **0.01** | Per-trade risk fraction (1%) |
-| `WATCHLIST` | `AAPL,MSFT,NVDA,...` (15 defaults) | Comma-separated ticker list; must exist in `market_registry.MARKET_META` |
+| `WATCHLIST` | `AAPL,MSFT,NVDA,...` (25 defaults) | Comma-separated ticker list; must exist in `market_registry.MARKET_META` |
 | `TARGET_BARS` | **756** | Rolling historical window (3 × 252 trading days) |
 | `LOOP_COOLDOWN_SECONDS` | **60** | Open-session inter-cycle pause |
 | `MARKET_CLOSED_SLEEP_SECONDS` | **3600** | Closed-session extended sleep |
@@ -1837,7 +1880,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `WATCHLIST` | No | 15-ticker default in `.env.example` | Comma-separated tickers; register new symbols in `market_registry.py` |
+| `WATCHLIST` | No | 25-ticker default in `.env.example` | Comma-separated tickers; register new symbols in `market_registry.py` |
 | `CAPITAL_AT_RISK` | No | `100000` | Total USD capital base (Phase 4: 60% legacy + 40% Top3) |
 | `RISK_PER_TRADE` | No | `0.01` | Per-trade risk fraction |
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
@@ -1876,6 +1919,27 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `MOMENTUM_WEIGHT_VOLUME` | No | `0.1` | Volume stability weight |
 | `MOMENTUM_REQUIRE_SMA50` | No | `true` | Require price above 50MA for ranking |
 | `MOMENTUM_REQUIRE_SMA200` | No | `false` | Require price above 200MA for ranking |
+| `MOMENTUM_REQUIRE_NEAR_52W_HIGH` | No | `true` | Require proximity to 52-week high for Top3 ranking |
+| `MOMENTUM_SECTOR_DIVERSIFY` | No | `true` | Sector cap when selecting Top-N momentum names |
+| `MOMENTUM_MAX_PER_SECTOR` | No | `1` | Max Top3 picks per sector tag |
+
+#### Phase 14 — Regime, Filters & Risk *(2026-06)*
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `USE_REGIME_GOLDEN_CROSS` | No | `true` | SPY 50/200MA golden cross → cautious regime caps |
+| `REGIME_CAUTIOUS_MAX_POSITIONS` | No | `2` | Max open positions when regime is cautious |
+| `USE_VOL_ADJUSTED_RISK` | No | `true` | Scale `RISK_PER_TRADE` from SPY ATR% |
+| `VOL_TARGET_PCT` | No | `0.015` | Target daily vol for vol-adjusted sizing |
+| `USE_WEEKLY_TREND_FILTER` | No | `true` | Block BUY when weekly close below weekly SMA |
+| `WEEKLY_TREND_SMA_PERIOD` | No | `20` | Weekly SMA lookback (weeks) |
+| `USE_52W_HIGH_FILTER` | No | `true` | Legacy entry filter: require near 52-week high |
+| `NEAR_52W_HIGH_PCT` | No | `0.05` | Max distance below 52w high (fraction) |
+| `USE_SCALE_IN` | No | `true` | 50% initial entry + add after 3 days |
+| `USE_SCALE_OUT` | No | `true` | Partial exit at profit target |
+| `MAX_POSITIONS_PER_SECTOR` | No | `2` | Sector concentration cap (new BUY) |
+| `MAX_CONSECUTIVE_LOSS_DAYS` | No | `3` | Circuit breaker after N losing days |
+| `PENDING_ORDER_CANCEL_MINUTES` | No | `45` | Cancel stale limit orders and allow resubmit |
 
 #### Dual-Strategy Deployment (Phase 12)
 
@@ -1942,15 +2006,25 @@ Toss Trading Bot/
 ├── test_order_retry_queue.py
 ├── session_manager.py      # P3: RegularHoursGate, IntradaySessionTracker, PortfolioReconciliationEngine
 ├── config.py               # TickerConfig / StrategyConfigMapper — isolated regime matrix
-├── market_registry.py      # DEFAULT_WATCHLIST (15) + KIS MARKET_META routing + parse/validate helpers
-├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing
+├── market_registry.py      # DEFAULT_WATCHLIST (25) + TICKER_SECTORS + KIS MARKET_META routing
+├── entry_filters.py        # Phase 14: weekly trend + 52w high entry filters
+├── trading_features.py     # Phase 14: shared live/backtest feature flags
+├── strategy_ownership.py   # Phase 14: Legacy vs Top3 buy collision prevention
+├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing, regime/scale
 ├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates
 ├── portfolio_backtest.py   # Consolidated portfolio backtest (default live-parity path)
 ├── momentum_ranker.py      # P9: weekly Top-N momentum universe filter
 ├── backtest_benchmarks.py  # P9: B&H / SPY benchmark helpers for walk-forward
 ├── daily_report.py         # P9: EOD metrics + Telegram report formatting
 ├── run_backtest.py         # CLI: portfolio backtest, --walk-forward, --isolated legacy, --random smoke test
-├── test_analytics.py       # Engine verification (trend filter + conditional RSI tests)
+├── test_market_regime.py
+├── test_entry_filters.py
+├── test_strategy_ownership.py
+├── test_market_registry.py
+├── scripts/
+│   ├── compare_watchlist.py  # 15 vs 25 dual backtest comparison
+│   └── dual_sweep.py         # Capital-split sweep + walk-forward
+├── test_analytics.py         # Engine verification (trend filter + conditional RSI tests)
 ├── test_momentum_ranker.py
 ├── test_backtest_benchmarks.py
 ├── test_daily_report.py
@@ -1975,18 +2049,28 @@ Toss Trading Bot/
 
 ## Appendix E: Academic Regime Mapping (Watchlist Design)
 
-The default 15-ticker watchlist maps to four execution regimes in `config.py`:
+The default **25-ticker** watchlist combines **execution regimes** (`config.py`) with **sector tags** (`market_registry.py`):
 
 | Regime | Tickers | Volatility Profile | Entry Style |
 |---|---|---|---|
-| **MEGA_CAP** | AAPL, MSFT, GOOGL, AMZN | Low-vol mega-cap trend | Dual (breakout + pullback + cross) |
-| **HIGH_BETA** | NVDA, META, AVGO, NFLX | High-beta market leaders | Dual, wider ATR trail |
+| **MEGA_CAP** | AAPL, MSFT, GOOGL, AMZN | Low-vol mega-cap trend | Breakout (20-day high) |
+| **HIGH_BETA** | NVDA, META, AVGO, NFLX | High-beta market leaders | Breakout, wider ATR trail |
 | **MOMENTUM** | PLTR, TSLA, CRWD, AMD | Breakout / parabolic growth | 20-day high breakout only |
-| **DEFAULT** | TSM, SHOP, UBER | Mid-cap control group | Dual, conservative gates |
+| **DEFAULT** | TSM, SHOP, UBER | Mid-cap control group | Breakout, conservative gates |
+| **DIVERSIFICATION** | LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT | Non-tech large-cap | DEFAULT regime; sector tags for concentration caps |
 
-**Universe filter:** `momentum_ranker.py` scores all 15 names weekly and activates the Top-N (`MOMENTUM_TOP_N=5`) for new BUY only. Exits run on every held position.
+| Sector tag | Tickers | Role |
+|---|---|---|
+| `healthcare` | LLY, UNH, JNJ | Defensive / different cycle vs tech |
+| `financials` | JPM, V | Rate-cycle exposure |
+| `energy` | XOM | Commodity / inflation sleeve |
+| `consumer_retail` | COST, WMT | Staples-adjacent retail |
+| `consumer_staples` | KO | Low-beta ballast |
+| `industrial` | CAT | Cyclical non-tech |
 
-Customize via `WATCHLIST` in `.env` while registering exchange routing in `MARKET_META` (`market_registry.py`).
+**Universe filter:** `momentum_ranker.py` scores all watchlist names weekly; Top3 uses `select_top_tickers_diversified()` with `MOMENTUM_TOP_N=3` and `MOMENTUM_MAX_PER_SECTOR=1`. Legacy runs signals on the full watchlist subject to entry filters and `RiskGuard` sector caps.
+
+Customize via `WATCHLIST` in `.env` while registering exchange routing in `MARKET_META` and sector tags in `TICKER_SECTORS` (`market_registry.py`).
 
 ---
 
