@@ -47,15 +47,31 @@ def should_send_eod_report(now: datetime | None, states: Mapping[str, Any]) -> b
     return portfolio.get("last_daily_report_date") != today
 
 
-def _count_open_positions(states: Mapping[str, Any], watchlist: list[str]) -> int:
-    count = 0
+def _effective_holdings(
+    states: Mapping[str, Any],
+    watchlist: list[str],
+) -> dict[str, int]:
+    """Prefer broker snapshot when local fill sync lagged (VTS ccnl 500)."""
+    portfolio = states.get("_portfolio", {})
+    broker = {}
+    if isinstance(portfolio, dict):
+        raw = portfolio.get("broker_holdings") or {}
+        if isinstance(raw, dict):
+            broker = raw
+
+    effective: dict[str, int] = {}
     for ticker in watchlist:
         payload = states.get(ticker, {})
-        if not isinstance(payload, dict):
-            continue
-        if int(payload.get("held_quantity", 0) or 0) > 0 or payload.get("in_position"):
-            count += 1
-    return count
+        local_qty = 0
+        if isinstance(payload, dict):
+            local_qty = int(payload.get("held_quantity", 0) or 0)
+        broker_qty = int(broker.get(ticker, 0) or 0)
+        effective[ticker] = max(local_qty, broker_qty)
+    return effective
+
+
+def _count_open_positions(states: Mapping[str, Any], watchlist: list[str]) -> int:
+    return sum(1 for qty in _effective_holdings(states, watchlist).values() if qty > 0)
 
 
 def _trades_today(trade_log_path: str, ny_date: str) -> list[dict[str, str]]:
@@ -101,13 +117,11 @@ def compile_eod_metrics(
         active = []
 
     holdings: list[str] = []
-    for ticker in watchlist:
-        payload = states.get(ticker, {})
-        if not isinstance(payload, dict):
-            continue
-        qty = int(payload.get("held_quantity", 0) or 0)
+    for ticker, qty in _effective_holdings(states, watchlist).items():
         if qty > 0:
             holdings.append(f"{ticker}({qty})")
+
+    broker_synced = bool(portfolio.get("last_reconciled_at"))
 
     return {
         "date": ny_date,
@@ -124,6 +138,7 @@ def compile_eod_metrics(
         "available_cash": available_cash,
         "dry_run": is_dry_run_mode(),
         "last_reconciled_at": portfolio.get("last_reconciled_at"),
+        "broker_synced": broker_synced,
     }
 
 
@@ -143,6 +158,11 @@ def format_eod_report_text(metrics: dict[str, Any]) -> str:
     active_e = escape_markdown_v2(", ".join(active) if active else "n/a")
     holdings = metrics.get("holdings") or []
     holdings_e = escape_markdown_v2(", ".join(holdings) if holdings else "none")
+    sync_note = ""
+    if not metrics.get("broker_synced") and holdings:
+        sync_note = "⚠️ Broker sync pending \\(local ledger may lag\\)\n"
+    elif not metrics.get("broker_synced"):
+        sync_note = "⚠️ Broker sync pending \\(check KIS app vs bot\\)\n"
     cash = metrics.get("available_cash")
     cash_line = ""
     if cash is not None:
@@ -157,6 +177,7 @@ def format_eod_report_text(metrics: dict[str, Any]) -> str:
         f"Fills: {fills_e} \\(B {buys_e} / S {sells_e}\\)\n"
         f"Open Positions: {open_e}\n"
         f"Held: {holdings_e}\n"
+        f"{sync_note}"
         f"Momentum Active: {active_e}"
     )
 

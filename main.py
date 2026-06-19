@@ -1820,10 +1820,10 @@ def run_top3_shadow_cycle(
     cache: MarketDataCache,
     states: dict[str, Any],
     ledger: PortfolioLedger,
-) -> None:
+) -> tuple[dict[str, Any], PortfolioLedger]:
     """Phase 3 shadow or Phase 4 live-split Top3 momentum rebalance."""
     if not DEPLOYMENT.top3_shadow_active:
-        return
+        return states, ledger
 
     portfolio_equity = _estimate_portfolio_equity(ledger, states, cache)
     shadow = load_top3_state(states)
@@ -1838,7 +1838,7 @@ def run_top3_shadow_cycle(
     )
 
     if not logs and not orders:
-        return
+        return states, ledger
 
     print()
     print("-" * 88)
@@ -1849,13 +1849,40 @@ def run_top3_shadow_cycle(
 
     if DEPLOYMENT.top3_live_orders:
         for order in orders:
-            execute_broker_order(
-                client,
-                order.ticker,
-                order.side,
-                order.shares,
-                order.reference_price,
-            )
+            side = "BUY" if order.side == "BUY" else "SELL"
+            try:
+                payload = execute_broker_order(
+                    client,
+                    order.ticker,
+                    side,
+                    order.shares,
+                    order.reference_price,
+                )
+                odno = extract_order_odno(payload) or ""
+                TRADE_LOG.append(
+                    {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ticker": order.ticker,
+                        "signal": side,
+                        "qty": order.shares,
+                        "order_price": order.reference_price,
+                        "fill_price": "",
+                        "status": "ACCEPTED",
+                        "reason": f"top3 odno={odno}",
+                        "cash_after": ledger.available_cash_usd,
+                        "held_qty": 0,
+                    }
+                )
+            except Exception as exc:
+                print(f"[TOP3/ERROR] {order.ticker} {order.side} failed: {exc}")
+        states, ledger = run_session_reconciliation(client, states, force=True)
+        FILL_MONITOR.resolve_all_pending(
+            client,
+            states,
+            WATCHLIST,
+            LiveSignalEngine,
+            cash_after=ledger.available_cash_usd,
+        )
     elif orders:
         print(
             f"[TOP3/SHADOW] {len(orders)} simulated order(s) — "
@@ -1874,6 +1901,7 @@ def run_top3_shadow_cycle(
 
     save_top3_state(states, shadow)
     print("-" * 88)
+    return states, ledger
 
 
 def run_watchlist_cycle(
@@ -1981,7 +2009,7 @@ def run_watchlist_cycle(
             )
             summary.append((ticker, "FAILED"))
 
-    run_top3_shadow_cycle(client, cache, states, ledger)
+    states, ledger = run_top3_shadow_cycle(client, cache, states, ledger)
     cache.maybe_collect_garbage()
     save_persisted_states(states)
 
@@ -2000,10 +2028,22 @@ def _maybe_send_eod_report(
     states: dict[str, Any],
     ledger: PortfolioLedger,
     *,
+    client: KISApiClient | None = None,
     now: datetime | None = None,
 ) -> None:
     if not should_send_eod_report(now, states):
         return
+
+    if client is not None:
+        states, ledger = run_session_reconciliation(client, states, force=True)
+        FILL_MONITOR.resolve_all_pending(
+            client,
+            states,
+            WATCHLIST,
+            LiveSignalEngine,
+            cash_after=ledger.available_cash_usd,
+        )
+        save_persisted_states(states)
 
     metrics = compile_eod_metrics(
         states,
@@ -2201,7 +2241,7 @@ def main() -> None:
                         f"[CACHE] Finalized {finalized} forming bar(s) into "
                         "completed EOD history (disk-safe)"
                     )
-                _maybe_send_eod_report(states, ledger, now=cycle_started)
+                _maybe_send_eod_report(states, ledger, client=client, now=cycle_started)
                 sleep_seconds = seconds_until_us_rth_open(cycle_started)
                 print()
                 print(
