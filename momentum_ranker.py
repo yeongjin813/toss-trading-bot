@@ -106,6 +106,28 @@ class MomentumRankSettings:
             inverse_vol_weighting=False,
         )
 
+    @classmethod
+    def for_live_bot(cls, deployment: Any) -> MomentumRankSettings:
+        """Production momentum config: env weights/filters + legacy ranking + deployment gate."""
+        from dataclasses import replace
+
+        raw = cls.from_env()
+        return replace(
+            raw.for_production(),
+            enabled=deployment.legacy_momentum_rank_enabled(raw.enabled),
+        )
+
+    @staticmethod
+    def warn_if_env_enhanced_ignored() -> str | None:
+        """Return warning text when .env requests enhanced but production forces legacy."""
+        mode = os.getenv("MOMENTUM_RANKING_MODE", DEFAULT_RANKING_MODE).strip().lower()
+        if mode == "enhanced":
+            return (
+                "MOMENTUM_RANKING_MODE=enhanced in .env is ignored; "
+                "production uses legacy ranking (see README Phase 16)."
+            )
+        return None
+
 
 @dataclass
 class MomentumScore:
@@ -286,7 +308,7 @@ def rank_universe_frames_enhanced(
     as_of_date: str | None = None,
     settings: MomentumRankSettings | None = None,
 ) -> list[MomentumScore]:
-    """RESEARCH ONLY — 60/120/252 momentum + FIP - skew penalty composite ranking."""
+    """60/120/252 momentum + FIP - skew penalty composite ranking."""
     from momentum_selection import build_composite_ranking
 
     cfg = settings or MomentumRankSettings.from_env()

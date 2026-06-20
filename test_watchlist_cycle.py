@@ -40,7 +40,6 @@ def _minimal_deps(recorder: _DepsRecorder) -> WatchlistCycleDeps:
     return WatchlistCycleDeps(
         watchlist=["AAPL"],
         momentum_settings=momentum,
-        momentum_raw=momentum,
         deployment=deployment,
         use_spy_market_filter=False,
         use_qqq_regime_filter=False,

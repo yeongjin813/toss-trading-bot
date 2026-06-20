@@ -29,3 +29,13 @@ def test_atomic_replace_leaves_valid_json_on_reread(tmp_path: Path) -> None:
 
 def test_load_missing_returns_empty_dict(tmp_path: Path) -> None:
     assert load_persisted_states(str(tmp_path / "missing.json")) == {}
+
+
+def test_save_creates_backup(tmp_path: Path) -> None:
+    path = tmp_path / "trading_state.json"
+    save_persisted_states({"v": 1}, str(path))
+    save_persisted_states({"v": 2}, str(path))
+    backup = path.with_name("trading_state.json.bak")
+    assert backup.exists()
+    assert json.loads(backup.read_text(encoding="utf-8"))["v"] == 1
+    assert load_persisted_states(str(path))["v"] == 2

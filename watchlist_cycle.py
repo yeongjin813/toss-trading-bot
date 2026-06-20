@@ -50,7 +50,6 @@ TelegramFn = Callable[..., None]
 class WatchlistCycleDeps:
     watchlist: list[str]
     momentum_settings: MomentumRankSettings
-    momentum_raw: MomentumRankSettings
     deployment: DeploymentConfig
     use_spy_market_filter: bool
     use_qqq_regime_filter: bool
@@ -201,7 +200,7 @@ def run_top3_shadow_cycle(
         total_equity_usd=portfolio_equity,
         deploy=deps.deployment,
         now=datetime.now(),
-        settings=deps.momentum_raw,
+        settings=deps.momentum_settings,
         broker_holdings=broker_holdings if deps.deployment.top3_live_orders else None,
     )
 

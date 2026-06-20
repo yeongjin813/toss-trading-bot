@@ -394,7 +394,7 @@ python scripts/compare_watchlist.py
 
 | Upgrade | Module | Summary |
 |---|---|---|
-| **Atomic state persistence** | `state_persistence.py` | `trading_state.json` written via temp file + `os.replace` — avoids partial-write corruption on kill/OOM |
+| **Atomic state persistence** | `state_persistence.py` | `trading_state.json` written via temp file + `os.replace`; `.bak` backup before each save |
 | **Reduced disk I/O** | `main.py` + `watchlist_cycle.py` | Gate blocks update in-memory state only; flush on order acceptance, fills, reconcile, ownership change, and **once per RTH cycle** |
 | **Pipeline extract** | `watchlist_cycle.py` | `run_watchlist_cycle()` owns reconcile → trim → fills → momentum → legacy tickers → Top3; `WatchlistCycleDeps` injects `process_ticker` / order hooks from `main.py` |
 | **Balance parse** | `session_manager.py` | `summarize_overseas_present_balance()` moved out of `main.py` |
@@ -418,7 +418,7 @@ An alternate Top3 selection model was implemented for research (not live deploym
 
 **2020–2026 backtest** (25-ticker watchlist, yfinance): Legacy beat Enhanced on **CAGR** (+24.2% vs +20.5%), **Sharpe** (0.97 vs 0.91), and **2022 drawdown** (−22.8% vs −28.1%). Enhanced reduced turnover (fewer trades/rebalances) but did not justify a production switch.
 
-**Production guarantee:** `main.py` hardcodes `ranking_mode=legacy` for `MOMENTUM_SETTINGS`. Setting `MOMENTUM_RANKING_MODE=enhanced` in `.env` does **not** affect the live bot.
+**Production guarantee:** `MomentumRankSettings.for_live_bot()` builds one settings object for Legacy Top-N gate **and** Top3 rebalance (`ranking_mode=legacy` always). `.env` `MOMENTUM_RANKING_MODE=enhanced` is ignored with a startup warning. `trading_state.json.bak` is written on each save.
 
 **Research / compare only:**
 

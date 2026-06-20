@@ -7,6 +7,8 @@ from datetime import datetime
 import pandas as pd
 import pytz
 
+import os
+
 from momentum_ranker import (
     MomentumRankSettings,
     build_cycle_tickers,
@@ -138,7 +140,6 @@ def test_enhanced_mode_uses_composite_fields() -> None:
 
 
 def test_for_production_forces_legacy() -> None:
-    settings = MomentumRankSettings.from_env()
     settings = MomentumRankSettings(
         ranking_mode="enhanced",
         dynamic_rebalance_only=True,
@@ -150,6 +151,46 @@ def test_for_production_forces_legacy() -> None:
     assert prod.inverse_vol_weighting is False
 
 
+def test_for_live_bot_forces_legacy_ranking() -> None:
+    from deployment_config import DeploymentConfig
+
+    prior = os.environ.get("MOMENTUM_RANKING_MODE")
+    os.environ["MOMENTUM_RANKING_MODE"] = "enhanced"
+    try:
+        deployment = DeploymentConfig(
+            phase=4,
+            strategy_mode="dual",
+            top3_backtest_only=False,
+            top3_dry_run_enabled=False,
+            legacy_capital_pct=60.0,
+            top3_capital_pct=40.0,
+        )
+        live = MomentumRankSettings.for_live_bot(deployment)
+        assert live.ranking_mode == "legacy"
+        assert live.enabled is False
+    finally:
+        if prior is None:
+            os.environ.pop("MOMENTUM_RANKING_MODE", None)
+        else:
+            os.environ["MOMENTUM_RANKING_MODE"] = prior
+
+
+def test_warn_if_env_enhanced_ignored() -> None:
+    prior = os.environ.get("MOMENTUM_RANKING_MODE")
+    try:
+        os.environ.pop("MOMENTUM_RANKING_MODE", None)
+        assert MomentumRankSettings.warn_if_env_enhanced_ignored() is None
+        os.environ["MOMENTUM_RANKING_MODE"] = "enhanced"
+        msg = MomentumRankSettings.warn_if_env_enhanced_ignored()
+        assert msg is not None
+        assert "ignored" in msg
+    finally:
+        if prior is None:
+            os.environ.pop("MOMENTUM_RANKING_MODE", None)
+        else:
+            os.environ["MOMENTUM_RANKING_MODE"] = prior
+
+
 def main() -> int:
     test_rank_universe_prefers_strong_momentum()
     test_build_cycle_tickers_keeps_held_names()
@@ -158,6 +199,8 @@ def main() -> int:
     test_rebalance_persists_active_tickers()
     test_enhanced_mode_uses_composite_fields()
     test_for_production_forces_legacy()
+    test_for_live_bot_forces_legacy_ranking()
+    test_warn_if_env_enhanced_ignored()
     print("ALL MOMENTUM RANKER TESTS PASSED")
     return 0
 

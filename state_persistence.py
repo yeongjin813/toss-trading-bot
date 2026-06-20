@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -27,10 +28,14 @@ def load_persisted_states(path: str = DEFAULT_STATE_FILE) -> dict[str, Any]:
 
 
 def save_persisted_states(states: dict[str, Any], path: str = DEFAULT_STATE_FILE) -> None:
-    """Write state atomically: temp file in same dir, fsync, then replace."""
+    """Write state atomically: backup prior file, temp write, fsync, replace."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     directory = str(target.parent) if str(target.parent) not in {"", "."} else "."
+
+    if target.exists() and target.stat().st_size > 0:
+        backup = target.with_name(f"{target.name}.bak")
+        shutil.copy2(target, backup)
 
     fd, temp_path = tempfile.mkstemp(
         prefix=f".{target.name}.",

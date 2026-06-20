@@ -334,7 +334,9 @@ def summarize_top3_analytics(
     total_return_pct = (
         (final_equity / initial_cash - 1.0) * 100.0 if initial_cash > 0 else 0.0
     )
-    win_rate = (winning_trades / total_trades * 100.0) if total_trades else 0.0
+    round_trips = len(closed_pnls)
+    round_trip_wins = sum(1 for p in closed_pnls if p > 0)
+    win_rate = (round_trip_wins / round_trips * 100.0) if round_trips else 0.0
 
     return {
         "cagr_pct": cagr_pct,
@@ -344,5 +346,7 @@ def summarize_top3_analytics(
         "win_rate_pct": win_rate,
         "profit_factor": profit_factor,
         "total_trades": total_trades,
+        "round_trip_wins": round_trip_wins,
+        "round_trips": round_trips,
         "annual_returns_pct": annual_returns,
     }

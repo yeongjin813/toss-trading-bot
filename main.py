@@ -25,10 +25,12 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 import traceback
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -143,26 +145,7 @@ WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
 USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
 USE_QQQ_REGIME_FILTER = StrategyConfigMapper.use_qqq_regime_filter()
 DEPLOYMENT = DeploymentConfig.from_env()
-_MOMENTUM_RAW = MomentumRankSettings.from_env()
-MOMENTUM_SETTINGS = MomentumRankSettings(
-    enabled=DEPLOYMENT.legacy_momentum_rank_enabled(_MOMENTUM_RAW.enabled),
-    top_n=_MOMENTUM_RAW.top_n,
-    rebalance_weekday=_MOMENTUM_RAW.rebalance_weekday,
-    weight_3m=_MOMENTUM_RAW.weight_3m,
-    weight_6m=_MOMENTUM_RAW.weight_6m,
-    weight_12m=_MOMENTUM_RAW.weight_12m,
-    weight_volume=_MOMENTUM_RAW.weight_volume,
-    require_above_sma50=_MOMENTUM_RAW.require_above_sma50,
-    require_above_sma200=_MOMENTUM_RAW.require_above_sma200,
-    require_near_52w_high=_MOMENTUM_RAW.require_near_52w_high,
-    near_52w_high_pct=_MOMENTUM_RAW.near_52w_high_pct,
-    sector_diversify=_MOMENTUM_RAW.sector_diversify,
-    max_per_sector=_MOMENTUM_RAW.max_per_sector,
-    min_bars=_MOMENTUM_RAW.min_bars,
-    ranking_mode="legacy",
-    dynamic_rebalance_only=False,
-    inverse_vol_weighting=False,
-)
+MOMENTUM_SETTINGS = MomentumRankSettings.for_live_bot(DEPLOYMENT)
 
 FEATURES = TradingFeatureFlags.from_env()
 
@@ -401,6 +384,10 @@ def validate_environment() -> None:
             f"QQQ regime filter enabled but {SECONDARY_BENCHMARK_TICKER} is missing MARKET_META routing."
         )
 
+    momentum_warn = MomentumRankSettings.warn_if_env_enhanced_ignored()
+    if momentum_warn:
+        print(f"[WARN] {momentum_warn}")
+
 
 class KISApiClient:
     """Minimal KIS Open API client for US mock trading."""
@@ -428,15 +415,33 @@ class KISApiClient:
         if not self._access_token or not self._token_expires_at:
             return
 
-        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "access_token": self._access_token,
-                    "expires_at": self._token_expires_at.isoformat(),
-                },
-                handle,
-                indent=2,
-            )
+        payload = {
+            "access_token": self._access_token,
+            "expires_at": self._token_expires_at.isoformat(),
+        }
+        target = Path(TOKEN_CACHE_FILE)
+        directory = str(target.parent) if str(target.parent) not in {"", "."} else "."
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".kis_token_cache.",
+            suffix=".tmp",
+            dir=directory,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+            if os.name != "nt":
+                os.chmod(target, 0o600)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
     def get_access_token(self) -> str:
         if self._access_token and self._token_expires_at and datetime.now() < self._token_expires_at:
@@ -1939,7 +1944,6 @@ def _build_cycle_deps() -> WatchlistCycleDeps:
     return WatchlistCycleDeps(
         watchlist=WATCHLIST,
         momentum_settings=MOMENTUM_SETTINGS,
-        momentum_raw=_MOMENTUM_RAW,
         deployment=DEPLOYMENT,
         use_spy_market_filter=USE_SPY_MARKET_FILTER,
         use_qqq_regime_filter=USE_QQQ_REGIME_FILTER,
@@ -2032,6 +2036,7 @@ def main() -> None:
     print(
         f"Momentum Rank       : "
         f"{'ON (Top ' + str(MOMENTUM_SETTINGS.top_n) + ' on Friday)' if MOMENTUM_SETTINGS.enabled else 'OFF'}"
+        f" | ranking={MOMENTUM_SETTINGS.ranking_mode}"
     )
     print(
         f"SPY Market Filter   : "
