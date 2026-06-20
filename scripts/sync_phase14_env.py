@@ -27,6 +27,10 @@ KEYS_TO_SYNC = [
     "PENDING_ORDER_CANCEL_MINUTES",
     "MAX_CONSECUTIVE_LOSS_DAYS",
     "USE_SPY_MARKET_FILTER",
+    "ENTRY_CONFIRMATION_DAYS",
+    "USE_VIX_REGIME_FILTER",
+    "VIX_REGIME_MAX",
+    "SLIPPAGE_BPS",
 ]
 
 
@@ -64,7 +68,7 @@ def main() -> int:
             out.append(f"{key}={example[key]}")
 
     ENV_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
-    print(f"Synced {len(KEYS_TO_SYNC)} Phase 14 keys into {ENV_PATH}")
+    print(f"Synced {len(KEYS_TO_SYNC)} non-secret keys into {ENV_PATH}")
     return 0
 
 
