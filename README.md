@@ -12,7 +12,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Watchlist Matrix** | **25 US names** — 15 tech core + 10 non-tech diversification (LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT); configurable via `.env` `WATCHLIST`; sector tags + KIS routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
 | **Account** | Set in `.env` — `KIS_CANO`, `KIS_ACNT_PRDT_CD` (never commit) |
-| **Execution Loop** | 60s watchlist cycle **during NY RTH only** (09:30–16:00 ET); sleeps off-hours |
+| **Execution Loop** | `watchlist_cycle.py` orchestrates RTH pipeline; `main.py` runs 60s loop during NY RTH only |
 | **Data Architecture** | Bootstrap 756 bars once → 1-bar micro-fetch per open-session cycle |
 | **Session Gate** | NYSE holiday registry + **`is_us_regular_market_hours()`** (09:30–16:00 ET via `pytz`) |
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
@@ -25,11 +25,12 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Phase 14 profit/risk + 25-ticker watchlist · *(this release)* · Over-deploy auto-trim · `8a5b6e7` · ccnl-fb reconcile · `f1bf7fc`
+**Latest production commits:** Watchlist pipeline extract · `a973468` · Atomic state persistence · `a102044` · Phase 14 + 25-ticker watchlist · `497b9a2`
 
 ---
 
-> **Phase 14 (2026-06)** extends the pipeline below: golden-cross regime, vol-adjusted sizing, entry filters, sector caps, Legacy/Top3 ownership, scale-in/out, and a **25-ticker** diversified universe. See [Improvement Journey](#improvement-journey--what-changed-and-why) rows **14.x** and [Phase 14](#phase-14-profit-risk-parity--diversified-universe-2026-06) before [Live System Flow](#live-system-flow).
+> **Phase 15 (2026-06)** — live-loop hardening: atomic `trading_state.json` writes, fewer disk flushes, and RTH orchestration moved to `watchlist_cycle.py`. See [Phase 15](#phase-15-live-loop-hardening--pipeline-extract-2026-06).  
+> **Phase 14 (2026-06)** — profit/risk parity + **25-ticker** universe. See rows **14.x** and [Phase 14](#phase-14-profit-risk-parity--diversified-universe-2026-06) before [Live System Flow](#live-system-flow).
 
 ## Documentation Map
 
@@ -54,7 +55,8 @@ flowchart TD
     D -->|Yes| E[Momentum rebalance Top-N]
     D -->|No| F[RTH watchlist cycle]
     E --> F
-    F --> G[Per ticker: signals + gates]
+    F --> F1[watchlist_cycle.py]
+    F1 --> G[Per ticker: signals + gates]
     G --> H{Signal BUY/SELL?}
     H -->|Dry-run| I[Instant local fill]
     H -->|Live| J[KIS order + fill poll]
@@ -83,6 +85,16 @@ flowchart TD
 7. **Strategy ownership** — Legacy vs Top3 cannot both open the same ticker (`strategy_ownership.py`)
 8. **RiskGuard** — daily loss, consecutive loss days, max positions, per-ticker exposure, **sector concentration**
 9. **Signal engine** — regime-specific breakout entry + staged exits; optional scale-in / scale-out
+
+**RTH cycle sequence** (`watchlist_cycle.run_watchlist_cycle`):
+
+1. Reconcile broker vs local (`session_manager`)
+2. Over-deploy trim if needed (`overdeployment_trim.py`)
+3. Fill poll + order retry queue
+4. Momentum Top-N refresh → parallel OHLCV refresh
+5. Legacy `process_ticker` per symbol (`main.py`)
+6. Top3 rebalance (`top3_strategy.py` via `watchlist_cycle`)
+7. Atomic state flush (`state_persistence.py`)
 
 **Fill path:** `rt_cd=0` → ccnl/nccs poll → on HTTP 500 fallback to `present-balance` holdings → state mutates only on confirmed fill.
 
@@ -122,7 +134,9 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 | **14.1** | Legacy + Top3 could both BUY same ticker; tech-only pool made sector caps cosmetic. | Strategy ownership registry; `MAX_POSITIONS_PER_SECTOR`; Top3 `MOMENTUM_SECTOR_DIVERSIFY`. | `strategy_ownership.py`, `market_registry.py` |
 | **14.2** | Backtest lacked live entry filters / scale signals; limit orders could stale indefinitely. | `trading_features.py` + `entry_filters.py`; scale-in/out; limit cancel/replace (`PENDING_ORDER_CANCEL_MINUTES`). | `portfolio_backtest.py`, `execution_engine.py` |
 | **14.3** | 15-ticker universe was ~100% tech — correlated drawdowns in 2022/2024-style rotations. | **25-ticker** watchlist: 15 tech core + 10 liquid non-tech (healthcare, finance, energy, consumer, industrial). Dual backtest: MaxDD 44%→28%, Sharpe 1.25→1.31 (full period). | `market_registry.py`, `scripts/compare_watchlist.py` |
-| **—** | *Still open:* sustained alpha vs buy-and-hold in all walk-forward windows; VIX filter; real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency. | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
+| **15.0** | Sync JSON overwrite risked corrupted `trading_state.json`; gate paths flushed disk dozens of times per cycle. | `state_persistence.py` — atomic write (temp + `os.replace`); immediate save only on orders/fills/reconcile; cycle-end flush. | `test_state_persistence.py` |
+| **15.1** | `main.py` mixed orchestration (reconcile → trim → Top3) with order dispatch — hard to debug. | `watchlist_cycle.py` + `WatchlistCycleDeps` injection; `main.py` keeps KIS + `process_ticker`. | `test_watchlist_cycle.py` |
+| **—** | *Still open:* sustained alpha vs buy-and-hold in all walk-forward windows; VIX filter; real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency; further slimming of `main.py` (order gateway). | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
 
 > **Operator path:** after Step 8.0, day-to-day commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.  
 > **Researcher path:** strategy math stays in Sections 2–8 below.
@@ -373,6 +387,23 @@ python scripts/compare_watchlist.py
 ```
 
 **Recommended `.env` (Phase 4 + Phase 14):** copy from `.env.example` — includes `USE_REGIME_GOLDEN_CROSS`, `USE_VOL_ADJUSTED_RISK`, `USE_WEEKLY_TREND_FILTER`, `USE_52W_HIGH_FILTER`, `USE_SCALE_IN`, `USE_SCALE_OUT`, `MAX_POSITIONS_PER_SECTOR=2`, `MOMENTUM_SECTOR_DIVERSIFY=true`, and the 25-ticker `WATCHLIST`.
+
+### Phase 15: Live-Loop Hardening & Pipeline Extract *(2026-06)*
+
+| Upgrade | Module | Summary |
+|---|---|---|
+| **Atomic state persistence** | `state_persistence.py` | `trading_state.json` written via temp file + `os.replace` — avoids partial-write corruption on kill/OOM |
+| **Reduced disk I/O** | `main.py` + `watchlist_cycle.py` | Gate blocks update in-memory state only; flush on order acceptance, fills, reconcile, ownership change, and **once per RTH cycle** |
+| **Pipeline extract** | `watchlist_cycle.py` | `run_watchlist_cycle()` owns reconcile → trim → fills → momentum → legacy tickers → Top3; `WatchlistCycleDeps` injects `process_ticker` / order hooks from `main.py` |
+| **Balance parse** | `session_manager.py` | `summarize_overseas_present_balance()` moved out of `main.py` |
+
+**Still in `main.py` (next refactor candidates):** KIS auth, `execute_broker_order`, `process_ticker`, Telegram dispatch.
+
+**Verify:**
+
+```powershell
+python -m pytest test_state_persistence.py test_watchlist_cycle.py -q
+```
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -1997,7 +2028,9 @@ Toss Trading Bot/
 ├── .github/workflows/ci.yml # P8: automated test_*.py on push/PR
 ├── kis_http.py             # P8: KIS HTTP wrapper + api_response_time telemetry
 ├── order_retry_queue.py    # P8: persistent order retry queue
-├── main.py                 # KIS orchestrator, reconciliation, RTH gate, Telegram dispatch, state-gated orders
+├── main.py                 # KIS client, process_ticker, order state machine, main loop (slimmed orchestration)
+├── watchlist_cycle.py      # Phase 15: RTH pipeline — reconcile → trim → legacy → Top3
+├── state_persistence.py    # Phase 15: atomic trading_state.json load/save
 ├── execution_engine.py     # P6: OrderFillMonitor, TradeLogWriter, RiskGuard, fill callbacks
 ├── telegram_notifier.py    # P7: async Telegram alerts (trade reports + system alerts)
 ├── test_telegram_notifier.py
@@ -2021,6 +2054,8 @@ Toss Trading Bot/
 ├── test_entry_filters.py
 ├── test_strategy_ownership.py
 ├── test_market_registry.py
+├── test_state_persistence.py
+├── test_watchlist_cycle.py
 ├── scripts/
 │   ├── compare_watchlist.py  # 15 vs 25 dual backtest comparison
 │   └── dual_sweep.py         # Capital-split sweep + walk-forward

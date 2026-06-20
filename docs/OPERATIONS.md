@@ -25,6 +25,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 14. [Phase 10 — Trend Hold & Exit Discipline](#phase-10--trend-hold--exit-discipline)
 15. [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases)
 16. [Phase 14 — Profit, Risk & Diversified Watchlist](#phase-14--profit-risk--diversified-watchlist)
+17. [Phase 15 — Live-Loop Hardening](#phase-15--live-loop-hardening--pipeline-extract)
 
 ---
 
@@ -536,6 +537,28 @@ grep -E 'WATCHLIST|Phase|capital=|top3=' project_metrics.log | tail -20
 
 ```powershell
 python scripts/compare_watchlist.py
+```
+
+---
+
+## Phase 15 — Live-Loop Hardening & Pipeline Extract
+
+Architecture cleanup for production stability. Full detail: [README Phase 15](../README.md#phase-15-live-loop-hardening--pipeline-extract-2026-06).
+
+| Component | File | Role |
+|---|---|---|
+| RTH orchestration | `watchlist_cycle.py` | reconcile → trim → fills → momentum → legacy → Top3 |
+| State I/O | `state_persistence.py` | Atomic `trading_state.json` writes |
+| Ticker signals + orders | `main.py` | `process_ticker`, KIS dispatch (injected into cycle via `WatchlistCycleDeps`) |
+
+**After `git pull` on EC2:** no new `.env` keys — code-only update. Restart `toss-bot`.
+
+**Verify:**
+
+```bash
+.venv/bin/python -m pytest test_state_persistence.py test_watchlist_cycle.py -q
+systemctl is-active toss-bot
+grep -E '\[CYCLE\]|\[RECONCILE\]|Cycle [0-9]+ started' project_metrics.log | tail -10
 ```
 
 ---
