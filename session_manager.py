@@ -692,3 +692,45 @@ class LiveExecutionGatekeeper:
 
         cycle["signal_result"] = signal_result
         return signal_result
+
+
+def _parse_kis_amount(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    return float(value)
+
+
+def summarize_overseas_present_balance(payload: dict[str, Any]) -> dict[str, float]:
+    """Parse KIS overseas present-balance payload into display totals."""
+    summary: dict[str, float] = {
+        "total_asset_krw": 0.0,
+        "total_deposit_krw": 0.0,
+        "withdrawable_krw": 0.0,
+        "usable_foreign_cash": 0.0,
+        "foreign_deposit_usd": 0.0,
+        "withdrawable_foreign_usd": 0.0,
+    }
+
+    output3 = payload.get("output3") or {}
+    if isinstance(output3, list):
+        output3 = output3[0] if output3 else {}
+
+    summary["total_asset_krw"] = _parse_kis_amount(output3.get("tot_asst_amt"))
+    summary["total_deposit_krw"] = _parse_kis_amount(output3.get("tot_dncl_amt"))
+    summary["withdrawable_krw"] = _parse_kis_amount(output3.get("wdrw_psbl_tot_amt"))
+    summary["usable_foreign_cash"] = _parse_kis_amount(output3.get("frcr_use_psbl_amt"))
+
+    output2_rows = payload.get("output2") or []
+    if output2_rows:
+        usd_row = next(
+            (row for row in output2_rows if row.get("crcy_cd") == "USD"),
+            output2_rows[0],
+        )
+        summary["foreign_deposit_usd"] = _parse_kis_amount(
+            usd_row.get("frcr_dncl_amt_2") or usd_row.get("frcr_drwg_psbl_amt_1")
+        )
+        summary["withdrawable_foreign_usd"] = _parse_kis_amount(
+            usd_row.get("frcr_drwg_psbl_amt_1")
+        )
+
+    return summary

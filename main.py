@@ -77,7 +77,9 @@ from session_manager import (
     RegularHoursGate,
     align_deployable_cash,
     holdings_notional_usd,
+    summarize_overseas_present_balance,
 )
+from state_persistence import load_persisted_states, save_persisted_states
 from telegram_notifier import (
     TelegramConfig,
     send_eod_report,
@@ -854,51 +856,10 @@ class KISApiClient:
         return payload
 
 
-def _parse_amount(value: Any) -> float:
-    if value in (None, ""):
-        return 0.0
-    return float(value)
-
-
-def _summarize_overseas_present_balance(payload: dict[str, Any]) -> dict[str, float]:
-    summary: dict[str, float] = {
-        "total_asset_krw": 0.0,
-        "total_deposit_krw": 0.0,
-        "withdrawable_krw": 0.0,
-        "usable_foreign_cash": 0.0,
-        "foreign_deposit_usd": 0.0,
-        "withdrawable_foreign_usd": 0.0,
-    }
-
-    output3 = payload.get("output3") or {}
-    if isinstance(output3, list):
-        output3 = output3[0] if output3 else {}
-
-    summary["total_asset_krw"] = _parse_amount(output3.get("tot_asst_amt"))
-    summary["total_deposit_krw"] = _parse_amount(output3.get("tot_dncl_amt"))
-    summary["withdrawable_krw"] = _parse_amount(output3.get("wdrw_psbl_tot_amt"))
-    summary["usable_foreign_cash"] = _parse_amount(output3.get("frcr_use_psbl_amt"))
-
-    output2_rows = payload.get("output2") or []
-    if output2_rows:
-        usd_row = next(
-            (row for row in output2_rows if row.get("crcy_cd") == "USD"),
-            output2_rows[0],
-        )
-        summary["foreign_deposit_usd"] = _parse_amount(
-            usd_row.get("frcr_dncl_amt_2") or usd_row.get("frcr_drwg_psbl_amt_1")
-        )
-        summary["withdrawable_foreign_usd"] = _parse_amount(
-            usd_row.get("frcr_drwg_psbl_amt_1")
-        )
-
-    return summary
-
-
 def print_mock_account_balance(client: KISApiClient) -> None:
     print("Fetching mock account balance/deposit (inquire-present-balance)...")
     payload = client.fetch_overseas_present_balance(natn_cd="840")
-    summary = _summarize_overseas_present_balance(payload)
+    summary = summarize_overseas_present_balance(payload)
 
     print("-" * 88)
     print("MOCK ACCOUNT BALANCE / DEPOSIT".center(88))
@@ -984,26 +945,14 @@ def _parse_kis_daily_output(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def load_persisted_states(path: str = STATE_FILE) -> dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = handle.read().strip()
-        if not raw:
-            print(f"[WARN] {path} is empty — starting with a fresh state registry.")
-            return {}
-        payload = json.loads(raw)
-
-    if not isinstance(payload, dict):
-        raise ValueError("Invalid trading state file: root must be a dictionary.")
-    return payload
-
-
-def save_persisted_states(states: dict[str, Any], path: str = STATE_FILE) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(states, handle, indent=2, sort_keys=True)
+def _sync_ticker_state(
+    states: dict[str, Any],
+    ticker: str,
+    runtime: PositionState,
+    engine: LiveSignalEngine,
+) -> None:
+    """Update in-memory state; cycle-end or order paths flush to disk."""
+    states[ticker] = engine.dump_state(runtime)
 
 
 def _failed_order_key(signal: str, bar_date: str) -> str:
@@ -1687,8 +1636,7 @@ def process_ticker(
         resubmit_qty = int(runtime.pending_resubmit_qty)
         runtime.pending_resubmit_side = None
         runtime.pending_resubmit_qty = 0
-        states[ticker] = engine.dump_state(runtime)
-        save_persisted_states(states)
+        _sync_ticker_state(states, ticker, runtime, engine)
         print(
             f"[RESUBMIT] {ticker} BUY qty={resubmit_qty} after limit cancel"
         )
@@ -1705,8 +1653,6 @@ def process_ticker(
             reference_price=current_price,
             ledger=ledger,
         )
-        states[ticker] = engine.dump_state(runtime)
-        save_persisted_states(states)
         if runtime.pending_order:
             return "PENDING"
 
@@ -1817,8 +1763,7 @@ def process_ticker(
 
     if cycle["signal_result"].get("pending_order_locked"):
         print(f"[LOCK] {ticker} pending order lock active — no dispatch")
-        states[ticker] = engine.dump_state(runtime)
-        save_persisted_states(states)
+        _sync_ticker_state(states, ticker, runtime, engine)
         return "LOCKED"
 
     regular_market_hours = bool(
@@ -1826,8 +1771,7 @@ def process_ticker(
     )
     if _rth_gate.block_signal_for_session(signal, regular_market_hours):
         print(_rth_gate.gate_message(signal, ticker))
-        states[ticker] = engine.dump_state(runtime)
-        save_persisted_states(states)
+        _sync_ticker_state(states, ticker, runtime, engine)
         return "HOLD"
 
     if signal in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"} and runtime.held_quantity <= 0:
@@ -1836,8 +1780,7 @@ def process_ticker(
             "(no broker shares)"
         )
         runtime.in_position = False
-        states[ticker] = engine.dump_state(runtime)
-        save_persisted_states(states)
+        _sync_ticker_state(states, ticker, runtime, engine)
         return "HOLD"
 
     if signal in {"BUY", "SCALE_IN_BUY", "SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"}:
@@ -1845,15 +1788,13 @@ def process_ticker(
             print(
                 f"[GATE/DATA] {ticker} BUY blocked — bar history loaded via yfinance fallback"
             )
-            states[ticker] = engine.dump_state(runtime)
-            save_persisted_states(states)
+            _sync_ticker_state(states, ticker, runtime, engine)
             return "HOLD"
 
         if signal in {"BUY", "SCALE_IN_BUY"}:
             if position_size_multiplier <= 0:
                 print(f"[GATE/REGIME] {ticker} BUY blocked — market risk-off")
-                states[ticker] = engine.dump_state(runtime)
-                save_persisted_states(states)
+                _sync_ticker_state(states, ticker, runtime, engine)
                 return "HOLD"
 
             if active_trade_tickers is not None and not is_new_buy_allowed(
@@ -1865,23 +1806,20 @@ def process_ticker(
                     f"[GATE/MOMENTUM] {ticker} BUY blocked — outside Top "
                     f"{MOMENTUM_SETTINGS.top_n} momentum rank"
                 )
-                states[ticker] = engine.dump_state(runtime)
-                save_persisted_states(states)
+                _sync_ticker_state(states, ticker, runtime, engine)
                 return "HOLD"
 
             if DEPLOYMENT.is_dual:
                 collision = check_buy_collision(states, ticker, "legacy")
                 if collision:
                     print(f"[GATE/OWNERSHIP] {ticker} BUY blocked — {collision}")
-                    states[ticker] = engine.dump_state(runtime)
-                    save_persisted_states(states)
+                    _sync_ticker_state(states, ticker, runtime, engine)
                     return "HOLD"
 
             rth_block = block_new_buy_rth_window(datetime.now(), EXECUTION_SETTINGS)
             if rth_block:
                 print(f"[GATE/RTH] {ticker} BUY blocked — {rth_block}")
-                states[ticker] = engine.dump_state(runtime)
-                save_persisted_states(states)
+                _sync_ticker_state(states, ticker, runtime, engine)
                 return "HOLD"
 
             risk_block = RISK_GUARD.check_buy_allowed(
@@ -1904,8 +1842,7 @@ def process_ticker(
             )
             if risk_block:
                 print(f"[GATE/RISK] {ticker} BUY blocked — {risk_block}")
-                states[ticker] = engine.dump_state(runtime)
-                save_persisted_states(states)
+                _sync_ticker_state(states, ticker, runtime, engine)
                 return "HOLD"
 
         execution_qty = _resolve_execution_quantity(
@@ -1945,21 +1882,25 @@ def process_ticker(
                 current_bar_date=cycle["current_bar_date"],
             )
             states[ticker] = engine.dump_state(runtime)
-            save_persisted_states(states)
             if runtime.pending_order:
+                save_persisted_states(states)
                 return "PENDING"
             return signal
+        ownership_changed = False
         if signal in {"BUY", "SCALE_IN_BUY"} and final_signal in {"PENDING", "BUY", "SCALE_IN_BUY"}:
             claim_ownership(states, ticker, "legacy")
+            ownership_changed = True
         if signal in {"SELL", "DYNAMIC_ATR_SELL", "PARTIAL_SELL"} and int(runtime.held_quantity or 0) <= 0:
             release_ownership(states, ticker)
-        save_persisted_states(states)
+            ownership_changed = True
+        if ownership_changed:
+            _sync_ticker_state(states, ticker, runtime, engine)
+            save_persisted_states(states)
     else:
         final_signal = signal
-        states[ticker] = engine.dump_state(runtime)
-        save_persisted_states(states)
+        _sync_ticker_state(states, ticker, runtime, engine)
 
-    print(f"  -> State persisted for {ticker}")
+    print(f"  -> Cycle state updated for {ticker}")
     return final_signal
 
 
