@@ -7,7 +7,7 @@ via WatchlistCycleDeps to avoid circular imports.
 
 from __future__ import annotations
 
-import traceback
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Protocol
@@ -29,6 +29,8 @@ from session_manager import PortfolioLedger
 from state_persistence import save_persisted_states
 from strategy_ownership import check_buy_collision, claim_ownership, release_ownership
 from top3_strategy import compute_top3_rebalance_orders, load_top3_state, save_top3_state
+
+logger = logging.getLogger(__name__)
 
 
 class KISClient(Protocol):
@@ -151,7 +153,13 @@ def run_overdeployment_trim_if_needed(
                 }
             )
         except Exception as exc:
-            print(f"[TRIM/ERROR] {order.ticker} SELL {order.shares} failed: {exc}")
+            logger.error(
+                "[TRIM/ERROR] %s SELL %s failed: %s",
+                order.ticker,
+                order.shares,
+                exc,
+                exc_info=True,
+            )
 
     portfolio["last_overdeployment_trim_date"] = today
     states, ledger = deps.run_session_reconciliation(
@@ -264,7 +272,13 @@ def run_top3_shadow_cycle(
                     }
                 )
             except Exception as exc:
-                print(f"[TOP3/ERROR] {order.ticker} {order.side} failed: {exc}")
+                logger.error(
+                    "[TOP3/ERROR] %s %s failed: %s",
+                    order.ticker,
+                    order.side,
+                    exc,
+                    exc_info=True,
+                )
         states, ledger = deps.run_session_reconciliation(
             client, states, force=True, cache=cache
         )
@@ -403,8 +417,12 @@ def run_watchlist_cycle(
             )
             summary.append((ticker, "NETWORK_ERROR"))
         except Exception as exc:
-            print(f"[ERROR] Unhandled failure for {ticker}: {exc}")
-            traceback.print_exc()
+            logger.error(
+                "[TICKER/ERROR] Unhandled failure for %s: %s",
+                ticker,
+                exc,
+                exc_info=True,
+            )
             deps.dispatch_system_alert(
                 "CRITICAL",
                 f"{ticker} unhandled trading loop failure: {exc}",

@@ -392,7 +392,9 @@ Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-ha
 | Feature | Env / file | What it does |
 |---|---|---|
 | Momentum Top-N | `MOMENTUM_RANK_ENABLED`, `MOMENTUM_TOP_N` | Friday rebalance; only Top-N tickers get new BUY (exits always run) |
-| Momentum ranking mode | `MOMENTUM_RANKING_MODE=legacy` (hardcoded in `main.py`) | **Production always Legacy.** Enhanced (FIP/skew/inverse-vol) is research-only — see README Phase 16 |
+| Momentum ranking mode | `MOMENTUM_RANKING_MODE=legacy` (hardcoded in `main.py`) | **Production always Legacy.** Enhanced is research-only — see README Phase 16 |
+| Loop cooldown | `LOOP_COOLDOWN_SECONDS`, `LOOP_COOLDOWN_HELD_SECONDS` | 60s flat; **15s when holding or pending order** (faster ATR stop checks) |
+| KIS environment | `KIS_ENVIRONMENT=vts`, `KIS_LIVE_CONFIRMED` | Live API blocked without explicit confirmation; URL/label mismatch fails at startup |
 | QQQ half-size regime | `USE_QQQ_REGIME_FILTER=true` | Half position when SPY &lt; 200MA and QQQ &gt; 200MA |
 | Fill sync fallback | `execution_engine.py` | On ccnl/nccs HTTP 500, infer fill from `present-balance` |
 | Walk-forward benchmarks | `python run_backtest.py --walk-forward --yfinance` | Strat vs equal-weight B&H vs SPY alpha table |

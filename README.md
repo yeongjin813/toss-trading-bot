@@ -274,7 +274,7 @@ Closed gaps from [Section 12](#12-pre-deployment-critical-architectural-flaws--h
 
 **Recommended for backtest-aligned live runs:** set `USE_EOD_ATR_STOPS=true` in `.env`.  
 **Recommended for production VTS (Phase 4):** `CAPITAL_AT_RISK=100000`, `DEPLOYMENT_PHASE=4`, `STRATEGY_MODE=dual`, `MOMENTUM_RANK_ENABLED=false`, `USE_QQQ_REGIME_FILTER=true`, `USE_DAILY_TELEGRAM_REPORT=true`, `KIS_DRY_RUN=false`.  
-**Still open (not auto-fixable):** sustained alpha vs buy-and-hold, VTS→real-account migration, 60s polling latency, VIX filter.
+**Still open (not auto-fixable):** sustained alpha vs buy-and-hold, VIX filter. **Mitigated (2026-06):** 60s flat polling → 15s when holding/pending (`LOOP_COOLDOWN_HELD_SECONDS`); live KIS requires `KIS_LIVE_CONFIRMED=true` (`kis_environment.py`).
 
 ### Phase 9: Momentum Universe, Strategy Overhaul & Ops Polish *(2026-06)*
 

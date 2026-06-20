@@ -5,6 +5,7 @@ and broker-vs-local portfolio reconciliation.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Mapping
@@ -17,6 +18,8 @@ from analytics import (
     use_eod_atr_stops,
 )
 from config import StrategyConfigMapper
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -281,7 +284,11 @@ def _holdings_from_ccnl(
             end.strftime("%Y%m%d"),
         )
     except Exception as exc:
-        print(f"[RECONCILE/CCNL-FB] ccnl aggregation failed: {exc}")
+        logger.warning(
+            "[RECONCILE/CCNL-FB] ccnl aggregation failed: %s",
+            exc,
+            exc_info=True,
+        )
         return holdings
 
     if not isinstance(rows, list):
@@ -549,7 +556,11 @@ class PortfolioReconciliationEngine:
             return states, ledger, report
 
         except Exception as exc:
-            print(f"[RECONCILE/ERROR] Broker sync failed: {exc}")
+            logger.error(
+                "[RECONCILE/ERROR] Broker sync failed: %s",
+                exc,
+                exc_info=True,
+            )
             cached = states.get("_portfolio", {})
             available = float(cached.get("available_cash_usd", fallback_cash) or fallback_cash)
             report = ReconciliationReport(

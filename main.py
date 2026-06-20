@@ -112,7 +112,8 @@ from strategy_ownership import (
     reconcile_ownership,
     release_ownership,
 )
-from trading_features import TradingFeatureFlags
+from kis_environment import load_kis_environment, validate_kis_live_guard
+from loop_timing import effective_loop_cooldown_seconds
 from watchlist_cycle import WatchlistCycleDeps, run_overdeployment_trim_if_needed, run_watchlist_cycle
 
 load_dotenv(override=True)
@@ -122,15 +123,16 @@ APP_SECRET = os.getenv("KIS_APP_SECRET")
 CANO = os.getenv("KIS_CANO")
 ACNT_PRDT_CD = os.getenv("KIS_ACNT_PRDT_CD")
 
-BASE_URL = "https://openapivts.koreainvestment.com:29443"
+KIS_ENV = load_kis_environment()
+BASE_URL = KIS_ENV.base_url
 
-TR_ID_US_BUY = "VTTT1002U"
-TR_ID_US_SELL = "VTTT1006U"
+TR_ID_US_BUY = KIS_ENV.tr_id_us_buy
+TR_ID_US_SELL = KIS_ENV.tr_id_us_sell
 TR_ID_DAILY_PRICE = "HHDFS76240000"
 TR_ID_US_PRESENT_BALANCE = "VTRP6504R"
-TR_ID_US_CCNL = "VTTS3035R" if "openapivts" in BASE_URL else "TTTS3035R"
-TR_ID_US_NCCS = "VTTS3018R" if "openapivts" in BASE_URL else "TTTS3018R"
-TR_ID_US_CANCEL = "VTTT1004U" if "openapivts" in BASE_URL else "TTTT1004U"
+TR_ID_US_CCNL = KIS_ENV.tr_id_us_ccnl
+TR_ID_US_NCCS = KIS_ENV.tr_id_us_nccs
+TR_ID_US_CANCEL = KIS_ENV.tr_id_us_cancel
 
 TOKEN_PATH = "/oauth2/tokenP"
 HASHKEY_PATH = "/uapi/hashkey"
@@ -171,6 +173,7 @@ USE_SCALE_IN = FEATURES.use_scale_in
 USE_SCALE_OUT = FEATURES.use_scale_out
 TICKER_SLEEP_SECONDS = int(os.getenv("TICKER_SLEEP_SECONDS", "1"))
 LOOP_COOLDOWN_SECONDS = int(os.getenv("LOOP_COOLDOWN_SECONDS", "60"))
+LOOP_COOLDOWN_HELD_SECONDS = int(os.getenv("LOOP_COOLDOWN_HELD_SECONDS", "15"))
 MARKET_CLOSED_SLEEP_SECONDS = int(os.getenv("MARKET_CLOSED_SLEEP_SECONDS", "3600"))
 KIS_REQUEST_TIMEOUT_SECONDS = int(os.getenv("KIS_REQUEST_TIMEOUT_SECONDS", "30"))
 KIS_ORDER_MAX_RETRIES = max(1, int(os.getenv("KIS_ORDER_MAX_RETRIES", "3")))
@@ -191,9 +194,7 @@ def _resolve_kis_order_type() -> str:
     explicit = os.getenv("KIS_ORDER_TYPE", "").strip().lower()
     if explicit in {"limit", "market"}:
         return explicit
-    if "openapivts" in BASE_URL:
-        return "limit"
-    return "market"
+    return KIS_ENV.default_order_type
 
 
 KIS_ORDER_TYPE = _resolve_kis_order_type()
@@ -387,6 +388,12 @@ def validate_environment() -> None:
     momentum_warn = MomentumRankSettings.warn_if_env_enhanced_ignored()
     if momentum_warn:
         print(f"[WARN] {momentum_warn}")
+
+    validate_kis_live_guard(
+        KIS_ENV,
+        dry_run=is_dry_run_mode(),
+        capital_at_risk=CAPITAL_AT_RISK,
+    )
 
 
 class KISApiClient:
@@ -914,9 +921,9 @@ def try_print_mock_account_balance(client: KISApiClient) -> None:
     try:
         print_mock_account_balance(client)
     except requests.RequestException as exc:
-        print(f"[INFO] Balance inquiry ignored (network): {exc}")
+        logger.warning("Startup balance inquiry failed (network): %s", exc)
     except Exception as exc:
-        print(f"[INFO] Balance inquiry ignored: {exc}")
+        logger.warning("Startup balance inquiry failed: %s", exc, exc_info=True)
 
 
 def _parse_kis_daily_output(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -2030,7 +2037,7 @@ def main() -> None:
     print("KIS Mock Trading - Production Execution Engine")
     print(f"Execution Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Deployment          : {DEPLOYMENT.describe()}")
-    print(f"Base URL            : {BASE_URL}")
+    print(f"Base URL            : {BASE_URL} ({KIS_ENV.banner_label()})")
     print(f"Account             : {CANO}-{ACNT_PRDT_CD}")
     print(f"Watchlist           : {', '.join(WATCHLIST)}")
     print(
@@ -2079,7 +2086,7 @@ def main() -> None:
         f"{'parallel' if parallel_refresh else 'sequential+stagger'} "
         f"(workers={workers}, stagger={stagger}s, forming-bar overlay)"
     )
-    print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s")
+    print(f"Loop Cooldown       : {LOOP_COOLDOWN_SECONDS}s flat / {LOOP_COOLDOWN_HELD_SECONDS}s when holding")
     print(f"Market Closed Sleep : {MARKET_CLOSED_SLEEP_SECONDS}s")
     print(f"KIS Request Timeout : {KIS_REQUEST_TIMEOUT_SECONDS}s")
     print(f"KIS Slow API Warn   : {KIS_SLOW_API_MS}ms")
@@ -2232,20 +2239,33 @@ def main() -> None:
                 )
             except Exception as exc:
                 if _is_transient_kis_failure(exc):
-                    print(f"[WARN] Cycle skipped after transient KIS error: {exc}")
+                    logger.warning("Cycle skipped after transient KIS error: %s", exc)
                     _dispatch_system_alert(
                         "WARNING",
                         f"Cycle skipped (transient KIS): {str(exc)[:200]}",
                     )
-                    time.sleep(LOOP_COOLDOWN_SECONDS)
+                    cooldown = effective_loop_cooldown_seconds(
+                        states,
+                        WATCHLIST,
+                        flat_seconds=LOOP_COOLDOWN_SECONDS,
+                        held_seconds=LOOP_COOLDOWN_HELD_SECONDS,
+                    )
+                    time.sleep(cooldown)
                     continue
                 raise
 
+            cooldown = effective_loop_cooldown_seconds(
+                states,
+                WATCHLIST,
+                flat_seconds=LOOP_COOLDOWN_SECONDS,
+                held_seconds=LOOP_COOLDOWN_HELD_SECONDS,
+            )
+            held_tag = "held/pending" if cooldown < LOOP_COOLDOWN_SECONDS else "flat"
             print(
                 f"Cycle {cycle_count} complete. "
-                f"Cooling down for {LOOP_COOLDOWN_SECONDS} seconds..."
+                f"Cooling down {cooldown}s ({held_tag})..."
             )
-            time.sleep(LOOP_COOLDOWN_SECONDS)
+            time.sleep(cooldown)
 
     except KeyboardInterrupt:
         print()
