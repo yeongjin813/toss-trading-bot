@@ -13,6 +13,7 @@ from typing import Any
 
 import pandas as pd
 
+from config import StrategyConfigMapper
 from execution_friction import fill_price
 from momentum_ranker import (
     MomentumRankSettings,
@@ -63,15 +64,35 @@ def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _close_on_date(df: pd.DataFrame, bar_date: str) -> float | None:
+def _price_on_date(
+    df: pd.DataFrame,
+    bar_date: str,
+    *,
+    column: str = "Close",
+) -> float | None:
     frame = _normalize_frame(df)
     ts = pd.Timestamp(bar_date)
     if ts not in frame.index:
         window = frame.loc[frame.index <= ts]
         if window.empty:
             return None
-        return float(window["Close"].iloc[-1])
-    return float(frame.loc[ts, "Close"])
+        return float(window[column].iloc[-1])
+    return float(frame.loc[ts, column])
+
+
+def _close_on_date(df: pd.DataFrame, bar_date: str) -> float | None:
+    return _price_on_date(df, bar_date, column="Close")
+
+
+def _open_on_date(df: pd.DataFrame, bar_date: str) -> float | None:
+    return _price_on_date(df, bar_date, column="Open")
+
+
+@dataclass
+class _PendingRebalance:
+    execute_date: str
+    sells: list[tuple[str, int, str]]
+    buys: list[tuple[str, int]]
 
 
 def run_top3_backtest(
@@ -95,6 +116,8 @@ def run_top3_backtest(
     """
     cfg = (momentum_settings or MomentumRankSettings.from_env()).for_top3()
     slip_bps = max(0.0, float(slippage_bps))
+    fill_at_next_open = StrategyConfigMapper.backtest_fill_at_next_open()
+    pending_rebalances: list[_PendingRebalance] = []
 
     raw_frames = {t: _normalize_frame(ohlcv_by_ticker[t]) for t in tickers}
     all_dates: set[str] = set()
@@ -206,7 +229,24 @@ def run_top3_backtest(
         )
         return True
 
-    for bar_date in timeline:
+    def execute_pending_rebalances(bar_date: str) -> None:
+        for pending in pending_rebalances[:]:
+            if pending.execute_date != bar_date:
+                continue
+            for ticker, shares, signal in pending.sells:
+                price = _open_on_date(raw_frames[ticker], bar_date)
+                if price is not None:
+                    do_sell(ticker, shares, price, bar_date, signal)
+            for ticker, shares in pending.buys:
+                price = _open_on_date(raw_frames[ticker], bar_date)
+                if price is not None:
+                    do_buy(ticker, shares, price, bar_date)
+            pending_rebalances.remove(pending)
+
+    for bar_idx, bar_date in enumerate(timeline):
+        if fill_at_next_open:
+            execute_pending_rebalances(bar_date)
+
         first_run = last_rebalance is None
         is_rebalance = first_run or should_rebalance_on_bar_date(
             bar_date,
@@ -245,9 +285,10 @@ def run_top3_backtest(
                 hv = holdings_value(prices)
                 equity = compute_portfolio_equity(cash, hv)
 
+                sell_plan: list[tuple[str, int, str]] = []
                 for ticker, shares in list(holdings.items()):
                     if shares > 0 and ticker not in target and ticker in prices:
-                        do_sell(ticker, shares, prices[ticker], bar_date, "TOP3_EXIT")
+                        sell_plan.append((ticker, shares, "TOP3_EXIT"))
 
                 prices = mark_prices(bar_date)
                 hv = holdings_value(prices)
@@ -259,6 +300,7 @@ def run_top3_backtest(
                     use_inverse_vol=use_inverse_vol,
                 )
 
+                buy_plan: list[tuple[str, int]] = []
                 for ticker in target:
                     if ticker not in prices or prices[ticker] <= 0:
                         continue
@@ -268,9 +310,25 @@ def run_top3_backtest(
                     target_shares = int(slot_equity / price)
                     delta = target_shares - current_shares
                     if delta < 0:
-                        do_sell(ticker, -delta, price, bar_date, "TOP3_TRIM")
+                        sell_plan.append((ticker, -delta, "TOP3_TRIM"))
                     elif delta > 0:
-                        do_buy(ticker, delta, price, bar_date)
+                        buy_plan.append((ticker, delta))
+
+                if fill_at_next_open and bar_idx + 1 < len(timeline):
+                    pending_rebalances.append(
+                        _PendingRebalance(
+                            execute_date=timeline[bar_idx + 1],
+                            sells=sell_plan,
+                            buys=buy_plan,
+                        )
+                    )
+                else:
+                    for ticker, shares, signal in sell_plan:
+                        if ticker in prices:
+                            do_sell(ticker, shares, prices[ticker], bar_date, signal)
+                    for ticker, shares in buy_plan:
+                        if ticker in prices:
+                            do_buy(ticker, shares, prices[ticker], bar_date)
 
                 rebalance_count += 1
 

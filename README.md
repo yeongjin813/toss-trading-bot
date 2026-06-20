@@ -450,8 +450,10 @@ python -m pytest test_momentum_selection.py test_momentum_ranker.py -q
 | `vix_data.py` | ^VIX yfinance frame (research; live inject when filter ON) |
 | `scripts/filter_combo_backtest.py` | SPY-only vs entry-confirm vs VIX grid |
 | `scripts/cost_sensitivity.py` | Commission × slippage sensitivity (dual 60/40) |
-| `BACKTEST_FILL_AT_NEXT_OPEN` | Signal at close → **fill next session open** (default `true`) |
+| `BACKTEST_FILL_AT_NEXT_OPEN` | Signal at close → **fill next session open** (default `true`; legacy + Top3 backtests) |
 | `USE_WEEKLY_TELEGRAM_REPORT` | Friday EOD weekly PnL vs paper anchor (Telegram) |
+
+**Live vs backtest order timing:** The live bot places **limit orders during RTH** (60s / 15s polling) when daily signals pass gates — not only at the closing auction. Backtests assume **signal at bar close → fill next session open** plus friction. See [OPERATIONS.md — Live order timing](docs/OPERATIONS.md#live-order-timing-not-close-only).
 
 **Verify:**
 
@@ -1705,26 +1707,18 @@ This section documents **residual production risks** that persist even after Pha
 | Trigger timing | Intraday, potentially mid-bar | End-of-bar EOD evaluation |
 | Parity status | **Asymmetric** — live is strictly more reactive |
 
-### B. Execution Timing Mismatch (The One-Day Latency Trap)
+### B. Execution Timing Mismatch (Live RTH vs Backtest Next-Open)
 
-- **The Core Risk**: By default, Backtrader's execution engine dispatches market actions (`self.close()`) to execute on the **Next Day's Open (Next Open)** price. Conversely, the live orchestration architecture (`analytics.py`) calculates portfolio net asset value (NAV) assuming immediate execution at the **Current Day's Close (EOD Close)**:
+- **Live bot**: Daily-bar **signals** evaluated on a **forming intraday bar**; orders dispatch as **KIS limit orders during RTH** (09:30–16:00 ET), polled every 60s (15s when holding). Not “close auction only.”
+- **Backtest (Phase 17 default)**: Signal on bar **close**; fill at **next session open** (`BACKTEST_FILL_AT_NEXT_OPEN=true`) with commission + slippage — conservative vs same-bar close.
+- **Residual gap**: Live can fill **same session** at limit; backtest waits until **next open**. Live ATR stops use intraday `session_low` unless `USE_EOD_ATR_STOPS=true`.
 
-$$
-\text{Backtest Execution Price} = \text{Open}_{t+1}
-$$
-
-$$
-\text{Live Engine Execution Price} = \text{Close}_t
-$$
-
-- **Historical Risk**: Without Cheat-on-Close, Backtrader's default next-bar open fill ($\text{Open}_{t+1}$) diverges from the live engine's EOD close assumption ($\text{Close}_t$).
-- **Current Status**: **Resolved** — `configure_backtest_broker()` in `strategy.py` enables `set_coc(True)` for isolated Backtrader runs; the default portfolio path uses `LiveSignalEngine` directly at $\text{Close}_t$.
-
-| Execution Assumption | Module | Price Anchor |
+| Execution Assumption | Module | Price / timing anchor |
 |---|---|---|
-| Same-bar close fill (isolated Backtrader) | `strategy.py` via `set_coc(True)` | $\text{Close}_t$ |
-| Same-bar close fill (portfolio default) | `portfolio_backtest.py` + `LiveSignalEngine` | $\text{Close}_t$ |
-| Live dispatch model | `analytics.py` / `main.py` | $\text{Close}_t$ (EOD signal on completed daily bar) |
+| Next-bar open fill (portfolio default) | `portfolio_backtest.py` | $\text{Open}_{t+1}$ after signal on $\text{Close}_t$ |
+| Next-bar open fill (Top3 rebalance) | `top3_backtest.py` | Rebalance signal on close → trades at next open |
+| Same-bar close fill (legacy toggle) | `BACKTEST_FILL_AT_NEXT_OPEN=false` | $\text{Close}_t$ |
+| Live dispatch | `main.py` + `execution_engine.py` | RTH limit; reference = latest bar close + buffer |
 
 ---
 

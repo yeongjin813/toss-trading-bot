@@ -115,6 +115,19 @@ Stop with `Ctrl+C`. State persists to `trading_state.json`.
 
 See [Live System Flow](../README.md#live-system-flow) for the full gate and fill pipeline.
 
+### Live order timing (not close-only)
+
+| | Live bot | Backtest (default) |
+|---|---|---|
+| **When orders fire** | **09:30–16:00 ET (RTH)** when signals pass gates — not only at 16:00 | Signal on bar **close**; fill at **next session open** (`BACKTEST_FILL_AT_NEXT_OPEN=true`) |
+| **Poll interval** | 60s flat; **15s** when holding or pending order | N/A (simulated daily bars) |
+| **Order type** | KIS **limit** (`KIS_ORDER_TYPE=limit`) with price buffer | Open/close + commission + slippage |
+| **Signal basis** | Daily indicators; **forming bar** updates intraday | Completed daily bars only |
+| **New BUY** | RTH; blocked in open/close volatility windows | Next-bar open after crossover signal |
+| **ATR stop** | Intraday `session_low` scan (default); `USE_EOD_ATR_STOPS=true` for backtest parity | Daily bar low (unless EOD mode aligned) |
+
+**Takeaway:** production is **intraday RTH limit trading on a daily-bar strategy** — not a “market-on-close only” bot. Backtest timing is intentionally conservative (signal → next open).
+
 **Log tags**
 
 | Tag | Meaning |
