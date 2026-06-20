@@ -23,6 +23,11 @@ from momentum_ranker import (
     select_top_tickers_diversified,
     should_rebalance_on_bar_date,
 )
+from momentum_selection import (
+    target_allocation_weights,
+    target_set_unchanged,
+    vol_map_from_ranked,
+)
 
 TOP3_STATE_KEY = "_top3_shadow"
 
@@ -118,19 +123,7 @@ def compute_top3_rebalance_orders(
     When broker_holdings is supplied (Phase 4 live), deltas use the shared
     broker account as source-of-truth instead of shadow-only quantities.
     """
-    cfg = settings or MomentumRankSettings.from_env()
-    cfg = MomentumRankSettings(
-        enabled=True,
-        top_n=cfg.top_n,
-        rebalance_weekday=cfg.rebalance_weekday,
-        weight_3m=cfg.weight_3m,
-        weight_6m=cfg.weight_6m,
-        weight_12m=cfg.weight_12m,
-        weight_volume=cfg.weight_volume,
-        require_above_sma50=cfg.require_above_sma50,
-        require_above_sma200=cfg.require_above_sma200,
-        min_bars=cfg.min_bars,
-    )
+    cfg = (settings or MomentumRankSettings.from_env()).for_top3()
 
     as_of = (now or datetime.now()).strftime("%Y-%m-%d")
     first_run = shadow.last_rebalance_date is None
@@ -152,6 +145,31 @@ def compute_top3_rebalance_orders(
         target = select_top_tickers(ranked, top_n=cfg.top_n)
     if not target:
         target = universe[: cfg.top_n]
+
+    if (
+        not force
+        and not first_run
+        and cfg.ranking_mode == "enhanced"
+        and cfg.dynamic_rebalance_only
+        and shadow.active_tickers
+        and target_set_unchanged(shadow.active_tickers, target)
+    ):
+        prices: dict[str, float] = {}
+        for ticker in universe:
+            price = _price_from_frame(cache.get_frame(ticker), as_of)
+            if price is not None:
+                prices[ticker] = price
+        shadow.last_rebalance_date = as_of
+        shadow.last_equity_usd = shadow.cash_usd + sum(
+            shadow.holdings.get(t, 0) * prices[t]
+            for t in shadow.holdings
+            if t in prices
+        )
+        hold_msg = (
+            f"[TOP3/SHADOW] Hold — Top{cfg.top_n} unchanged: {', '.join(target)} "
+            f"(equity=${shadow.last_equity_usd:,.2f})"
+        )
+        return shadow, [], [hold_msg]
 
     top3_equity = scaled_capital(total_equity_usd, deploy.top3_capital_fraction())
     if shadow.cash_usd <= 0 and not shadow.holdings:
@@ -214,14 +232,20 @@ def compute_top3_rebalance_orders(
         if t in prices
     )
     equity = shadow.cash_usd + holdings_value
-    per_slot = equity / len(target) if target else 0.0
+    use_inverse_vol = cfg.ranking_mode == "enhanced" and cfg.inverse_vol_weighting
+    weights = target_allocation_weights(
+        target,
+        vol_map_from_ranked(ranked, target),
+        use_inverse_vol=use_inverse_vol,
+    )
 
     for ticker in target:
         if ticker not in prices:
             continue
         price = prices[ticker]
         current = current_shares(ticker)
-        target_shares = int(per_slot / price) if price > 0 else 0
+        slot_equity = equity * weights.get(ticker, 0.0)
+        target_shares = int(slot_equity / price) if price > 0 else 0
         delta = target_shares - current
         if delta < 0:
             sell_qty = -delta
@@ -262,10 +286,11 @@ def compute_top3_rebalance_orders(
     shadow.last_equity_usd = shadow.cash_usd + sum(
         shadow.holdings.get(t, 0) * prices[t] for t in shadow.holdings if t in prices
     )
+    weight_note = "inverse-vol" if use_inverse_vol else "equal-weight"
     logs.insert(
         0,
         f"[TOP3/SHADOW] Rebalance {as_of} Top{cfg.top_n}: {', '.join(target)} "
-        f"(equity=${shadow.last_equity_usd:,.2f})",
+        f"({weight_note}, equity=${shadow.last_equity_usd:,.2f})",
     )
     return shadow, orders, logs
 

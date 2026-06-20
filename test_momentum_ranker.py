@@ -117,12 +117,47 @@ def test_rebalance_persists_active_tickers() -> None:
     assert states["_portfolio"]["active_trade_tickers"] == snapshot.active_tickers
 
 
+def test_enhanced_mode_uses_composite_fields() -> None:
+    frames = {
+        "AAA": _synthetic_frame("AAA", daily_return=0.002, bars=300),
+        "BBB": _synthetic_frame("BBB", daily_return=0.001, bars=300),
+    }
+    settings = MomentumRankSettings(
+        enabled=True,
+        top_n=2,
+        ranking_mode="enhanced",
+        require_above_sma50=False,
+        require_above_sma200=False,
+        require_near_52w_high=False,
+        min_bars=252,
+    )
+    ranked = rank_universe_frames(frames, list(frames), settings=settings)
+    assert ranked
+    assert ranked[0].momentum_subscore >= 0
+    assert ranked[0].vol_126d > 0
+
+
+def test_for_production_forces_legacy() -> None:
+    settings = MomentumRankSettings.from_env()
+    settings = MomentumRankSettings(
+        ranking_mode="enhanced",
+        dynamic_rebalance_only=True,
+        inverse_vol_weighting=True,
+    )
+    prod = settings.for_production()
+    assert prod.ranking_mode == "legacy"
+    assert prod.dynamic_rebalance_only is False
+    assert prod.inverse_vol_weighting is False
+
+
 def main() -> int:
     test_rank_universe_prefers_strong_momentum()
     test_build_cycle_tickers_keeps_held_names()
     test_buy_gate_blocks_outside_active_set()
     test_rebalance_runs_on_friday()
     test_rebalance_persists_active_tickers()
+    test_enhanced_mode_uses_composite_fields()
+    test_for_production_forces_legacy()
     print("ALL MOMENTUM RANKER TESTS PASSED")
     return 0
 

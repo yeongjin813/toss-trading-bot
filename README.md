@@ -29,7 +29,9 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 ---
 
-> **Phase 15 (2026-06)** — live-loop hardening: atomic `trading_state.json` writes, fewer disk flushes, and RTH orchestration moved to `watchlist_cycle.py`. See [Phase 15](#phase-15-live-loop-hardening--pipeline-extract-2026-06).  
+> **Phase 15 (2026-06)** — live-loop hardening: atomic `trading_state.json` writes, fewer disk flushes, and RTH orchestration moved to `watchlist_cycle.py`. See [Phase 15](#phase-15-live-loop-hardening--pipeline-extract-2026-06).
+>
+> **Phase 16 (2026-06)** — Enhanced momentum model (FIP / skewness / inverse-vol) researched and backtested; **Legacy kept as production default**. See [Phase 16](#phase-16-enhanced-momentum-research-legacy-retained-2026-06).  
 > **Phase 14 (2026-06)** — profit/risk parity + **25-ticker** universe. See rows **14.x** and [Phase 14](#phase-14-profit-risk-parity--diversified-universe-2026-06) before [Live System Flow](#live-system-flow).
 
 ## Documentation Map
@@ -403,6 +405,27 @@ python scripts/compare_watchlist.py
 
 ```powershell
 python -m pytest test_state_persistence.py test_watchlist_cycle.py -q
+```
+
+### Phase 16: Enhanced Momentum Research — Legacy Retained *(2026-06)*
+
+An alternate Top3 selection model was implemented for research (not live deployment):
+
+| Component | Module | Status |
+|---|---|---|
+| **Legacy (production)** | `momentum_ranker.py` | 63/126/252 returns + volume stability; equal-weight Top3; **default everywhere** |
+| **Enhanced (research)** | `momentum_selection.py` + `rank_universe_frames_enhanced()` | 60/120/252 + FIP − skew penalty; inverse-vol weights; composition-only rebalance |
+
+**2020–2026 backtest** (25-ticker watchlist, yfinance): Legacy beat Enhanced on **CAGR** (+24.2% vs +20.5%), **Sharpe** (0.97 vs 0.91), and **2022 drawdown** (−22.8% vs −28.1%). Enhanced reduced turnover (fewer trades/rebalances) but did not justify a production switch.
+
+**Production guarantee:** `main.py` hardcodes `ranking_mode=legacy` for `MOMENTUM_SETTINGS`. Setting `MOMENTUM_RANKING_MODE=enhanced` in `.env` does **not** affect the live bot.
+
+**Research / compare only:**
+
+```powershell
+python run_backtest.py --yfinance --compare-momentum-ranking --cash 100000 --start 2020-01-01
+python scripts/compare_momentum_ranking.py --yfinance
+python -m pytest test_momentum_selection.py test_momentum_ranker.py -q
 ```
 
 | Upgrade | Module | Summary |
@@ -1953,6 +1976,19 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | `MOMENTUM_REQUIRE_NEAR_52W_HIGH` | No | `true` | Require proximity to 52-week high for Top3 ranking |
 | `MOMENTUM_SECTOR_DIVERSIFY` | No | `true` | Sector cap when selecting Top-N momentum names |
 | `MOMENTUM_MAX_PER_SECTOR` | No | `1` | Max Top3 picks per sector tag |
+| `MOMENTUM_RANKING_MODE` | No | `legacy` | **Production uses legacy** (`main.py` ignores `enhanced`). Research: `--compare-momentum-ranking` |
+| `MOMENTUM_DYNAMIC_REBALANCE` | No | `true` | Enhanced-only: skip rebalance when Top3 composition unchanged |
+| `MOMENTUM_INVERSE_VOL_WEIGHT` | No | `true` | Enhanced-only: inverse-vol Top3 weights (126d) |
+
+#### Phase 16 — Enhanced Momentum Research *(inactive in production)*
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MOMENTUM_WEIGHT_MOMENTUM` | No | `1.0` | Enhanced composite: normalized multi-horizon momentum weight |
+| `MOMENTUM_WEIGHT_FIP` | No | `1.0` | Enhanced composite: Frog-in-the-Pan weight |
+| `MOMENTUM_WEIGHT_SKEW_PENALTY` | No | `1.0` | Enhanced composite: skewness penalty weight |
+
+See [Phase 16](#phase-16-enhanced-momentum-research-legacy-retained-2026-06). Modules: `momentum_selection.py`, `scripts/compare_momentum_ranking.py`.
 
 #### Phase 14 — Regime, Filters & Risk *(2026-06)*
 
@@ -2046,7 +2082,8 @@ Toss Trading Bot/
 ├── analytics.py            # IndicatorAnalytics (dual MA), LiveSignalEngine, dual-clamp sizing, regime/scale
 ├── strategy.py             # TrendTradingStrategy — ticker-bound Backtrader twin with regime gates
 ├── portfolio_backtest.py   # Consolidated portfolio backtest (default live-parity path)
-├── momentum_ranker.py      # P9: weekly Top-N momentum universe filter
+├── momentum_ranker.py      # P9: weekly Top-N momentum universe filter (legacy production default)
+├── momentum_selection.py   # P16: enhanced ranking research module (not deployed live)
 ├── backtest_benchmarks.py  # P9: B&H / SPY benchmark helpers for walk-forward
 ├── daily_report.py         # P9: EOD metrics + Telegram report formatting
 ├── run_backtest.py         # CLI: portfolio backtest, --walk-forward, --isolated legacy, --random smoke test
@@ -2061,6 +2098,7 @@ Toss Trading Bot/
 │   └── dual_sweep.py         # Capital-split sweep + walk-forward
 ├── test_analytics.py         # Engine verification (trend filter + conditional RSI tests)
 ├── test_momentum_ranker.py
+├── test_momentum_selection.py
 ├── test_backtest_benchmarks.py
 ├── test_daily_report.py
 ├── requirements.txt        # Python dependencies (includes python-telegram-bot>=21.0)

@@ -159,6 +159,9 @@ MOMENTUM_SETTINGS = MomentumRankSettings(
     sector_diversify=_MOMENTUM_RAW.sector_diversify,
     max_per_sector=_MOMENTUM_RAW.max_per_sector,
     min_bars=_MOMENTUM_RAW.min_bars,
+    ranking_mode="legacy",
+    dynamic_rebalance_only=False,
+    inverse_vol_weighting=False,
 )
 
 FEATURES = TradingFeatureFlags.from_env()

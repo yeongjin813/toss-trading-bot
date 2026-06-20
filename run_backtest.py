@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from portfolio_backtest import (
 )
 from top3_backtest import (
     Top3BacktestResult,
+    analytics_for_top3_result,
     print_dual_combined_summary,
     print_strategy_comparison_table,
     run_top3_backtest,
@@ -78,6 +80,9 @@ def resolve_momentum_settings(args: argparse.Namespace) -> MomentumRankSettings:
     settings = MomentumRankSettings.from_env()
     enabled = settings.enabled and not args.no_momentum_rank
     top_n = args.momentum_top_n if args.momentum_top_n is not None else settings.top_n
+    ranking_mode = settings.ranking_mode
+    if getattr(args, "momentum_ranking_mode", None):
+        ranking_mode = args.momentum_ranking_mode
     return MomentumRankSettings(
         enabled=enabled,
         top_n=top_n,
@@ -93,6 +98,12 @@ def resolve_momentum_settings(args: argparse.Namespace) -> MomentumRankSettings:
         sector_diversify=settings.sector_diversify,
         max_per_sector=settings.max_per_sector,
         min_bars=settings.min_bars,
+        ranking_mode=ranking_mode,
+        weight_momentum=settings.weight_momentum,
+        weight_fip=settings.weight_fip,
+        weight_skew_penalty=settings.weight_skew_penalty,
+        dynamic_rebalance_only=settings.dynamic_rebalance_only,
+        inverse_vol_weighting=settings.inverse_vol_weighting,
     )
 
 
@@ -551,6 +562,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override MOMENTUM_TOP_N for this backtest run",
     )
     parser.add_argument(
+        "--momentum-ranking-mode",
+        choices=("legacy", "enhanced"),
+        default=None,
+        help="Top3 ranking model: legacy (63/126/252+volume) or enhanced (60/120/252+FIP-skew)",
+    )
+    parser.add_argument(
+        "--compare-momentum-ranking",
+        action="store_true",
+        help="Run legacy vs enhanced Top3 models side-by-side (ignores --strategy)",
+    )
+    parser.add_argument(
         "--strategy",
         choices=("legacy", "top3", "compare", "dual"),
         default="legacy",
@@ -633,20 +655,10 @@ def run_strategy_backtests(
     if args.strategy in {"top3", "compare", "dual"}:
         if args.strategy == "compare":
             print()
-        top3_settings = MomentumRankSettings(
+        top3_settings = replace(
+            momentum_settings,
             enabled=True,
-            top_n=3,
-            rebalance_weekday=momentum_settings.rebalance_weekday,
-            weight_3m=momentum_settings.weight_3m,
-            weight_6m=momentum_settings.weight_6m,
-            weight_12m=momentum_settings.weight_12m,
-            weight_volume=momentum_settings.weight_volume,
-            require_above_sma50=momentum_settings.require_above_sma50,
-            require_above_sma200=momentum_settings.require_above_sma200,
-            require_near_52w_high=momentum_settings.require_near_52w_high,
-            near_52w_high_pct=momentum_settings.near_52w_high_pct,
-            sector_diversify=momentum_settings.sector_diversify,
-            max_per_sector=momentum_settings.max_per_sector,
+            top_n=momentum_settings.top_n if args.momentum_top_n is None else args.momentum_top_n,
             min_bars=min(momentum_settings.min_bars, 60),
         )
         top3_ohlcv = full_ohlcv if full_ohlcv is not None else ohlcv
@@ -800,6 +812,71 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
     return 0
 
 
+    return 0
+
+
+def run_compare_momentum_ranking(
+    args: argparse.Namespace,
+    loaded: list[str],
+    ohlcv: dict[str, pd.DataFrame],
+    *,
+    window_label: str = "",
+) -> int:
+    """Legacy vs enhanced Top3 selection on identical OHLCV."""
+    from momentum_selection import print_momentum_ranking_comparison_table
+
+    base = replace(
+        MomentumRankSettings.from_env().for_top3(),
+        top_n=args.momentum_top_n or MomentumRankSettings.from_env().top_n,
+        min_bars=min(MomentumRankSettings.from_env().min_bars, 60),
+        require_near_52w_high=MomentumRankSettings.from_env().require_near_52w_high,
+        near_52w_high_pct=MomentumRankSettings.from_env().near_52w_high_pct,
+        sector_diversify=MomentumRankSettings.from_env().sector_diversify,
+        max_per_sector=MomentumRankSettings.from_env().max_per_sector,
+    )
+    legacy_cfg = replace(
+        base,
+        ranking_mode="legacy",
+        dynamic_rebalance_only=False,
+        inverse_vol_weighting=False,
+    )
+    enhanced_cfg = replace(
+        base,
+        ranking_mode="enhanced",
+        dynamic_rebalance_only=True,
+        inverse_vol_weighting=True,
+    )
+
+    print("=" * 88)
+    print("TOP3 MOMENTUM RANKING COMPARISON: LEGACY vs ENHANCED".center(88))
+    print("=" * 88)
+
+    legacy_result = run_top3_backtest(
+        tickers=loaded,
+        ohlcv_by_ticker=ohlcv,
+        initial_cash=args.cash,
+        commission_rate=args.commission,
+        momentum_settings=legacy_cfg,
+        window_start=args.start,
+        window_end=args.end,
+    )
+    enhanced_result = run_top3_backtest(
+        tickers=loaded,
+        ohlcv_by_ticker=ohlcv,
+        initial_cash=args.cash,
+        commission_rate=args.commission,
+        momentum_settings=enhanced_cfg,
+        window_start=args.start,
+        window_end=args.end,
+    )
+    print_momentum_ranking_comparison_table(
+        analytics_for_top3_result(legacy_result),
+        analytics_for_top3_result(enhanced_result),
+        window_label=window_label,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     tickers = parse_watchlist(args.tickers)
@@ -928,6 +1005,18 @@ def main(argv: list[str] | None = None) -> int:
         ]
         print_isolated_table(rows, args.cash)
         return 0
+
+    window_label = ""
+    if args.start or args.end:
+        window_label = f"{args.start or '...'} → {args.end or '...'}"
+
+    if args.compare_momentum_ranking:
+        return run_compare_momentum_ranking(
+            args,
+            loaded,
+            ohlcv,
+            window_label=window_label,
+        )
 
     return run_strategy_backtests(
         args,

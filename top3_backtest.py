@@ -20,6 +20,12 @@ from momentum_ranker import (
     select_top_tickers_diversified,
     should_rebalance_on_bar_date,
 )
+from momentum_selection import (
+    summarize_top3_analytics,
+    target_allocation_weights,
+    target_set_unchanged,
+    vol_map_from_ranked,
+)
 from portfolio_backtest import (
     TradeRecord,
     compute_max_drawdown,
@@ -41,6 +47,8 @@ class Top3BacktestResult:
     trades: list[TradeRecord]
     per_ticker_summary: dict[str, dict[str, Any]]
     rebalance_count: int = 0
+    closed_pnls: list[float] = field(default_factory=list)
+    ranking_mode: str = "legacy"
 
 
 def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -83,19 +91,7 @@ def run_top3_backtest(
       2. Sell holdings outside Top N
       3. Rebalance to equal weight across Top N (target = equity / N each)
     """
-    cfg = momentum_settings or MomentumRankSettings.from_env()
-    cfg = MomentumRankSettings(
-        enabled=True,
-        top_n=cfg.top_n,
-        rebalance_weekday=cfg.rebalance_weekday,
-        weight_3m=cfg.weight_3m,
-        weight_6m=cfg.weight_6m,
-        weight_12m=cfg.weight_12m,
-        weight_volume=cfg.weight_volume,
-        require_above_sma50=cfg.require_above_sma50,
-        require_above_sma200=cfg.require_above_sma200,
-        min_bars=cfg.min_bars,
-    )
+    cfg = (momentum_settings or MomentumRankSettings.from_env()).for_top3()
 
     raw_frames = {t: _normalize_frame(ohlcv_by_ticker[t]) for t in tickers}
     all_dates: set[str] = set()
@@ -116,6 +112,7 @@ def run_top3_backtest(
     closed_pnls: list[float] = []
     open_cost: dict[str, float] = {}
     last_rebalance: str | None = None
+    last_target: list[str] = []
     rebalance_count = 0
 
     def mark_prices(bar_date: str) -> dict[str, float]:
@@ -230,33 +227,50 @@ def run_top3_backtest(
             if not target:
                 target = tickers[: cfg.top_n]
 
-            prices = mark_prices(bar_date)
-            hv = holdings_value(prices)
-            equity = compute_portfolio_equity(cash, hv)
+            skip_trades = (
+                not first_run
+                and cfg.ranking_mode == "enhanced"
+                and cfg.dynamic_rebalance_only
+                and last_target
+                and target_set_unchanged(last_target, target)
+            )
 
-            for ticker, shares in list(holdings.items()):
-                if shares > 0 and ticker not in target and ticker in prices:
-                    do_sell(ticker, shares, prices[ticker], bar_date, "TOP3_EXIT")
+            if not skip_trades:
+                prices = mark_prices(bar_date)
+                hv = holdings_value(prices)
+                equity = compute_portfolio_equity(cash, hv)
 
-            prices = mark_prices(bar_date)
-            hv = holdings_value(prices)
-            equity = compute_portfolio_equity(cash, hv)
-            per_slot = equity / len(target) if target else 0.0
+                for ticker, shares in list(holdings.items()):
+                    if shares > 0 and ticker not in target and ticker in prices:
+                        do_sell(ticker, shares, prices[ticker], bar_date, "TOP3_EXIT")
 
-            for ticker in target:
-                if ticker not in prices or prices[ticker] <= 0:
-                    continue
-                price = prices[ticker]
-                current_shares = holdings.get(ticker, 0)
-                target_shares = int(per_slot / price)
-                delta = target_shares - current_shares
-                if delta < 0:
-                    do_sell(ticker, -delta, price, bar_date, "TOP3_TRIM")
-                elif delta > 0:
-                    do_buy(ticker, delta, price, bar_date)
+                prices = mark_prices(bar_date)
+                hv = holdings_value(prices)
+                equity = compute_portfolio_equity(cash, hv)
+                use_inverse_vol = cfg.ranking_mode == "enhanced" and cfg.inverse_vol_weighting
+                weights = target_allocation_weights(
+                    target,
+                    vol_map_from_ranked(ranked, target),
+                    use_inverse_vol=use_inverse_vol,
+                )
 
+                for ticker in target:
+                    if ticker not in prices or prices[ticker] <= 0:
+                        continue
+                    price = prices[ticker]
+                    current_shares = holdings.get(ticker, 0)
+                    slot_equity = equity * weights.get(ticker, 0.0)
+                    target_shares = int(slot_equity / price)
+                    delta = target_shares - current_shares
+                    if delta < 0:
+                        do_sell(ticker, -delta, price, bar_date, "TOP3_TRIM")
+                    elif delta > 0:
+                        do_buy(ticker, delta, price, bar_date)
+
+                rebalance_count += 1
+
+            last_target = list(target)
             last_rebalance = bar_date
-            rebalance_count += 1
 
         prices = mark_prices(bar_date)
         hv = holdings_value(prices)
@@ -305,7 +319,24 @@ def run_top3_backtest(
         trades=trades,
         per_ticker_summary=per_ticker,
         rebalance_count=rebalance_count,
+        closed_pnls=closed_pnls,
+        ranking_mode=cfg.ranking_mode,
     )
+
+
+def analytics_for_top3_result(result: Top3BacktestResult) -> dict[str, float | int | dict[str, float]]:
+    """Extended metrics for legacy vs enhanced comparison."""
+    metrics = summarize_top3_analytics(
+        initial_cash=result.initial_cash,
+        final_equity=result.final_equity,
+        equity_curve=result.equity_curve,
+        closed_pnls=result.closed_pnls,
+        total_trades=result.total_trades,
+        winning_trades=result.winning_trades,
+    )
+    metrics["rebalance_count"] = result.rebalance_count
+    metrics["ranking_mode"] = result.ranking_mode
+    return metrics
 
 
 def _normalized_equity_series(result: Any) -> pd.Series:

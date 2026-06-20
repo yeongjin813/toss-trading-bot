@@ -1,9 +1,9 @@
 """
 Cross-sectional momentum ranker for universe -> active tradable subset.
 
-Scores each symbol on multi-horizon returns, trend alignment, and volume
-stability, then selects Top N names for new BUY eligibility only. Held
-positions outside the active set still receive exit processing.
+**Production default:** ``legacy`` (63/126/252 returns + volume stability).
+The ``enhanced`` branch (FIP, skewness, inverse-vol) lives in this module and
+``momentum_selection.py`` for backtest/research only — not deployed live.
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ TRADING_DAYS_6M = 126
 TRADING_DAYS_12M = 252
 SMA_50 = 50
 SMA_200 = 200
+
+# Production and dataclass default — do not change without a new backtest + review.
+DEFAULT_RANKING_MODE = "legacy"
+PRODUCTION_RANKING_MODE = "legacy"
+VALID_RANKING_MODES = frozenset({"legacy", "enhanced"})
 
 
 class FrameProvider(Protocol):
@@ -44,11 +49,22 @@ class MomentumRankSettings:
     sector_diversify: bool = True
     max_per_sector: int = 1
     min_bars: int = TRADING_DAYS_12M
+    # Research-only enhanced selection (see momentum_selection.py). Production uses legacy.
+    ranking_mode: str = DEFAULT_RANKING_MODE
+    weight_momentum: float = 1.0
+    weight_fip: float = 1.0
+    weight_skew_penalty: float = 1.0
+    dynamic_rebalance_only: bool = True
+    inverse_vol_weighting: bool = True
 
     @classmethod
     def from_env(cls) -> MomentumRankSettings:
         def _flag(name: str, default: str = "true") -> bool:
             return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        mode = os.getenv("MOMENTUM_RANKING_MODE", DEFAULT_RANKING_MODE).strip().lower()
+        if mode not in VALID_RANKING_MODES:
+            mode = DEFAULT_RANKING_MODE
 
         return cls(
             enabled=_flag("MOMENTUM_RANK_ENABLED", "false"),
@@ -65,6 +81,29 @@ class MomentumRankSettings:
             sector_diversify=_flag("MOMENTUM_SECTOR_DIVERSIFY", "true"),
             max_per_sector=max(1, int(os.getenv("MOMENTUM_MAX_PER_SECTOR", "1"))),
             min_bars=int(os.getenv("MOMENTUM_MIN_BARS", str(TRADING_DAYS_12M))),
+            ranking_mode=mode,
+            weight_momentum=float(os.getenv("MOMENTUM_WEIGHT_MOMENTUM", "1.0")),
+            weight_fip=float(os.getenv("MOMENTUM_WEIGHT_FIP", "1.0")),
+            weight_skew_penalty=float(os.getenv("MOMENTUM_WEIGHT_SKEW_PENALTY", "1.0")),
+            dynamic_rebalance_only=_flag("MOMENTUM_DYNAMIC_REBALANCE", "true"),
+            inverse_vol_weighting=_flag("MOMENTUM_INVERSE_VOL_WEIGHT", "true"),
+        )
+
+    def for_top3(self) -> MomentumRankSettings:
+        """Top3 path always ranks; copy full settings with enabled=True."""
+        from dataclasses import replace
+
+        return replace(self, enabled=True)
+
+    def for_production(self) -> MomentumRankSettings:
+        """Live bot settings: always legacy ranking and equal-weight Top3."""
+        from dataclasses import replace
+
+        return replace(
+            self,
+            ranking_mode=PRODUCTION_RANKING_MODE,
+            dynamic_rebalance_only=False,
+            inverse_vol_weighting=False,
         )
 
 
@@ -79,6 +118,10 @@ class MomentumScore:
     above_sma200: bool
     volume_score: float
     close: float
+    fip_score: float = 0.0
+    skewness_90d: float = 0.0
+    vol_126d: float = 0.0
+    momentum_subscore: float = 0.0
 
 
 @dataclass
@@ -191,6 +234,102 @@ def compute_ticker_momentum(
     )
 
 
+def _enhanced_raw_factors(
+    df: pd.DataFrame,
+    ticker: str,
+    *,
+    as_of_date: str | None = None,
+    settings: MomentumRankSettings,
+) -> dict[str, float] | None:
+    """RESEARCH ONLY — used when ranking_mode=enhanced (backtest / compare scripts)."""
+    from momentum_selection import compute_ticker_factors
+
+    window = _slice_as_of(df, as_of_date)
+    if len(window) < settings.min_bars:
+        return None
+
+    closes = window["Close"].astype(float)
+    close = float(closes.iloc[-1])
+    sma50 = float(closes.tail(SMA_50).mean()) if len(closes) >= SMA_50 else close
+    sma200 = float(closes.tail(SMA_200).mean()) if len(closes) >= SMA_200 else close
+    above_sma50 = close > sma50
+    above_sma200 = close > sma200
+
+    if settings.require_above_sma50 and not above_sma50:
+        return None
+    if settings.require_above_sma200 and not above_sma200:
+        return None
+
+    high_52w = (
+        float(closes.tail(TRADING_DAYS_12M).max())
+        if len(closes) >= TRADING_DAYS_12M
+        else close
+    )
+    if settings.require_near_52w_high and high_52w > 0:
+        floor = high_52w * (1.0 - settings.near_52w_high_pct)
+        if close < floor:
+            return None
+
+    row = compute_ticker_factors(
+        closes,
+        ticker,
+        above_sma50=above_sma50,
+        above_sma200=above_sma200,
+    )
+    return row
+
+
+def rank_universe_frames_enhanced(
+    frames: Mapping[str, pd.DataFrame],
+    universe: list[str],
+    *,
+    as_of_date: str | None = None,
+    settings: MomentumRankSettings | None = None,
+) -> list[MomentumScore]:
+    """RESEARCH ONLY — 60/120/252 momentum + FIP - skew penalty composite ranking."""
+    from momentum_selection import build_composite_ranking
+
+    cfg = settings or MomentumRankSettings.from_env()
+    raw_rows: dict[str, dict[str, float]] = {}
+    for ticker in universe:
+        frame = frames.get(ticker)
+        if frame is None or frame.empty:
+            continue
+        row = _enhanced_raw_factors(
+            frame,
+            ticker,
+            as_of_date=as_of_date,
+            settings=cfg,
+        )
+        if row is not None:
+            raw_rows[ticker] = row
+
+    composite = build_composite_ranking(
+        raw_rows,
+        weight_momentum=cfg.weight_momentum,
+        weight_fip=cfg.weight_fip,
+        weight_skew_penalty=cfg.weight_skew_penalty,
+    )
+    return [
+        MomentumScore(
+            ticker=row.ticker,
+            score=row.composite_score,
+            ret_3m=row.ret_60,
+            ret_6m=row.ret_120,
+            ret_12m=row.ret_252,
+            above_sma50=row.above_sma50,
+            above_sma200=row.above_sma200,
+            volume_score=0.0,
+            close=row.close,
+            fip_score=row.fip_score,
+            skewness_90d=row.skewness_90d,
+            vol_126d=row.vol_126d,
+            momentum_subscore=row.momentum_score,
+        )
+        for row in composite
+    ]
+
+
 def rank_universe_frames(
     frames: Mapping[str, pd.DataFrame],
     universe: list[str],
@@ -200,6 +339,13 @@ def rank_universe_frames(
 ) -> list[MomentumScore]:
     """Score and sort the universe; highest composite score first."""
     cfg = settings or MomentumRankSettings.from_env()
+    if cfg.ranking_mode == "enhanced":
+        return rank_universe_frames_enhanced(
+            frames,
+            universe,
+            as_of_date=as_of_date,
+            settings=cfg,
+        )
     raw: dict[str, MomentumScore] = {}
 
     for ticker in universe:
@@ -419,8 +565,9 @@ def rebalance_active_tickers(
 
     portfolio["active_trade_tickers"] = active
     portfolio["momentum_last_rebalance_date"] = as_of_date
-    portfolio["momentum_rankings"] = [
-        {
+    ranking_payload: list[dict[str, Any]] = []
+    for row in ranked[: max(cfg.top_n * 2, cfg.top_n)]:
+        entry: dict[str, Any] = {
             "ticker": row.ticker,
             "score": round(row.score, 4),
             "ret_3m_pct": round(row.ret_3m * 100.0, 2),
@@ -430,19 +577,38 @@ def rebalance_active_tickers(
             "above_sma200": row.above_sma200,
             "volume_score": round(row.volume_score, 4),
         }
-        for row in ranked[: max(cfg.top_n * 2, cfg.top_n)]
-    ]
+        if cfg.ranking_mode == "enhanced":
+            entry.update(
+                {
+                    "fip_score": round(row.fip_score, 4),
+                    "skewness_90d": round(row.skewness_90d, 4),
+                    "vol_126d": round(row.vol_126d, 6),
+                    "momentum_subscore": round(row.momentum_subscore, 4),
+                }
+            )
+        ranking_payload.append(entry)
+    portfolio["momentum_rankings"] = ranking_payload
+    portfolio["momentum_ranking_mode"] = cfg.ranking_mode
 
+    mode_tag = "enhanced" if cfg.ranking_mode == "enhanced" else "legacy"
     print(
-        f"[MOMENTUM] Rebalance {as_of_date} Top {cfg.top_n}: "
+        f"[MOMENTUM/{mode_tag}] Rebalance {as_of_date} Top {cfg.top_n}: "
         f"{', '.join(active)}"
     )
     for row in ranked[: cfg.top_n]:
-        print(
-            f"  {row.ticker:<5} score={row.score:.3f} "
-            f"3M={row.ret_3m * 100:+.1f}% 6M={row.ret_6m * 100:+.1f}% "
-            f"12M={row.ret_12m * 100:+.1f}% vol={row.volume_score:.2f}"
-        )
+        if cfg.ranking_mode == "enhanced":
+            print(
+                f"  {row.ticker:<5} composite={row.score:.3f} "
+                f"60D={row.ret_3m * 100:+.1f}% 120D={row.ret_6m * 100:+.1f}% "
+                f"252D={row.ret_12m * 100:+.1f}% FIP={row.fip_score:.2f} "
+                f"skew={row.skewness_90d:+.2f}"
+            )
+        else:
+            print(
+                f"  {row.ticker:<5} score={row.score:.3f} "
+                f"3M={row.ret_3m * 100:+.1f}% 6M={row.ret_6m * 100:+.1f}% "
+                f"12M={row.ret_12m * 100:+.1f}% vol={row.volume_score:.2f}"
+            )
 
     return MomentumRankSnapshot(
         as_of_date=as_of_date,
