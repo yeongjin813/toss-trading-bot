@@ -224,11 +224,13 @@ git fetch origin && git reset --hard origin/main
 .venv/bin/pip install -r requirements.txt
 ```
 
-**Merge Phase 14 keys into server `.env`** (if not already present — compare with `.env.example`):
+**Merge Phase 14+17 keys into server `.env`** (if not already present — compare with `.env.example`):
 
 ```bash
-grep -E '^(WATCHLIST|USE_REGIME_GOLDEN_CROSS|USE_VOL_ADJUSTED_RISK|USE_WEEKLY_TREND_FILTER|USE_52W_HIGH_FILTER|USE_SCALE_IN|USE_SCALE_OUT|MAX_POSITIONS_PER_SECTOR|MOMENTUM_SECTOR_DIVERSIFY)=' .env
+grep -E '^(WATCHLIST|USE_REGIME_GOLDEN_CROSS|USE_VOL_ADJUSTED_RISK|USE_WEEKLY_TREND_FILTER|USE_52W_HIGH_FILTER|USE_SCALE_IN|USE_SCALE_OUT|MAX_POSITIONS_PER_SECTOR|MOMENTUM_SECTOR_DIVERSIFY|SLIPPAGE_BPS|ENTRY_CONFIRMATION_DAYS|USE_VIX_REGIME_FILTER)=' .env
 ```
+
+Ensure `ENTRY_CONFIRMATION_DAYS=0`, `USE_VIX_REGIME_FILTER=false`, `SLIPPAGE_BPS=5` (backtest parity; live limit buffer unchanged).
 
 Add or update missing lines from `.env.example`, then:
 
@@ -554,7 +556,7 @@ Architecture cleanup for production stability. Full detail: [README Phase 15](..
 | State I/O | `state_persistence.py` | Atomic `trading_state.json` writes |
 | Ticker signals + orders | `main.py` | `process_ticker`, KIS dispatch (injected into cycle via `WatchlistCycleDeps`) |
 
-**After `git pull` on EC2:** no new `.env` keys — code-only update. Restart `toss-bot`.
+**After `git pull` on EC2:** merge any new `.env` keys from `.env.example` (Phase 17: `SLIPPAGE_BPS`, confirm VIX/entry-confirm OFF). Restart `toss-bot`.
 
 **Verify:**
 

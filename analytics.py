@@ -123,6 +123,8 @@ class PositionState:
     scale_in_target_qty: int = 0
     pending_resubmit_side: str | None = None
     pending_resubmit_qty: int = 0
+    entry_confirm_bars: int = 0
+    entry_confirm_bar_date: str | None = None
 
     @property
     def has_position(self) -> bool:
@@ -836,6 +838,48 @@ def spy_regime_snapshot(
     return spy_close > spy_sma, spy_close, spy_sma
 
 
+def build_vix_regime_lookup(
+    vix_df: pd.DataFrame,
+    *,
+    max_vix: float = 25.0,
+) -> dict[str, bool]:
+    """Map YYYY-MM-DD -> True when VIX close <= max_vix (favorable for new BUY)."""
+    frame = vix_df.copy()
+    if "Date" in frame.columns:
+        frame["Date"] = pd.to_datetime(frame["Date"])
+        frame = frame.sort_values("Date")
+    elif not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index)
+        frame = frame.sort_index()
+    else:
+        frame = frame.sort_index()
+
+    if "Date" in frame.columns:
+        dates = frame["Date"]
+        closes = frame["Close"].astype(float)
+    else:
+        dates = frame.index
+        closes = frame["Close"].astype(float)
+
+    lookup: dict[str, bool] = {}
+    for dt, close in zip(dates, closes, strict=False):
+        if pd.isna(close):
+            continue
+        lookup[pd.Timestamp(dt).strftime("%Y-%m-%d")] = float(close) <= max_vix
+    return lookup
+
+
+def resolve_vix_allows_buys(
+    vix_lookup: dict[str, bool] | None,
+    bar_date: str,
+    *,
+    default: bool = True,
+) -> bool:
+    if not vix_lookup:
+        return default
+    return vix_lookup.get(bar_date, default)
+
+
 class LiveSignalEngine:
     """
     Ticker-bound live signal engine with regime-isolated configuration.
@@ -1158,6 +1202,21 @@ class LiveSignalEngine:
             and self._passes_trend_filter(bar)
         )
 
+    def _entry_setup_still_valid(
+        self,
+        bar: BarSnapshot,
+        *,
+        market_bullish: bool,
+    ) -> bool:
+        """Post-signal persistence: trend intact and price holds above short MA."""
+        if not market_bullish:
+            return False
+        if not self._passes_trend_filter(bar):
+            return False
+        if bar.close <= bar.sma_short:
+            return False
+        return self._rsi_allows_entry(bar.rsi)
+
     def _entry_signal(
         self,
         bar: BarSnapshot,
@@ -1443,7 +1502,41 @@ class LiveSignalEngine:
             liquidity_ok=liquidity_ok,
             market_bullish=market_bullish,
         )
-        if entry_ok:
+        confirm_days = StrategyConfigMapper.entry_confirmation_days()
+        setup_valid = self._entry_setup_still_valid(bar, market_bullish=market_bullish)
+        if mutate_state:
+            bar_key = _format_bar_date(bar.date)
+            prior_bars = int(state.entry_confirm_bars or 0)
+            if entry_ok:
+                if state.entry_confirm_bar_date != bar_key:
+                    state.entry_confirm_bars = prior_bars + 1
+                    state.entry_confirm_bar_date = bar_key
+            elif prior_bars > 0:
+                if setup_valid and state.entry_confirm_bar_date != bar_key:
+                    state.entry_confirm_bars = prior_bars + 1
+                    state.entry_confirm_bar_date = bar_key
+                elif not setup_valid:
+                    state.entry_confirm_bars = 0
+                    state.entry_confirm_bar_date = None
+            working_state.entry_confirm_bars = state.entry_confirm_bars
+            working_state.entry_confirm_bar_date = state.entry_confirm_bar_date
+
+        if confirm_days <= 0:
+            confirmed = entry_ok
+        else:
+            confirmed = int(working_state.entry_confirm_bars or 0) >= confirm_days and setup_valid
+        if confirm_days > 0 and not confirmed and (entry_ok or int(working_state.entry_confirm_bars or 0) > 0):
+            return {
+                "signal": "HOLD",
+                "dynamic_atr_stop": None,
+                "liquidity_ok": liquidity_ok,
+                "entry_confirm_pending": True,
+                "entry_confirm_bars": int(working_state.entry_confirm_bars or 0),
+                "entry_confirm_required": confirm_days,
+                "state": working_state.to_dict(),
+            }
+
+        if confirmed:
             if mutate_state:
                 state.in_position = True
                 state.entry_price = bar.close
@@ -1453,6 +1546,8 @@ class LiveSignalEngine:
                 state.highest_price_achieved = bar.close
                 state.days_below_sma_long = 0
                 state.profit_trail_armed = False
+                state.entry_confirm_bars = 0
+                state.entry_confirm_bar_date = None
                 self._update_trailing_state(state, bar.close, bar.atr)
             return {
                 "signal": "BUY",

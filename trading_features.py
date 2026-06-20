@@ -13,6 +13,7 @@ from analytics import (
     calculate_atr,
     resolve_market_regime,
     resolve_spy_market_bullish,
+    resolve_vix_allows_buys,
     volatility_adjusted_risk_fraction,
 )
 from config import StrategyConfigMapper
@@ -92,28 +93,72 @@ def resolve_bar_regime(
     *,
     regime_lookup: dict[str, MarketRegime] | None,
     spy_lookup: dict[str, bool] | None,
+    vix_lookup: dict[str, bool] | None = None,
 ) -> MarketRegime:
     if regime_lookup:
-        return resolve_market_regime(regime_lookup, bar_date)
-    bullish = resolve_spy_market_bullish(spy_lookup, bar_date)
-    if bullish:
+        regime = resolve_market_regime(regime_lookup, bar_date)
+    else:
+        bullish = resolve_spy_market_bullish(spy_lookup, bar_date)
+        if bullish:
+            regime = MarketRegime(
+                allow_new_buys=True,
+                position_size_multiplier=1.0,
+                spy_bullish=True,
+                qqq_bullish=True,
+                label="normal",
+                atr_stop_multiplier=1.0,
+            )
+        else:
+            regime = MarketRegime(
+                allow_new_buys=False,
+                position_size_multiplier=0.0,
+                spy_bullish=False,
+                qqq_bullish=False,
+                label="risk_off",
+                max_open_positions=0,
+                atr_stop_multiplier=0.7,
+            )
+
+    if (
+        StrategyConfigMapper.use_vix_regime_filter()
+        and vix_lookup
+        and not resolve_vix_allows_buys(vix_lookup, bar_date)
+    ):
         return MarketRegime(
-            allow_new_buys=True,
-            position_size_multiplier=1.0,
-            spy_bullish=True,
-            qqq_bullish=True,
-            label="normal",
-            atr_stop_multiplier=1.0,
+            allow_new_buys=False,
+            position_size_multiplier=0.0,
+            spy_bullish=regime.spy_bullish,
+            qqq_bullish=regime.qqq_bullish,
+            label="vix_elevated",
+            max_open_positions=0,
+            spy_golden_cross=regime.spy_golden_cross,
+            atr_stop_multiplier=regime.atr_stop_multiplier,
         )
-    return MarketRegime(
-        allow_new_buys=False,
-        position_size_multiplier=0.0,
-        spy_bullish=False,
-        qqq_bullish=False,
-        label="risk_off",
-        max_open_positions=0,
-        atr_stop_multiplier=0.7,
-    )
+    return regime
+
+
+def apply_vix_regime_gate(
+    regime: MarketRegime,
+    bar_date: str,
+    vix_lookup: dict[str, bool] | None,
+) -> MarketRegime:
+    """Overlay VIX ceiling on an existing regime snapshot (live/backtest parity)."""
+    if (
+        StrategyConfigMapper.use_vix_regime_filter()
+        and vix_lookup
+        and not resolve_vix_allows_buys(vix_lookup, bar_date)
+    ):
+        return MarketRegime(
+            allow_new_buys=False,
+            position_size_multiplier=0.0,
+            spy_bullish=regime.spy_bullish,
+            qqq_bullish=regime.qqq_bullish,
+            label="vix_elevated",
+            max_open_positions=0,
+            spy_golden_cross=regime.spy_golden_cross,
+            atr_stop_multiplier=regime.atr_stop_multiplier,
+        )
+    return regime
 
 
 def build_spy_atr_pct_lookup(

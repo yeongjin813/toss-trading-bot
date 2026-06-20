@@ -208,6 +208,25 @@ class StrategyConfigMapper:
         }
 
     @classmethod
+    def use_vix_regime_filter(cls) -> bool:
+        """Default OFF — 2020-2026 backtest: raised MaxDD, lowered CAGR vs SPY 200MA only."""
+        return os.getenv("USE_VIX_REGIME_FILTER", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @classmethod
+    def vix_regime_max(cls) -> float:
+        return float(os.getenv("VIX_REGIME_MAX", "25"))
+
+    @classmethod
+    def entry_confirmation_days(cls) -> int:
+        """Default 0 — 3-day confirm cut MaxDD slightly but cost more CAGR; keep OFF in prod."""
+        return max(0, int(os.getenv("ENTRY_CONFIRMATION_DAYS", "0")))
+
+    @classmethod
     def resolve_regime(cls, ticker: str) -> TickerConfig:
         normalized = ticker.strip().upper()
         return cls._EXPLICIT.get(normalized, cls._DEFAULT)

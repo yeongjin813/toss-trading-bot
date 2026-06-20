@@ -8,11 +8,12 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM / DEFAULT (all `breakout`) |
 | **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top3 momentum rebalance (separate sizing pools) |
 | **Universe Filter** | Legacy: full watchlist signals · Top3: equal-weight Top-3, Friday rebalance (`top3_strategy.py`) |
-| **Regime Filter** | SPY 200MA gate + optional QQQ half-size when SPY bear / QQQ bull (`USE_QQQ_REGIME_FILTER`) |
+| **Regime Filter** | **Validated:** SPY 200MA + QQQ half-size + golden cross — **VIX / entry-confirm OFF** (2020–26 backtest) |
 | **Watchlist Matrix** | **25 US names** — 15 tech core + 10 non-tech diversification (LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT); configurable via `.env` `WATCHLIST`; sector tags + KIS routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
 | **Account** | Set in `.env` — `KIS_CANO`, `KIS_ACNT_PRDT_CD` (never commit) |
-| **Execution Loop** | `watchlist_cycle.py` orchestrates RTH pipeline; `main.py` runs 60s loop during NY RTH only |
+| **Execution Loop** | `watchlist_cycle.py` orchestrates RTH pipeline; `main.py` runs 60s flat / **15s when holding** during NY RTH |
+| **Backtest costs** | Default **0.10% commission + 5 bps slippage** (`execution_friction.py`, `SLIPPAGE_BPS=5`) |
 | **Data Architecture** | Bootstrap 756 bars once → 1-bar micro-fetch per open-session cycle |
 | **Session Gate** | NYSE holiday registry + **`is_us_regular_market_hours()`** (09:30–16:00 ET via `pytz`) |
 | **Execution Integrity** | Same-bar sequential ATR stop → trailing update → crossover/RSI exit |
@@ -30,6 +31,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 ---
 
 > **Phase 15 (2026-06)** — live-loop hardening: atomic `trading_state.json` writes, fewer disk flushes, and RTH orchestration moved to `watchlist_cycle.py`. See [Phase 15](#phase-15-live-loop-hardening--pipeline-extract-2026-06).
+>
+> **Phase 17 (2026-06)** — Realistic backtest costs + filter validation: **SPY 200MA only** in production; VIX and 3-day entry-confirm kept OFF. See [Phase 17](#phase-17-realistic-costs--validated-regime-policy-2026-06).
 >
 > **Phase 16 (2026-06)** — Enhanced momentum model (FIP / skewness / inverse-vol) researched and backtested; **Legacy kept as production default**. See [Phase 16](#phase-16-enhanced-momentum-research-legacy-retained-2026-06).  
 > **Phase 14 (2026-06)** — profit/risk parity + **25-ticker** universe. See rows **14.x** and [Phase 14](#phase-14-profit-risk-parity--diversified-universe-2026-06) before [Live System Flow](#live-system-flow).
@@ -138,7 +141,8 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 | **14.3** | 15-ticker universe was ~100% tech — correlated drawdowns in 2022/2024-style rotations. | **25-ticker** watchlist: 15 tech core + 10 liquid non-tech (healthcare, finance, energy, consumer, industrial). Dual backtest: MaxDD 44%→28%, Sharpe 1.25→1.31 (full period). | `market_registry.py`, `scripts/compare_watchlist.py` |
 | **15.0** | Sync JSON overwrite risked corrupted `trading_state.json`; gate paths flushed disk dozens of times per cycle. | `state_persistence.py` — atomic write (temp + `os.replace`); immediate save only on orders/fills/reconcile; cycle-end flush. | `test_state_persistence.py` |
 | **15.1** | `main.py` mixed orchestration (reconcile → trim → Top3) with order dispatch — hard to debug. | `watchlist_cycle.py` + `WatchlistCycleDeps` injection; `main.py` keeps KIS + `process_ticker`. | `test_watchlist_cycle.py` |
-| **—** | *Still open:* sustained alpha vs buy-and-hold in all walk-forward windows; VIX filter; real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency; further slimming of `main.py` (order gateway). | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
+| **—** | *Still open:* sustained alpha vs buy-and-hold in all walk-forward windows; real-account guard; off-watchlist holdings; VTS cash/ccnl intermittency; further slimming of `main.py` (order gateway). | Documented in [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06) + Section 11. | Track in Section 14 checklist |
+| **17.0** | Backtests used optimistic fills; VIX / entry-confirm unvalidated. | **0.1% + 5 bps** friction wired; filter combo script — **SPY 200MA only** wins vs VIX or 3-day confirm (2020–26 legacy). | `execution_friction.py`, `scripts/filter_combo_backtest.py` |
 
 > **Operator path:** after Step 8.0, day-to-day commands live in **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.  
 > **Researcher path:** strategy math stays in Sections 2–8 below.
@@ -274,7 +278,7 @@ Closed gaps from [Section 12](#12-pre-deployment-critical-architectural-flaws--h
 
 **Recommended for backtest-aligned live runs:** set `USE_EOD_ATR_STOPS=true` in `.env`.  
 **Recommended for production VTS (Phase 4):** `CAPITAL_AT_RISK=100000`, `DEPLOYMENT_PHASE=4`, `STRATEGY_MODE=dual`, `MOMENTUM_RANK_ENABLED=false`, `USE_QQQ_REGIME_FILTER=true`, `USE_DAILY_TELEGRAM_REPORT=true`, `KIS_DRY_RUN=false`.  
-**Still open (not auto-fixable):** sustained alpha vs buy-and-hold, VIX filter. **Mitigated (2026-06):** 60s flat polling → 15s when holding/pending (`LOOP_COOLDOWN_HELD_SECONDS`); live KIS requires `KIS_LIVE_CONFIRMED=true` (`kis_environment.py`).
+**Still open (not auto-fixable):** sustained alpha vs buy-and-hold. **Validated OFF (2020–26):** `USE_VIX_REGIME_FILTER`, `ENTRY_CONFIRMATION_DAYS>0`. **Mitigated (2026-06):** 60s flat polling → 15s when holding/pending (`LOOP_COOLDOWN_HELD_SECONDS`); live KIS requires `KIS_LIVE_CONFIRMED=true` (`kis_environment.py`); backtest default slippage 5 bps.
 
 ### Phase 9: Momentum Universe, Strategy Overhaul & Ops Polish *(2026-06)*
 
@@ -388,7 +392,7 @@ python run_backtest.py --strategy dual --yfinance
 python scripts/compare_watchlist.py
 ```
 
-**Recommended `.env` (Phase 4 + Phase 14):** copy from `.env.example` — includes `USE_REGIME_GOLDEN_CROSS`, `USE_VOL_ADJUSTED_RISK`, `USE_WEEKLY_TREND_FILTER`, `USE_52W_HIGH_FILTER`, `USE_SCALE_IN`, `USE_SCALE_OUT`, `MAX_POSITIONS_PER_SECTOR=2`, `MOMENTUM_SECTOR_DIVERSIFY=true`, and the 25-ticker `WATCHLIST`.
+**Recommended `.env` (Phase 4 + Phase 14 + 17):** copy from `.env.example` — includes `SLIPPAGE_BPS=5` (backtest), `ENTRY_CONFIRMATION_DAYS=0`, `USE_VIX_REGIME_FILTER=false`, `USE_REGIME_GOLDEN_CROSS`, `USE_VOL_ADJUSTED_RISK`, `USE_WEEKLY_TREND_FILTER`, `USE_52W_HIGH_FILTER`, `USE_SCALE_IN`, `USE_SCALE_OUT`, `MAX_POSITIONS_PER_SECTOR=2`, `MOMENTUM_SECTOR_DIVERSIFY=true`, and the 25-ticker `WATCHLIST`.
 
 ### Phase 15: Live-Loop Hardening & Pipeline Extract *(2026-06)*
 
@@ -427,6 +431,36 @@ python run_backtest.py --yfinance --compare-momentum-ranking --cash 100000 --sta
 python scripts/compare_momentum_ranking.py --yfinance
 python -m pytest test_momentum_selection.py test_momentum_ranker.py -q
 ```
+
+### Phase 17: Realistic Costs & Validated Regime Policy *(2026-06)*
+
+**Production policy (validated on 2020–2026 legacy backtest, 25 tickers, realistic costs):**
+
+| Setting | Production | Rationale |
+|---|---|---|
+| SPY 200MA + QQQ + golden cross | **ON** | Best CAGR / MaxDD balance |
+| `USE_VIX_REGIME_FILTER` | **false** | Raised MaxDD (+3.3pp), lowered CAGR (−1.2pp) |
+| `ENTRY_CONFIRMATION_DAYS` | **0** | 3-day confirm cut MaxDD slightly but cost more CAGR |
+| `SLIPPAGE_BPS` | **5** (backtest default) | 0 bps overstated returns ~3pp on legacy |
+| Enhanced momentum | **legacy only** | Phase 16 — unchanged |
+
+| Module | Role |
+|---|---|
+| `execution_friction.py` | Buy/sell fill price + round-trip cost helper |
+| `vix_data.py` | ^VIX yfinance frame (research; live inject when filter ON) |
+| `scripts/filter_combo_backtest.py` | SPY-only vs entry-confirm vs VIX grid |
+| `scripts/cost_sensitivity.py` | Commission × slippage sensitivity (dual 60/40) |
+
+**Verify:**
+
+```powershell
+python test_execution_friction.py
+python scripts/filter_combo_backtest.py
+python run_backtest.py --strategy dual --yfinance --start 2020-01-01 --end 2026-12-31
+python scripts/cost_sensitivity.py
+```
+
+**Reference numbers (legacy $100k, 0.1% + 5 bps, 2020–2026):** SPY-only CAGR ~+10.9%, MaxDD ~14.6%. Dual Phase 4 combined ~+186% total return (see `run_backtest.py --strategy dual`).
 
 | Upgrade | Module | Summary |
 |---|---|---|

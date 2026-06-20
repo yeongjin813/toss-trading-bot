@@ -13,6 +13,7 @@ from typing import Any
 
 import pandas as pd
 
+from execution_friction import fill_price
 from momentum_ranker import (
     MomentumRankSettings,
     rank_universe_frames,
@@ -78,6 +79,7 @@ def run_top3_backtest(
     ohlcv_by_ticker: dict[str, pd.DataFrame],
     initial_cash: float = 10_000.0,
     commission_rate: float = 0.001,
+    slippage_bps: float = 0.0,
     momentum_settings: MomentumRankSettings | None = None,
     *,
     window_start: str | None = None,
@@ -92,6 +94,7 @@ def run_top3_backtest(
       3. Rebalance to equal weight across Top N (target = equity / N each)
     """
     cfg = (momentum_settings or MomentumRankSettings.from_env()).for_top3()
+    slip_bps = max(0.0, float(slippage_bps))
 
     raw_frames = {t: _normalize_frame(ohlcv_by_ticker[t]) for t in tickers}
     all_dates: set[str] = set()
@@ -136,7 +139,7 @@ def run_top3_backtest(
         if shares <= 0 or held <= 0:
             return
         shares = min(shares, held)
-        gross = shares * price
+        gross = shares * fill_price("SELL", price, slippage_bps=slip_bps)
         commission = gross * commission_rate
         proceeds = gross - commission
         total_cost = open_cost.get(ticker, held * price)
@@ -171,14 +174,16 @@ def run_top3_backtest(
         nonlocal cash
         if shares <= 0:
             return False
-        gross = shares * price
+        fill = fill_price("BUY", price, slippage_bps=slip_bps)
+        gross = shares * fill
         commission = gross * commission_rate
         total_cost = gross + commission
         if total_cost > cash:
-            shares = int(cash / (price * (1.0 + commission_rate)))
+            shares = int(cash / (fill * (1.0 + commission_rate)))
             if shares <= 0:
                 return False
-            gross = shares * price
+            fill = fill_price("BUY", price, slippage_bps=slip_bps)
+            gross = shares * fill
             commission = gross * commission_rate
             total_cost = gross + commission
         cash -= total_cost

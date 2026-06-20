@@ -53,6 +53,7 @@ from strategy import (
 load_dotenv(override=True)
 
 DEFAULT_RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+DEFAULT_SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5"))
 REQUIRED_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 DEFAULT_RANDOM_BARS = 252
 RANDOM_START_PRICES: dict[str, float] = {
@@ -167,6 +168,25 @@ def fetch_yfinance_ohlcv(
     if raw is None or raw.empty:
         raise ValueError(f"No yfinance data returned for {ticker} ({start} -> {end})")
     return normalize_yfinance_frame(raw)
+
+
+def load_vix_frame(
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame | None:
+    if not StrategyConfigMapper.use_vix_regime_filter():
+        return None
+    try:
+        from vix_data import fetch_vix_daily_yfinance
+
+        return fetch_vix_daily_yfinance(
+            start=start or YFINANCE_WARMUP_START,
+            end=end,
+        )
+    except Exception as exc:
+        print(f"[WARN] VIX data unavailable ({exc}) — VIX filter disabled.")
+        return None
 
 
 def slice_ohlcv_window(
@@ -504,6 +524,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Commission rate as decimal (default: 0.001)",
     )
     parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=DEFAULT_SLIPPAGE_BPS,
+        help="One-way slippage in basis points (default: SLIPPAGE_BPS env or 5)",
+    )
+    parser.add_argument(
         "--start",
         default=None,
         help="Optional inclusive start date (YYYY-MM-DD) for CSV backtest window",
@@ -592,6 +618,7 @@ def run_strategy_backtests(
     *,
     window_label: str = "",
     full_ohlcv: dict[str, pd.DataFrame] | None = None,
+    vix_df: pd.DataFrame | None = None,
 ) -> int:
     legacy_momentum = momentum_settings
     if args.strategy in {"legacy", "compare"}:
@@ -638,9 +665,11 @@ def run_strategy_backtests(
             initial_cash=legacy_cash,
             risk_per_trade=args.risk_per_trade,
             commission_rate=args.commission,
+            slippage_bps=args.slippage_bps,
             use_spy_market_filter=use_spy_filter,
             spy_df=spy_df,
             qqq_df=qqq_df,
+            vix_df=vix_df,
             momentum_settings=legacy_momentum,
         )
         print_portfolio_summary(
@@ -667,6 +696,7 @@ def run_strategy_backtests(
             ohlcv_by_ticker=top3_ohlcv,
             initial_cash=top3_cash,
             commission_rate=args.commission,
+            slippage_bps=args.slippage_bps,
             momentum_settings=top3_settings,
             window_start=args.start,
             window_end=args.end,
@@ -752,6 +782,8 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
             use_spy_filter = False
             qqq_df = None
 
+    vix_df = load_vix_frame(start=YFINANCE_WARMUP_START)
+
     summary_rows: list[dict[str, Any]] = []
     for label, start, end in WALK_FORWARD_WINDOWS:
         window_ohlcv: dict[str, pd.DataFrame] = {}
@@ -770,9 +802,11 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
             initial_cash=args.cash,
             risk_per_trade=args.risk_per_trade,
             commission_rate=args.commission,
+            slippage_bps=args.slippage_bps,
             use_spy_market_filter=use_spy_filter,
             spy_df=spy_df,
             qqq_df=qqq_df,
+            vix_df=vix_df,
             momentum_settings=momentum_settings,
         )
         bench = summarize_strategy_vs_benchmarks(
@@ -809,9 +843,6 @@ def run_walk_forward_validation(args: argparse.Namespace, tickers: list[str]) ->
     else:
         print("No walk-forward windows produced results.")
         return 1
-    return 0
-
-
     return 0
 
 
@@ -856,6 +887,7 @@ def run_compare_momentum_ranking(
         ohlcv_by_ticker=ohlcv,
         initial_cash=args.cash,
         commission_rate=args.commission,
+        slippage_bps=args.slippage_bps,
         momentum_settings=legacy_cfg,
         window_start=args.start,
         window_end=args.end,
@@ -865,6 +897,7 @@ def run_compare_momentum_ranking(
         ohlcv_by_ticker=ohlcv,
         initial_cash=args.cash,
         commission_rate=args.commission,
+        slippage_bps=args.slippage_bps,
         momentum_settings=enhanced_cfg,
         window_start=args.start,
         window_end=args.end,
@@ -905,10 +938,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Portfolio capital: ${args.cash:,.0f} (single consolidated pool)")
     print(f"Risk per trade   : {args.risk_per_trade * 100:.1f}% of total equity")
     print(f"Commission       : {args.commission * 100:.1f}%")
+    print(f"Slippage (1-way) : {args.slippage_bps:.1f} bps")
     print(
         f"SPY market filter: "
         f"{'ON (BUY only when SPY > 200MA)' if use_spy_filter else 'OFF'}"
     )
+    use_vix = StrategyConfigMapper.use_vix_regime_filter()
+    print(
+        f"VIX regime filter: "
+        f"{'ON (VIX <= ' + str(StrategyConfigMapper.vix_regime_max()) + ')' if use_vix else 'OFF'}"
+    )
+    entry_confirm = StrategyConfigMapper.entry_confirmation_days()
+    if entry_confirm > 0:
+        print(f"Entry confirm    : {entry_confirm} consecutive signal days")
     print(
         f"Momentum rank    : "
         f"{'ON (Top ' + str(momentum_settings.top_n) + ', Friday rebalance)' if momentum_settings.enabled else 'OFF'}"
@@ -998,6 +1040,11 @@ def main(argv: list[str] | None = None) -> int:
             use_spy_filter = False
             qqq_df = None
 
+    vix_df = load_vix_frame(
+        start=args.start or YFINANCE_WARMUP_START,
+        end=args.end,
+    )
+
     if args.isolated:
         rows = [
             run_isolated_backtest(ticker, ohlcv[ticker], args.cash, args.commission)
@@ -1027,6 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
         qqq_df,
         momentum_settings,
         full_ohlcv=full_ohlcv if args.start or args.end else None,
+        vix_df=vix_df,
     )
 
 

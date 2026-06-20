@@ -294,6 +294,40 @@ class MarketDataCache:
             finalized += 1
         return finalized
 
+    def inject_completed_frame(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        *,
+        source: str = "inject",
+        persist: bool = False,
+    ) -> None:
+        """Load external OHLCV (e.g. ^VIX from yfinance) without a KIS fetch."""
+        frame = df.copy()
+        if "Date" not in frame.columns:
+            raise ValueError(f"inject_completed_frame({ticker}): missing Date column")
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        for column in _OHLCV_COLS:
+            if column not in frame.columns:
+                if column == "Volume":
+                    frame["Volume"] = 0.0
+                else:
+                    raise ValueError(
+                        f"inject_completed_frame({ticker}): missing {column} column"
+                    )
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+        frame = frame.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(
+            drop=True
+        )
+        if frame.empty:
+            raise ValueError(f"inject_completed_frame({ticker}): no valid rows")
+        self._completed[ticker] = frame
+        self._forming.pop(ticker, None)
+        self._data_sources[ticker] = source
+        if persist:
+            self.persist_completed(ticker)
+
     def persist_completed(self, ticker: str) -> None:
         if ticker not in self._completed:
             return

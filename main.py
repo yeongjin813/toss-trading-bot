@@ -39,7 +39,9 @@ from dotenv import load_dotenv
 
 from analytics import (
     LiveSignalEngine,
+    MarketRegime,
     PositionState,
+    build_vix_regime_lookup,
     calculate_atr,
     describe_us_market_closure,
     is_us_equity_session,
@@ -57,6 +59,7 @@ from market_registry import (
     BENCHMARK_TICKER,
     MARKET_META,
     SECONDARY_BENCHMARK_TICKER,
+    VIX_TICKER,
     parse_watchlist,
     validate_watchlist_routing,
 )
@@ -114,7 +117,8 @@ from strategy_ownership import (
 )
 from kis_environment import load_kis_environment, validate_kis_live_guard
 from loop_timing import effective_loop_cooldown_seconds
-from trading_features import TradingFeatureFlags
+from trading_features import TradingFeatureFlags, apply_vix_regime_gate
+from vix_data import fetch_vix_daily_yfinance
 from watchlist_cycle import WatchlistCycleDeps, run_overdeployment_trim_if_needed, run_watchlist_cycle
 
 load_dotenv(override=True)
@@ -147,6 +151,9 @@ ORDER_RVSECNCL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 WATCHLIST = parse_watchlist(os.getenv("WATCHLIST"))
 USE_SPY_MARKET_FILTER = StrategyConfigMapper.use_spy_market_filter()
 USE_QQQ_REGIME_FILTER = StrategyConfigMapper.use_qqq_regime_filter()
+USE_VIX_REGIME_FILTER = StrategyConfigMapper.use_vix_regime_filter()
+VIX_REGIME_MAX = StrategyConfigMapper.vix_regime_max()
+VIX_LOOKUP: dict[str, bool] | None = None
 DEPLOYMENT = DeploymentConfig.from_env()
 MOMENTUM_SETTINGS = MomentumRankSettings.for_live_bot(DEPLOYMENT)
 
@@ -189,6 +196,29 @@ OVERDEPLOYMENT_TRIM_TARGET_PCT = float(
     os.getenv("OVERDEPLOYMENT_TRIM_TARGET_PCT", "0.98")
 )
 _alert_last_sent: dict[str, float] = {}
+
+
+def bootstrap_vix_regime_cache(cache: MarketDataCache) -> None:
+    """Inject ^VIX history for optional VIX ceiling gate (yfinance; not on KIS)."""
+    global VIX_LOOKUP
+    if not USE_VIX_REGIME_FILTER:
+        VIX_LOOKUP = None
+        return
+    try:
+        vix_df = fetch_vix_daily_yfinance(
+            start=(datetime.now() - timedelta(days=LOOKBACK_YEARS * 365)).strftime(
+                "%Y-%m-%d"
+            ),
+        )
+        cache.inject_completed_frame(VIX_TICKER, vix_df, source="yfinance")
+        VIX_LOOKUP = build_vix_regime_lookup(vix_df, max_vix=VIX_REGIME_MAX)
+        print(
+            f"  -> VIX regime cache: {len(VIX_LOOKUP)} days "
+            f"(block BUY when close > {VIX_REGIME_MAX:.0f})"
+        )
+    except Exception as exc:
+        VIX_LOOKUP = None
+        print(f"[WARN] VIX regime bootstrap failed ({exc}) — filter disabled")
 
 
 def _resolve_kis_order_type() -> str:
@@ -1720,6 +1750,23 @@ def process_ticker(
         except KeyError:
             print(f"[WARN] {BENCHMARK_TICKER} not bootstrapped — market filter skipped")
 
+    if USE_VIX_REGIME_FILTER and VIX_LOOKUP:
+        base = MarketRegime(
+            allow_new_buys=market_bullish,
+            position_size_multiplier=position_size_multiplier,
+            spy_bullish=market_bullish,
+            qqq_bullish=market_bullish,
+            label=market_regime_label,
+            max_open_positions=regime_max_open_positions,
+            atr_stop_multiplier=atr_regime_multiplier,
+        )
+        gated = apply_vix_regime_gate(base, current_bar_date, VIX_LOOKUP)
+        market_bullish = gated.allow_new_buys
+        position_size_multiplier = gated.position_size_multiplier
+        market_regime_label = gated.label
+        regime_max_open_positions = gated.max_open_positions
+        atr_regime_multiplier = gated.atr_stop_multiplier
+
     cycle = engine.evaluate_trading_cycle(
         df,
         runtime_state=states.get(ticker, ticker_state if isinstance(ticker_state, dict) else {}),
@@ -2054,6 +2101,15 @@ def main() -> None:
         f"QQQ Regime Filter   : "
         f"{'ON (half size when SPY<200MA & QQQ>200MA)' if USE_QQQ_REGIME_FILTER else 'OFF'}"
     )
+    print(
+        f"VIX Regime Filter   : "
+        f"{'ON (block BUY when VIX > ' + str(VIX_REGIME_MAX) + ')' if USE_VIX_REGIME_FILTER else 'OFF (validated: SPY 200MA only)'}"
+    )
+    entry_confirm = StrategyConfigMapper.entry_confirmation_days()
+    if entry_confirm > 0:
+        print(f"Entry Confirmation  : {entry_confirm} consecutive signal days")
+    else:
+        print("Entry Confirmation  : OFF (validated: SPY 200MA only)")
     print(f"Capital At Risk     : ${CAPITAL_AT_RISK:,.2f}")
     if DEPLOYMENT.is_dual:
         print(f"Legacy Sizing Pool  : ${LEGACY_CAPITAL_AT_RISK:,.2f}")
@@ -2140,6 +2196,7 @@ def main() -> None:
     if USE_QQQ_REGIME_FILTER and SECONDARY_BENCHMARK_TICKER not in bootstrap_tickers:
         bootstrap_tickers.append(SECONDARY_BENCHMARK_TICKER)
     cache.bootstrap(bootstrap_tickers)
+    bootstrap_vix_regime_cache(cache)
 
     states = load_persisted_states()
     print(f"Loaded state entries: {len(states)}")

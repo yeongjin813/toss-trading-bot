@@ -18,10 +18,12 @@ from analytics import (
     LiveSignalEngine,
     PositionState,
     build_spy_regime_lookup,
+    build_vix_regime_lookup,
 )
 from config import StrategyConfig, StrategyConfigMapper
 from entry_filters import passes_entry_filters
 from market_registry import BENCHMARK_SMA_PERIOD
+from execution_friction import fill_price
 from momentum_ranker import (
     MomentumRankSettings,
     is_new_buy_allowed,
@@ -265,15 +267,18 @@ class PortfolioBacktestEngine:
         initial_cash: float = 10_000.0,
         risk_per_trade: float = 0.01,
         commission_rate: float = 0.001,
+        slippage_bps: float = 0.0,
         use_spy_market_filter: bool | None = None,
         spy_df: pd.DataFrame | None = None,
         qqq_df: pd.DataFrame | None = None,
+        vix_df: pd.DataFrame | None = None,
         momentum_settings: MomentumRankSettings | None = None,
         features: TradingFeatureFlags | None = None,
     ) -> None:
         self.initial_cash = initial_cash
         self.base_risk_per_trade = risk_per_trade
         self.commission_rate = commission_rate
+        self.slippage_bps = max(0.0, float(slippage_bps))
         self.watchlist = tickers
         self.momentum_settings = momentum_settings or MomentumRankSettings.from_env()
         self.features = features or TradingFeatureFlags.from_env()
@@ -285,11 +290,17 @@ class PortfolioBacktestEngine:
         self.spy_lookup: dict[str, bool] | None = None
         self.regime_lookup = None
         self.spy_atr_lookup: dict[str, float] | None = None
+        self.vix_lookup: dict[str, bool] | None = None
         if self.use_spy_market_filter and spy_df is not None and not spy_df.empty:
             self.regime_lookup = build_regime_lookup(spy_df, qqq_df, features=self.features)
             if self.regime_lookup is None:
                 self.spy_lookup = build_spy_regime_lookup(spy_df, BENCHMARK_SMA_PERIOD)
             self.spy_atr_lookup = build_spy_atr_pct_lookup(spy_df)
+        if StrategyConfigMapper.use_vix_regime_filter() and vix_df is not None and not vix_df.empty:
+            self.vix_lookup = build_vix_regime_lookup(
+                vix_df,
+                max_vix=StrategyConfigMapper.vix_regime_max(),
+            )
         self.series_map: dict[str, TickerBacktestSeries] = {}
 
         for ticker in tickers:
@@ -368,6 +379,7 @@ class PortfolioBacktestEngine:
             bar_date,
             regime_lookup=self.regime_lookup,
             spy_lookup=self.spy_lookup,
+            vix_lookup=self.vix_lookup,
         )
         return (
             regime.allow_new_buys,
@@ -496,7 +508,7 @@ class PortfolioBacktestEngine:
                         series.state,
                         bar,
                         prev_bar,
-                        mutate_state=False,
+                        mutate_state=StrategyConfigMapper.entry_confirmation_days() > 0,
                         allow_crossover=True,
                         market_bullish=market_bullish,
                     )
@@ -519,7 +531,8 @@ class PortfolioBacktestEngine:
                 shares = min(shares, series.shares)
                 if shares <= 0:
                     continue
-                gross = shares * bar.close
+                fill = fill_price("SELL", bar.close, slippage_bps=self.slippage_bps)
+                gross = shares * fill
                 commission = gross * self.commission_rate
                 proceeds = gross - commission
                 entry_cost = open_entry_cost.get(series.ticker, shares * bar.close)
@@ -567,14 +580,22 @@ class PortfolioBacktestEngine:
                 )
                 if shares <= 0:
                     continue
-                gross = shares * bar.close
+                fill = fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
+                gross = shares * fill
                 commission = gross * self.commission_rate
                 total_cost = gross + commission
                 if total_cost > cash:
-                    shares = int(cash / (bar.close * (1.0 + self.commission_rate)))
+                    shares = int(
+                        cash
+                        / (
+                            fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
+                            * (1.0 + self.commission_rate)
+                        )
+                    )
                     if shares <= 0:
                         continue
-                    gross = shares * bar.close
+                    fill = fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
+                    gross = shares * fill
                     commission = gross * self.commission_rate
                     total_cost = gross + commission
                 cash -= total_cost
@@ -621,7 +642,8 @@ class PortfolioBacktestEngine:
                 shares = min(shares, add_qty)
                 if shares <= 0:
                     continue
-                gross = shares * bar.close
+                fill = fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
+                gross = shares * fill
                 commission = gross * self.commission_rate
                 total_cost = gross + commission
                 if total_cost > cash:
@@ -716,9 +738,11 @@ def run_portfolio_backtest(
     initial_cash: float = 10_000.0,
     risk_per_trade: float = 0.01,
     commission_rate: float = 0.001,
+    slippage_bps: float = 0.0,
     use_spy_market_filter: bool | None = None,
     spy_df: pd.DataFrame | None = None,
     qqq_df: pd.DataFrame | None = None,
+    vix_df: pd.DataFrame | None = None,
     momentum_settings: MomentumRankSettings | None = None,
     features: TradingFeatureFlags | None = None,
 ) -> PortfolioBacktestResult:
@@ -728,9 +752,11 @@ def run_portfolio_backtest(
         initial_cash=initial_cash,
         risk_per_trade=risk_per_trade,
         commission_rate=commission_rate,
+        slippage_bps=slippage_bps,
         use_spy_market_filter=use_spy_market_filter,
         spy_df=spy_df,
         qqq_df=qqq_df,
+        vix_df=vix_df,
         momentum_settings=momentum_settings,
         features=features,
     )
