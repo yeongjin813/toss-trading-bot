@@ -42,6 +42,31 @@ from trading_features import (
 
 
 @dataclass
+class _PendingExit:
+    series: TickerBacktestSeries
+    signal: str
+    exit_reason: str
+    partial_qty: int | None
+    execute_date: str
+
+
+@dataclass
+class _PendingEntry:
+    series: TickerBacktestSeries
+    signal_bar: BarSnapshot
+    size_multiplier: float
+    execute_date: str
+
+
+@dataclass
+class _PendingScaleIn:
+    series: TickerBacktestSeries
+    signal_bar: BarSnapshot
+    add_qty: int
+    execute_date: str
+
+
+@dataclass
 class TradeRecord:
     date: str
     ticker: str
@@ -279,6 +304,7 @@ class PortfolioBacktestEngine:
         self.base_risk_per_trade = risk_per_trade
         self.commission_rate = commission_rate
         self.slippage_bps = max(0.0, float(slippage_bps))
+        self.fill_at_next_open = StrategyConfigMapper.backtest_fill_at_next_open()
         self.watchlist = tickers
         self.momentum_settings = momentum_settings or MomentumRankSettings.from_env()
         self.features = features or TradingFeatureFlags.from_env()
@@ -405,7 +431,9 @@ class PortfolioBacktestEngine:
         size_multiplier: float,
         bar_date: str,
         shares_hint: int | None = None,
+        entry_price: float | None = None,
     ) -> tuple[int, int]:
+        price = entry_price if entry_price is not None else bar.close
         risk = effective_risk_per_trade(
             self.base_risk_per_trade,
             bar_date,
@@ -413,14 +441,17 @@ class PortfolioBacktestEngine:
             features=self.features,
         )
         stop_distance = bar.atr * series.config.atr_multiplier
-        full_shares = shares_hint or dual_clamp_portfolio_size(
-            total_equity=total_equity,
-            available_cash=cash,
-            entry_price=bar.close,
-            stop_distance=stop_distance,
-            risk_per_trade=risk,
-            commission_rate=self.commission_rate,
-        )
+        if shares_hint is not None:
+            full_shares = shares_hint
+        else:
+            full_shares = dual_clamp_portfolio_size(
+                total_equity=total_equity,
+                available_cash=cash,
+                entry_price=price,
+                stop_distance=stop_distance,
+                risk_per_trade=risk,
+                commission_rate=self.commission_rate,
+            )
         if full_shares <= 0:
             return 0, 0
         if size_multiplier < 1.0:
@@ -429,6 +460,239 @@ class PortfolioBacktestEngine:
             return max(1, full_shares // 2), full_shares
         return full_shares, 0
 
+    def _next_trading_date(self, bar_date: str) -> str | None:
+        try:
+            idx = self.timeline.index(bar_date)
+        except ValueError:
+            return None
+        if idx + 1 >= len(self.timeline):
+            return None
+        return self.timeline[idx + 1]
+
+    def _bars_for_date(
+        self, series: TickerBacktestSeries, bar_date: str
+    ) -> tuple[BarSnapshot, BarSnapshot] | None:
+        idx = series.date_to_index.get(bar_date)
+        if idx is None or idx < 1:
+            return None
+        bar = BarSnapshot.from_row(series.enriched.iloc[idx])
+        prev_bar = BarSnapshot.from_row(series.enriched.iloc[idx - 1])
+        return bar, prev_bar
+
+    def _execute_sell(
+        self,
+        series: TickerBacktestSeries,
+        *,
+        exec_bar: BarSnapshot,
+        exec_date: str,
+        signal: str,
+        exit_reason: str,
+        partial_qty: int | None,
+        cash: float,
+        open_entry_cost: dict[str, float],
+        closed_trade_pnls: list[float],
+        trades: list[TradeRecord],
+    ) -> float:
+        if series.shares <= 0:
+            return cash
+        shares = partial_qty if partial_qty else series.shares
+        shares = min(shares, series.shares)
+        if shares <= 0:
+            return cash
+        ref = exec_bar.open if self.fill_at_next_open else exec_bar.close
+        fill = fill_price("SELL", ref, slippage_bps=self.slippage_bps)
+        gross = shares * fill
+        commission = gross * self.commission_rate
+        proceeds = gross - commission
+        entry_cost = open_entry_cost.get(series.ticker, shares * ref)
+        if partial_qty:
+            cost_basis = entry_cost * (shares / series.shares)
+            closed_trade_pnls.append(proceeds - cost_basis)
+            open_entry_cost[series.ticker] = entry_cost - cost_basis
+            _apply_partial_sell_state(series, shares, exec_date)
+        else:
+            closed_trade_pnls.append(proceeds - entry_cost)
+            open_entry_cost.pop(series.ticker, None)
+            _apply_sell_state(series, exec_date)
+        cash += proceeds
+        mark_prices = self._mark_prices(exec_date)
+        holdings = self._holdings_snapshot(mark_prices)
+        equity = compute_portfolio_equity(cash, holdings)
+        trades.append(
+            TradeRecord(
+                date=exec_date,
+                ticker=series.ticker,
+                side="SELL",
+                shares=shares,
+                price=ref,
+                commission=commission,
+                cash_after=cash,
+                equity_after=equity,
+                signal=signal,
+                exit_reason=exit_reason,
+            )
+        )
+        return cash
+
+    def _execute_buy(
+        self,
+        series: TickerBacktestSeries,
+        *,
+        sizing_bar: BarSnapshot,
+        exec_bar: BarSnapshot,
+        exec_date: str,
+        size_multiplier: float,
+        cash: float,
+        open_entry_cost: dict[str, float],
+        trades: list[TradeRecord],
+        signal: str = "BUY",
+        shares_hint: int | None = None,
+        append_shares: bool = False,
+    ) -> float:
+        if not append_shares and series.shares > 0:
+            return cash
+        mark_prices = self._mark_prices(exec_date)
+        holdings = self._holdings_snapshot(mark_prices)
+        total_equity = compute_portfolio_equity(cash, holdings)
+        ref = exec_bar.open if self.fill_at_next_open else exec_bar.close
+        shares, scale_target = self._size_entry_shares(
+            series,
+            sizing_bar,
+            cash=cash,
+            total_equity=total_equity,
+            size_multiplier=size_multiplier,
+            bar_date=exec_date,
+            shares_hint=shares_hint,
+            entry_price=ref,
+        )
+        if shares_hint is not None:
+            shares = min(shares, shares_hint)
+        if shares <= 0:
+            return cash
+        fill = fill_price("BUY", ref, slippage_bps=self.slippage_bps)
+        gross = shares * fill
+        commission = gross * self.commission_rate
+        total_cost = gross + commission
+        if total_cost > cash:
+            shares = int(cash / (fill * (1.0 + self.commission_rate)))
+            if shares <= 0:
+                return cash
+            fill = fill_price("BUY", ref, slippage_bps=self.slippage_bps)
+            gross = shares * fill
+            commission = gross * self.commission_rate
+            total_cost = gross + commission
+        if append_shares:
+            prior_cost = open_entry_cost.get(series.ticker, 0.0)
+            cash -= total_cost
+            new_total = series.shares + shares
+            _apply_buy_state(series, exec_bar, new_total, exec_date)
+            series.state.scale_in_target_qty = 0
+            open_entry_cost[series.ticker] = prior_cost + total_cost
+        else:
+            cash -= total_cost
+            _apply_buy_state(
+                series,
+                exec_bar,
+                shares,
+                exec_date,
+                scale_in_target=scale_target,
+            )
+            open_entry_cost[series.ticker] = total_cost
+        mark_prices = self._mark_prices(exec_date)
+        holdings = self._holdings_snapshot(mark_prices)
+        equity = compute_portfolio_equity(cash, holdings)
+        trades.append(
+            TradeRecord(
+                date=exec_date,
+                ticker=series.ticker,
+                side="BUY",
+                shares=shares,
+                price=ref,
+                commission=commission,
+                cash_after=cash,
+                equity_after=equity,
+                signal=signal,
+            )
+        )
+        return cash
+
+    def _execute_pending_at_open(
+        self,
+        bar_date: str,
+        *,
+        cash: float,
+        open_entry_cost: dict[str, float],
+        closed_trade_pnls: list[float],
+        trades: list[TradeRecord],
+        pending_exits: list[_PendingExit],
+        pending_entries: list[_PendingEntry],
+        pending_scale_ins: list[_PendingScaleIn],
+    ) -> float:
+        market_bullish, size_multiplier, _ = self._regime_context(bar_date)
+
+        for pending in [p for p in pending_exits if p.execute_date == bar_date]:
+            pair = self._bars_for_date(pending.series, bar_date)
+            if pair is None:
+                continue
+            exec_bar, _ = pair
+            cash = self._execute_sell(
+                pending.series,
+                exec_bar=exec_bar,
+                exec_date=bar_date,
+                signal=pending.signal,
+                exit_reason=pending.exit_reason,
+                partial_qty=pending.partial_qty,
+                cash=cash,
+                open_entry_cost=open_entry_cost,
+                closed_trade_pnls=closed_trade_pnls,
+                trades=trades,
+            )
+        pending_exits[:] = [p for p in pending_exits if p.execute_date != bar_date]
+
+        for pending in [p for p in pending_entries if p.execute_date == bar_date]:
+            if not market_bullish or size_multiplier <= 0:
+                continue
+            if pending.series.shares > 0:
+                continue
+            pair = self._bars_for_date(pending.series, bar_date)
+            if pair is None:
+                continue
+            exec_bar, _ = pair
+            cash = self._execute_buy(
+                pending.series,
+                sizing_bar=pending.signal_bar,
+                exec_bar=exec_bar,
+                exec_date=bar_date,
+                size_multiplier=pending.size_multiplier * size_multiplier,
+                cash=cash,
+                open_entry_cost=open_entry_cost,
+                trades=trades,
+            )
+        pending_entries[:] = [p for p in pending_entries if p.execute_date != bar_date]
+
+        for pending in [p for p in pending_scale_ins if p.execute_date == bar_date]:
+            if pending.series.shares <= 0 or pending.add_qty <= 0:
+                continue
+            pair = self._bars_for_date(pending.series, bar_date)
+            if pair is None:
+                continue
+            exec_bar, _ = pair
+            cash = self._execute_buy(
+                pending.series,
+                sizing_bar=pending.signal_bar,
+                exec_bar=exec_bar,
+                exec_date=bar_date,
+                size_multiplier=1.0,
+                cash=cash,
+                open_entry_cost=open_entry_cost,
+                trades=trades,
+                signal="SCALE_IN_BUY",
+                shares_hint=pending.add_qty,
+                append_shares=True,
+            )
+        pending_scale_ins[:] = [p for p in pending_scale_ins if p.execute_date != bar_date]
+        return cash
+
     def run(self) -> PortfolioBacktestResult:
         cash = self.initial_cash
         trades: list[TradeRecord] = []
@@ -436,8 +700,24 @@ class PortfolioBacktestEngine:
 
         closed_trade_pnls: list[float] = []
         open_entry_cost: dict[str, float] = {}
+        pending_exits: list[_PendingExit] = []
+        pending_entries: list[_PendingEntry] = []
+        pending_scale_ins: list[_PendingScaleIn] = []
+        defer_fills = self.fill_at_next_open
 
         for bar_date in self.timeline:
+            if defer_fills:
+                cash = self._execute_pending_at_open(
+                    bar_date,
+                    cash=cash,
+                    open_entry_cost=open_entry_cost,
+                    closed_trade_pnls=closed_trade_pnls,
+                    trades=trades,
+                    pending_exits=pending_exits,
+                    pending_entries=pending_entries,
+                    pending_scale_ins=pending_scale_ins,
+                )
+
             self._maybe_rebalance_momentum(bar_date)
             market_bullish, size_multiplier, atr_stop_multiplier = self._regime_context(
                 bar_date
@@ -462,7 +742,7 @@ class PortfolioBacktestEngine:
                         series.state,
                         bar,
                         prev_bar,
-                        mutate_state=True,
+                        mutate_state=not defer_fills,
                         allow_crossover=True,
                         momentum_ranked_hold=ranked_hold,
                         atr_regime_multiplier=atr_stop_multiplier,
@@ -524,117 +804,81 @@ class PortfolioBacktestEngine:
                         continue
                     entry_events.append((series, bar, size_multiplier, None))
 
+            next_date = self._next_trading_date(bar_date) if defer_fills else None
+
             for series, bar, signal, exit_reason, partial_qty in exit_events:
-                if series.shares <= 0:
-                    continue
-                shares = partial_qty if partial_qty else series.shares
-                shares = min(shares, series.shares)
-                if shares <= 0:
-                    continue
-                fill = fill_price("SELL", bar.close, slippage_bps=self.slippage_bps)
-                gross = shares * fill
-                commission = gross * self.commission_rate
-                proceeds = gross - commission
-                entry_cost = open_entry_cost.get(series.ticker, shares * bar.close)
-                if partial_qty:
-                    cost_basis = entry_cost * (shares / series.shares)
-                    closed_trade_pnls.append(proceeds - cost_basis)
-                    open_entry_cost[series.ticker] = entry_cost - cost_basis
-                    _apply_partial_sell_state(series, shares, bar_date)
-                else:
-                    closed_trade_pnls.append(proceeds - entry_cost)
-                    open_entry_cost.pop(series.ticker, None)
-                    _apply_sell_state(series, bar_date)
-                cash += proceeds
-                mark_prices = self._mark_prices(bar_date)
-                holdings = self._holdings_snapshot(mark_prices)
-                equity = compute_portfolio_equity(cash, holdings)
-                trades.append(
-                    TradeRecord(
-                        date=bar_date,
-                        ticker=series.ticker,
-                        side="SELL",
-                        shares=shares,
-                        price=bar.close,
-                        commission=commission,
-                        cash_after=cash,
-                        equity_after=equity,
-                        signal=signal,
-                        exit_reason=exit_reason,
+                if defer_fills:
+                    if next_date is None:
+                        continue
+                    pending_exits.append(
+                        _PendingExit(
+                            series=series,
+                            signal=signal,
+                            exit_reason=exit_reason,
+                            partial_qty=partial_qty,
+                            execute_date=next_date,
+                        )
                     )
+                    continue
+                cash = self._execute_sell(
+                    series,
+                    exec_bar=bar,
+                    exec_date=bar_date,
+                    signal=signal,
+                    exit_reason=exit_reason,
+                    partial_qty=partial_qty,
+                    cash=cash,
+                    open_entry_cost=open_entry_cost,
+                    closed_trade_pnls=closed_trade_pnls,
+                    trades=trades,
                 )
 
             for series, bar, size_multiplier, _ in entry_events:
-                if series.shares > 0:
-                    continue
-                mark_prices = self._mark_prices(bar_date)
-                holdings = self._holdings_snapshot(mark_prices)
-                total_equity = compute_portfolio_equity(cash, holdings)
-                shares, scale_target = self._size_entry_shares(
-                    series,
-                    bar,
-                    cash=cash,
-                    total_equity=total_equity,
-                    size_multiplier=size_multiplier,
-                    bar_date=bar_date,
-                )
-                if shares <= 0:
-                    continue
-                fill = fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
-                gross = shares * fill
-                commission = gross * self.commission_rate
-                total_cost = gross + commission
-                if total_cost > cash:
-                    shares = int(
-                        cash
-                        / (
-                            fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
-                            * (1.0 + self.commission_rate)
+                if defer_fills:
+                    if next_date is None:
+                        continue
+                    pending_entries.append(
+                        _PendingEntry(
+                            series=series,
+                            signal_bar=bar,
+                            size_multiplier=size_multiplier,
+                            execute_date=next_date,
                         )
                     )
-                    if shares <= 0:
-                        continue
-                    fill = fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
-                    gross = shares * fill
-                    commission = gross * self.commission_rate
-                    total_cost = gross + commission
-                cash -= total_cost
-                _apply_buy_state(
+                    continue
+                cash = self._execute_buy(
                     series,
-                    bar,
-                    shares,
-                    bar_date,
-                    scale_in_target=scale_target,
-                )
-                open_entry_cost[series.ticker] = total_cost
-                mark_prices = self._mark_prices(bar_date)
-                holdings = self._holdings_snapshot(mark_prices)
-                equity = compute_portfolio_equity(cash, holdings)
-                trades.append(
-                    TradeRecord(
-                        date=bar_date,
-                        ticker=series.ticker,
-                        side="BUY",
-                        shares=shares,
-                        price=bar.close,
-                        commission=commission,
-                        cash_after=cash,
-                        equity_after=equity,
-                        signal="BUY",
-                    )
+                    sizing_bar=bar,
+                    exec_bar=bar,
+                    exec_date=bar_date,
+                    size_multiplier=size_multiplier,
+                    cash=cash,
+                    open_entry_cost=open_entry_cost,
+                    trades=trades,
                 )
 
             for series, bar, add_qty in scale_in_events:
+                if defer_fills:
+                    if next_date is None:
+                        continue
+                    pending_scale_ins.append(
+                        _PendingScaleIn(
+                            series=series,
+                            signal_bar=bar,
+                            add_qty=add_qty,
+                            execute_date=next_date,
+                        )
+                    )
+                    continue
                 if series.shares <= 0 or add_qty <= 0:
                     continue
-                mark_prices = self._mark_prices(bar_date)
-                holdings = self._holdings_snapshot(mark_prices)
-                total_equity = compute_portfolio_equity(cash, holdings)
                 shares, _ = self._size_entry_shares(
                     series,
                     bar,
                     cash=cash,
-                    total_equity=total_equity,
+                    total_equity=compute_portfolio_equity(
+                        cash, self._holdings_snapshot(self._mark_prices(bar_date))
+                    ),
                     size_multiplier=1.0,
                     bar_date=bar_date,
                     shares_hint=add_qty,
@@ -642,33 +886,18 @@ class PortfolioBacktestEngine:
                 shares = min(shares, add_qty)
                 if shares <= 0:
                     continue
-                fill = fill_price("BUY", bar.close, slippage_bps=self.slippage_bps)
-                gross = shares * fill
-                commission = gross * self.commission_rate
-                total_cost = gross + commission
-                if total_cost > cash:
-                    continue
-                prior_cost = open_entry_cost.get(series.ticker, 0.0)
-                cash -= total_cost
-                new_total = series.shares + shares
-                _apply_buy_state(series, bar, new_total, bar_date)
-                series.state.scale_in_target_qty = 0
-                open_entry_cost[series.ticker] = prior_cost + total_cost
-                mark_prices = self._mark_prices(bar_date)
-                holdings = self._holdings_snapshot(mark_prices)
-                equity = compute_portfolio_equity(cash, holdings)
-                trades.append(
-                    TradeRecord(
-                        date=bar_date,
-                        ticker=series.ticker,
-                        side="BUY",
-                        shares=shares,
-                        price=bar.close,
-                        commission=commission,
-                        cash_after=cash,
-                        equity_after=equity,
-                        signal="SCALE_IN_BUY",
-                    )
+                cash = self._execute_buy(
+                    series,
+                    sizing_bar=bar,
+                    exec_bar=bar,
+                    exec_date=bar_date,
+                    size_multiplier=1.0,
+                    cash=cash,
+                    open_entry_cost=open_entry_cost,
+                    trades=trades,
+                    signal="SCALE_IN_BUY",
+                    shares_hint=shares,
+                    append_shares=True,
                 )
 
             mark_prices = self._mark_prices(bar_date)

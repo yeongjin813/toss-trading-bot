@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from analytics import _to_ny_datetime, describe_us_market_closure
@@ -186,3 +186,163 @@ def mark_eod_report_sent(states: dict[str, Any], *, now: datetime | None = None)
     ny_date = _to_ny_datetime(now).strftime("%Y-%m-%d")
     portfolio = states.setdefault("_portfolio", {})
     portfolio["last_daily_report_date"] = ny_date
+
+
+def use_weekly_telegram_report() -> bool:
+    return os.getenv("USE_WEEKLY_TELEGRAM_REPORT", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def record_daily_equity_snapshot(
+    states: dict[str, Any],
+    equity: float,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Append one EOD equity point for weekly paper-trading reports."""
+    ny_date = _to_ny_datetime(now).strftime("%Y-%m-%d")
+    portfolio = states.setdefault("_portfolio", {})
+    history = portfolio.get("equity_history")
+    if not isinstance(history, dict):
+        history = {}
+    history[ny_date] = round(float(equity), 2)
+    if len(history) > 120:
+        for key in sorted(history.keys())[:-120]:
+            history.pop(key, None)
+    portfolio["equity_history"] = history
+
+
+def _trades_since(trade_log_path: str, since_date: str) -> list[dict[str, str]]:
+    if not os.path.exists(trade_log_path):
+        return []
+    rows: list[dict[str, str]] = []
+    with open(trade_log_path, encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            timestamp = (row.get("timestamp") or "").strip()
+            if timestamp[:10] >= since_date:
+                rows.append(row)
+    return rows
+
+
+def should_send_weekly_report(now: datetime | None, states: Mapping[str, Any]) -> bool:
+    """Friday after 16:00 ET, once per ISO week — paper-trading go/no-go summary."""
+    if not use_weekly_telegram_report():
+        return False
+    ny = _to_ny_datetime(now)
+    if describe_us_market_closure(ny) is not None:
+        return False
+    if ny.weekday() != 4 or ny.hour < 16:
+        return False
+    portfolio = states.get("_portfolio", {})
+    if not isinstance(portfolio, dict):
+        return False
+    week_key = ny.strftime("%G-W%V")
+    return portfolio.get("last_weekly_report_week") != week_key
+
+
+def compile_weekly_metrics(
+    states: Mapping[str, Any],
+    watchlist: list[str],
+    *,
+    trade_log_path: str,
+    available_cash: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    ny = _to_ny_datetime(now)
+    ny_date = ny.strftime("%Y-%m-%d")
+    week_key = ny.strftime("%G-W%V")
+    portfolio = states.get("_portfolio", {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+
+    history = portfolio.get("equity_history") or {}
+    if not isinstance(history, dict):
+        history = {}
+
+    since = (ny - timedelta(days=7)).strftime("%Y-%m-%d")
+    week_dates = sorted(
+        d
+        for d in history.keys()
+        if d <= ny_date and d >= (ny - timedelta(days=7)).strftime("%Y-%m-%d")
+    )
+    week_start_equity = float(history[week_dates[0]]) if week_dates else float(
+        portfolio.get("last_equity_usd", 0.0) or 0.0
+    )
+    week_end_equity = float(history[week_dates[-1]]) if week_dates else week_start_equity
+    week_pnl = week_end_equity - week_start_equity
+    week_pnl_pct = (week_pnl / week_start_equity * 100.0) if week_start_equity > 0 else 0.0
+
+    week_rows = _trades_since(trade_log_path, since)
+    fills = [r for r in week_rows if r.get("status") in {"FILLED", "DRY_RUN", "PARTIAL"}]
+    buys = sum(1 for r in fills if r.get("signal") == "BUY")
+    sells = sum(1 for r in fills if r.get("signal") in {"SELL", "DYNAMIC_ATR_SELL"})
+
+    anchor = float(portfolio.get("paper_anchor_equity_usd", 0.0) or 0.0)
+    if anchor <= 0 and week_start_equity > 0:
+        anchor = week_start_equity
+    cumulative_pnl = week_end_equity - anchor if anchor > 0 else 0.0
+    cumulative_pct = (cumulative_pnl / anchor * 100.0) if anchor > 0 else 0.0
+
+    return {
+        "week_key": week_key,
+        "week_end_date": ny_date,
+        "week_start_equity": week_start_equity,
+        "week_end_equity": week_end_equity,
+        "week_pnl": week_pnl,
+        "week_pnl_pct": week_pnl_pct,
+        "cumulative_pnl": cumulative_pnl,
+        "cumulative_pnl_pct": cumulative_pct,
+        "paper_anchor_equity": anchor,
+        "fills": len(fills),
+        "buys": buys,
+        "sells": sells,
+        "open_positions": _count_open_positions(states, watchlist),
+        "equity_days": len(week_dates),
+        "available_cash": available_cash,
+        "dry_run": is_dry_run_mode(),
+    }
+
+
+def format_weekly_report_text(metrics: dict[str, Any]) -> str:
+    week_e = escape_markdown_v2(metrics["week_key"])
+    end_e = escape_markdown_v2(metrics["week_end_date"])
+    mode = "DRY\\-RUN" if metrics.get("dry_run") else "PAPER"
+    pnl = float(metrics["week_pnl"])
+    pnl_sign = "+" if pnl >= 0 else ""
+    week_pnl_e = escape_markdown_v2(f"{pnl_sign}{pnl:,.2f}")
+    week_pct_e = escape_markdown_v2(f"{pnl_sign}{metrics['week_pnl_pct']:.2f}")
+    cum_pnl = float(metrics["cumulative_pnl"])
+    cum_sign = "+" if cum_pnl >= 0 else ""
+    cum_pnl_e = escape_markdown_v2(f"{cum_sign}{cum_pnl:,.2f}")
+    cum_pct_e = escape_markdown_v2(f"{cum_sign}{metrics['cumulative_pnl_pct']:.2f}")
+    equity_e = escape_markdown_v2(f"{metrics['week_end_equity']:,.2f}")
+    fills_e = escape_markdown_v2(str(metrics["fills"]))
+    open_e = escape_markdown_v2(str(metrics["open_positions"]))
+    return (
+        f"📈 *Weekly Paper Report* \\({week_e}, {end_e}\\) \\[{mode}\\]\n"
+        f"Equity: ${equity_e}\n"
+        f"Week PnL: ${week_pnl_e} \\({week_pct_e}%\\)\n"
+        f"Since anchor: ${cum_pnl_e} \\({cum_pct_e}%\\)\n"
+        f"Fills: {fills_e} \\(B {escape_markdown_v2(str(metrics['buys']))} / "
+        f"S {escape_markdown_v2(str(metrics['sells']))}\\)\n"
+        f"Open Positions: {open_e}\n"
+        f"Equity snapshots: {escape_markdown_v2(str(metrics['equity_days']))}/7d"
+    )
+
+
+def mark_weekly_report_sent(states: dict[str, Any], *, now: datetime | None = None) -> None:
+    ny = _to_ny_datetime(now)
+    portfolio = states.setdefault("_portfolio", {})
+    portfolio["last_weekly_report_week"] = ny.strftime("%G-W%V")
+    anchor = float(portfolio.get("paper_anchor_equity_usd", 0.0) or 0.0)
+    if anchor <= 0:
+        history = portfolio.get("equity_history") or {}
+        if isinstance(history, dict) and history:
+            portfolio["paper_anchor_equity_usd"] = float(sorted(history.items())[0][1])
+        elif portfolio.get("last_equity_usd"):
+            portfolio["paper_anchor_equity_usd"] = float(portfolio["last_equity_usd"])

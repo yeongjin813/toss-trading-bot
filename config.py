@@ -227,6 +227,16 @@ class StrategyConfigMapper:
         return max(0, int(os.getenv("ENTRY_CONFIRMATION_DAYS", "0")))
 
     @classmethod
+    def backtest_fill_at_next_open(cls) -> bool:
+        """Fill at next session open after signal (avoids same-bar close look-ahead)."""
+        return os.getenv("BACKTEST_FILL_AT_NEXT_OPEN", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @classmethod
     def resolve_regime(cls, ticker: str) -> TickerConfig:
         normalized = ticker.strip().upper()
         return cls._EXPLICIT.get(normalized, cls._DEFAULT)

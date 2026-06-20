@@ -450,6 +450,8 @@ python -m pytest test_momentum_selection.py test_momentum_ranker.py -q
 | `vix_data.py` | ^VIX yfinance frame (research; live inject when filter ON) |
 | `scripts/filter_combo_backtest.py` | SPY-only vs entry-confirm vs VIX grid |
 | `scripts/cost_sensitivity.py` | Commission × slippage sensitivity (dual 60/40) |
+| `BACKTEST_FILL_AT_NEXT_OPEN` | Signal at close → **fill next session open** (default `true`) |
+| `USE_WEEKLY_TELEGRAM_REPORT` | Friday EOD weekly PnL vs paper anchor (Telegram) |
 
 **Verify:**
 

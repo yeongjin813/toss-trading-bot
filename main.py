@@ -101,10 +101,15 @@ from momentum_ranker import (
 )
 from daily_report import (
     compile_eod_metrics,
+    compile_weekly_metrics,
     format_eod_report_text,
+    format_weekly_report_text,
     is_dry_run_mode,
     mark_eod_report_sent,
+    mark_weekly_report_sent,
+    record_daily_equity_snapshot,
     should_send_eod_report,
+    should_send_weekly_report,
     use_daily_telegram_report,
 )
 from deployment_config import DeploymentConfig, scaled_capital
@@ -2067,6 +2072,33 @@ def _maybe_send_eod_report(
     else:
         print(text.replace("\\", ""))
     mark_eod_report_sent(states)
+    record_daily_equity_snapshot(states, float(metrics["equity"]), now=now)
+    save_persisted_states(states)
+    _maybe_send_weekly_report(states, ledger, now=now)
+
+
+def _maybe_send_weekly_report(
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+    *,
+    now: datetime | None = None,
+) -> None:
+    if not should_send_weekly_report(now, states):
+        return
+    metrics = compile_weekly_metrics(
+        states,
+        WATCHLIST,
+        trade_log_path=TRADE_LOG_FILE,
+        available_cash=ledger.available_cash_usd,
+        now=now,
+    )
+    text = format_weekly_report_text(metrics)
+    print(f"[WEEKLY] Sending paper report for {metrics['week_key']}...")
+    if _telegram_enabled():
+        _run_telegram(send_eod_report(text))
+    else:
+        print(text.replace("\\", ""))
+    mark_weekly_report_sent(states, now=now)
     save_persisted_states(states)
 
 
@@ -2162,6 +2194,12 @@ def main() -> None:
     print(
         f"EOD Telegram Report : "
         f"{'ON (after 16:00 ET)' if use_daily_telegram_report() else 'OFF'}"
+    )
+    from daily_report import use_weekly_telegram_report
+
+    print(
+        f"Weekly Paper Report : "
+        f"{'ON (Friday after 16:00 ET)' if use_weekly_telegram_report() else 'OFF'}"
     )
     print(
         "Extended Hours      : OFF (daily-bar strategy; pre/post market orders disabled)"

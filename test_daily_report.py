@@ -8,8 +8,11 @@ from zoneinfo import ZoneInfo
 
 from daily_report import (
     compile_eod_metrics,
+    compile_weekly_metrics,
     format_eod_report_text,
+    format_weekly_report_text,
     should_send_eod_report,
+    should_send_weekly_report,
 )
 
 
@@ -54,3 +57,35 @@ def test_compile_and_format_eod_metrics(tmp_path):
     text = format_eod_report_text(metrics)
     assert "EOD Report" in text
     assert "NVDA" in text
+
+
+def test_weekly_report_friday(monkeypatch):
+    monkeypatch.setenv("USE_WEEKLY_TELEGRAM_REPORT", "true")
+    ny = datetime(2024, 6, 21, 16, 30, tzinfo=ZoneInfo("America/New_York"))
+    states = {"_portfolio": {"equity_history": {"2024-06-17": 10000.0, "2024-06-21": 10100.0}}}
+    assert should_send_weekly_report(ny, states) is True
+
+
+def test_compile_weekly_metrics(tmp_path):
+    log_path = tmp_path / "trade_log.csv"
+    log_path.write_text(
+        "timestamp,ticker,signal,qty,order_price,fill_price,status,reason,cash_after,held_qty\n"
+        "2024-06-20T15:00:00,NVDA,BUY,1,900.0,900.0,FILLED,test,9000,1\n",
+        encoding="utf-8",
+    )
+    states = {
+        "_portfolio": {
+            "equity_history": {"2024-06-17": 10000.0, "2024-06-21": 10100.0},
+            "paper_anchor_equity_usd": 10000.0,
+        },
+        "NVDA": {"held_quantity": 1},
+    }
+    metrics = compile_weekly_metrics(
+        states,
+        ["NVDA"],
+        trade_log_path=str(log_path),
+        now=datetime(2024, 6, 21, 16, 30, tzinfo=ZoneInfo("America/New_York")),
+    )
+    text = format_weekly_report_text(metrics)
+    assert metrics["week_pnl"] == 100.0
+    assert "Weekly Paper Report" in text.replace("\\", "")
