@@ -53,8 +53,8 @@ def _dual_metrics(
             strategy_mode="dual",
             top3_backtest_only=False,
             top3_dry_run_enabled=False,
-            legacy_capital_pct=float(os.getenv("LEGACY_CAPITAL_PCT", "60")),
-            top3_capital_pct=float(os.getenv("TOP3_CAPITAL_PCT", "40")),
+            legacy_capital_pct=float(os.getenv("LEGACY_CAPITAL_PCT", "70")),
+            top3_capital_pct=float(os.getenv("TOP3_CAPITAL_PCT", "30")),
         )
     leg_cash = scaled_capital(TOTAL_CASH, deploy.legacy_capital_fraction())
     top_cash = scaled_capital(TOTAL_CASH, deploy.top3_capital_fraction())

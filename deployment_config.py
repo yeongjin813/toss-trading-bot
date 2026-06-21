@@ -32,8 +32,8 @@ class DeploymentConfig:
         mode = os.getenv("STRATEGY_MODE", "legacy").strip().lower()
         if mode not in {"legacy", "dual"}:
             mode = "legacy"
-        legacy_pct = float(os.getenv("LEGACY_CAPITAL_PCT", "60"))
-        top3_pct = float(os.getenv("TOP3_CAPITAL_PCT", "40"))
+        legacy_pct = float(os.getenv("LEGACY_CAPITAL_PCT", "70"))
+        top3_pct = float(os.getenv("TOP3_CAPITAL_PCT", "30"))
         return cls(
             phase=phase,
             strategy_mode=mode,

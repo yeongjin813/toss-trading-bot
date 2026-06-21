@@ -37,6 +37,21 @@ def test_phase3_dual_shadow():
         assert cfg.legacy_momentum_rank_enabled(True) is False
 
 
+def test_phase4_default_split():
+    env = {
+        "DEPLOYMENT_PHASE": "4",
+        "STRATEGY_MODE": "dual",
+    }
+    with mock.patch.dict(os.environ, env, clear=True):
+        cfg = DeploymentConfig.from_env()
+        assert cfg.legacy_capital_pct == 70.0
+        assert cfg.top3_capital_pct == 30.0
+        assert cfg.legacy_capital_fraction() == 0.7
+        assert cfg.top3_capital_fraction() == 0.3
+        assert scaled_capital(100_000, cfg.legacy_capital_fraction()) == 70_000
+        assert scaled_capital(100_000, cfg.top3_capital_fraction()) == 30_000
+
+
 def test_phase4_live_split():
     env = {
         "DEPLOYMENT_PHASE": "4",

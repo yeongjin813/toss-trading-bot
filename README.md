@@ -4,7 +4,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | **Phase 4 live** — Legacy 60% + Top3 40% on **$100,000** total (`CAPITAL_AT_RISK`) |
+| **System Status** | **Phase 4 live** — Legacy 70% + Top3 30% on **$100,000** total (`CAPITAL_AT_RISK`) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM / DEFAULT (all `breakout`) |
 | **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top3 momentum rebalance (separate sizing pools) |
 | **Universe Filter** | Legacy: full watchlist signals · Top3: equal-weight Top-3, Friday rebalance (`top3_strategy.py`) |
@@ -31,6 +31,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 ---
 
 > **Phase 15 (2026-06)** — live-loop hardening: atomic `trading_state.json` writes, fewer disk flushes, and RTH orchestration moved to `watchlist_cycle.py`. See [Phase 15](#phase-15-live-loop-hardening--pipeline-extract-2026-06).
+>
+> **Phase 19 (2026-06)** — Dual capital split **70/30** (Legacy/Top3) after 2020–2026 sweep; beats 60/40 on return, Sharpe, MaxDD. See [Phase 19](#phase-19-dual-capital-split-7030-2026-06).
 >
 > **Phase 18 (2026-06)** — Quant feedback triage: walk-forward OOS tooling added; enhanced / inverse-vol / VIX **not** promoted to prod. See [Phase 18](#phase-18-external-quant-feedback--accept--reject-2026-06).
 >
@@ -339,7 +341,7 @@ python test_analytics.py
 | **Top3 live path** | `top3_strategy.py` + `main.py` | Shadow (phase 3) or KIS orders (phase 4) on separate capital slice |
 | **Compare CLI** | `run_backtest.py --strategy compare` | Legacy vs Top3 side-by-side on same window |
 
-**Production (Phase 4):** `CAPITAL_AT_RISK=100000` → Legacy **$60,000** sizing + Top3 **$40,000** sizing. See [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases-env).
+**Production (Phase 4):** `CAPITAL_AT_RISK=100000` → Legacy **$70,000** sizing + Top3 **$30,000** sizing. See [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases-env).
 
 ### Phase 13: Broker Holdings Sync & Report Parity *(2026-06)*
 
@@ -493,6 +495,23 @@ python -m pytest test_walk_forward_research.py -q
 ```
 
 **Production unchanged:** Legacy ranking + **equal-weight Top3** + SPY/QQQ/golden-cross regime (no VIX).
+
+### Phase 19: Dual Capital Split 70/30 *(2026-06)*
+
+**2020–2026 split sweep** (`scripts/dual_split_sweep_2020.py`, prod friction + filters):
+
+| Legacy/Top3 | Return | Sharpe | MaxDD | CAGR |
+|---|---|---|---|---|
+| 100/0 | +235% | 1.49 | 19.6% | +22.3% |
+| **70/30** *(prod)* | **+218%** | **1.32** | **19.0%** | **+21.3%** |
+| 60/40 | +212% | 1.23 | 19.2% | +20.9% |
+| 0/100 Top3 | +177% | 0.79 | 33.4% | +18.5% |
+
+**Decision:** Keep dual (regime diversification) but tilt **Legacy 70% / Top3 30%** — better return, Sharpe, and MaxDD than 60/40; Top3-only or Top3-heavy splits underperform.
+
+```powershell
+python scripts/dual_split_sweep_2020.py --start 2020-01-01 --end 2025-12-31
+```
 
 | Upgrade | Module | Summary |
 |---|---|---|
@@ -1559,7 +1578,7 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 
 #### Dual-Strategy Deployment Phases (`.env`)
 
-**Production default:** Phase **4** — `$100,000` total capital split **60% Legacy / 40% Top3**.
+**Production default:** Phase **4** — `$100,000` total capital split **70% Legacy / 30% Top3**.
 
 | Pool | Capital | Strategy |
 |---|---|---|
@@ -1571,20 +1590,20 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 | **1** | `1` | Legacy only; `MOMENTUM_RANK_ENABLED=false` | `python run_backtest.py` |
 | **2** | `2` | Same as phase 1 live | `python run_backtest.py --strategy compare --yfinance` |
 | **3** | `3` + `STRATEGY_MODE=dual` + `TOP3_DRY_RUN_ENABLED=true` | Legacy live + Top3 shadow (log/Telegram only) | Compare first |
-| **4** *(production)* | `4` + `STRATEGY_MODE=dual` | **60% legacy / 40% Top3** on `CAPITAL_AT_RISK` | N/A |
+| **4** *(production)* | `4` + `STRATEGY_MODE=dual` | **70% legacy / 30% Top3** on `CAPITAL_AT_RISK` | N/A |
 
 | Parameter | Default | Description |
 |---|---|---|
 | `CAPITAL_AT_RISK` | **100000** | **Total** deployable portfolio (USD); split in phase 4 |
 | `DEPLOYMENT_PHASE` | **4** | Active rollout phase (1–4) |
 | `STRATEGY_MODE` | **dual** | `legacy` or `dual` (dual activates at phase ≥ 3) |
-| `LEGACY_CAPITAL_PCT` | **60** | Legacy sizing slice (% of `CAPITAL_AT_RISK`) |
-| `TOP3_CAPITAL_PCT` | **40** | Top3 sizing slice (% of `CAPITAL_AT_RISK`) |
+| `LEGACY_CAPITAL_PCT` | **70** | Legacy sizing slice (% of `CAPITAL_AT_RISK`) |
+| `TOP3_CAPITAL_PCT` | **30** | Top3 sizing slice (% of `CAPITAL_AT_RISK`) |
 | `TOP3_BACKTEST_ONLY` | **false** | Phase 2 flag — Top3 evaluated in backtests only |
 | `TOP3_DRY_RUN_ENABLED` | **false** | Phase 3 — shadow Top3 orders without KIS |
 | `MOMENTUM_RANK_ENABLED` | **false** | Legacy path: off in dual mode (Top3 handles momentum separately) |
 
-**Backtest decision (2026-06):** Four-window compare — Top3 wins recent bull windows; Legacy wins 2020–22 bear. **60/40 split** chosen over either strategy alone. No live shadow wait required.
+**Backtest decision (2026-06):** Four-window compare — Top3 wins recent bull windows; Legacy wins 2020–22 bear. **70/30 split** (Phase 19) chosen after 2020–2026 sweep beat 60/40 on return, Sharpe, and MaxDD while keeping dual diversification.
 
 **Limitations:** KIS VTS does not tag orders by strategy. Top3 state in `trading_state.json` → `_portfolio._top3_shadow`. Broker positions are shared — reconcile before phase changes. Off-watchlist holdings are invisible to the bot. EOD equity may lag when broker cash returns 0. ccnl HTTP 500 remains intermittent on VTS — see [Phase 13](#phase-13-broker-holdings-sync--report-parity-2026-06).
 
@@ -1604,7 +1623,7 @@ Only tickers in the weekly **Top-N** list (`MOMENTUM_TOP_N`, default **3**) rece
 
 | Parameter | Default | Description |
 |---|---|---|
-| `CAPITAL_AT_RISK` | **100000** | Total deployable portfolio (USD); Phase 4 → Legacy $60k + Top3 $40k |
+| `CAPITAL_AT_RISK` | **100000** | Total deployable portfolio (USD); Phase 4 → Legacy $70k + Top3 $30k |
 | `RISK_PER_TRADE` | **0.01** | Per-trade risk fraction (1%) |
 | `WATCHLIST` | `AAPL,MSFT,NVDA,...` (25 defaults) | Comma-separated ticker list; must exist in `market_registry.MARKET_META` |
 | `TARGET_BARS` | **756** | Rolling historical window (3 × 252 trading days) |
@@ -1993,7 +2012,7 @@ Death Cross (Step 3)    = Close crosses below SMA_SHORT — ALWAYS unconditional
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `WATCHLIST` | No | 25-ticker default in `.env.example` | Comma-separated tickers; register new symbols in `market_registry.py` |
-| `CAPITAL_AT_RISK` | No | `100000` | Total USD capital base (Phase 4: 60% legacy + 40% Top3) |
+| `CAPITAL_AT_RISK` | No | `100000` | Total USD capital base (Phase 4: 70% legacy + 30% Top3) |
 | `RISK_PER_TRADE` | No | `0.01` | Per-trade risk fraction |
 | `LOOP_COOLDOWN_SECONDS` | No | `60` | Open-session cycle pause |
 | `TICKER_SLEEP_SECONDS` | No | `1` | Inter-ticker pause |
@@ -2072,8 +2091,8 @@ See [Phase 16](#phase-16-enhanced-momentum-research-legacy-retained-2026-06). Mo
 |---|---|---|---|
 | `DEPLOYMENT_PHASE` | No | `4` | Rollout phase (1–4) |
 | `STRATEGY_MODE` | No | `dual` | `legacy` or `dual` |
-| `LEGACY_CAPITAL_PCT` | No | `60` | Legacy pool % of `CAPITAL_AT_RISK` |
-| `TOP3_CAPITAL_PCT` | No | `40` | Top3 pool % of `CAPITAL_AT_RISK` |
+| `LEGACY_CAPITAL_PCT` | No | `70` | Legacy pool % of `CAPITAL_AT_RISK` |
+| `TOP3_CAPITAL_PCT` | No | `30` | Top3 pool % of `CAPITAL_AT_RISK` |
 | `TOP3_BACKTEST_ONLY` | No | `false` | Phase 2 — backtest-only flag |
 | `TOP3_DRY_RUN_ENABLED` | No | `false` | Phase 3 — shadow Top3 without KIS |
 

@@ -650,8 +650,8 @@ def run_strategy_backtests(
                 strategy_mode="dual",
                 top3_backtest_only=False,
                 top3_dry_run_enabled=False,
-                legacy_capital_pct=float(os.getenv("LEGACY_CAPITAL_PCT", "60")),
-                top3_capital_pct=float(os.getenv("TOP3_CAPITAL_PCT", "40")),
+                legacy_capital_pct=float(os.getenv("LEGACY_CAPITAL_PCT", "70")),
+                top3_capital_pct=float(os.getenv("TOP3_CAPITAL_PCT", "30")),
             )
         legacy_cash = scaled_capital(args.cash, deploy.legacy_capital_fraction())
         top3_cash = scaled_capital(args.cash, deploy.top3_capital_fraction())

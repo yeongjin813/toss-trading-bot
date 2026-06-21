@@ -65,11 +65,11 @@ KIS_ORDER_RETRY_BACKOFF_SECONDS=2.0
 USE_EOD_ATR_STOPS=false
 KIS_ORDER_TYPE=limit
 
-# Dual-strategy Phase 4: Legacy $60k + Top3 $40k on $100k total
+# Dual-strategy Phase 4: Legacy $70k + Top3 $30k on $100k total
 DEPLOYMENT_PHASE=4
 STRATEGY_MODE=dual
-LEGACY_CAPITAL_PCT=60
-TOP3_CAPITAL_PCT=40
+LEGACY_CAPITAL_PCT=70
+TOP3_CAPITAL_PCT=30
 TOP3_DRY_RUN_ENABLED=false
 MOMENTUM_RANK_ENABLED=false
 MOMENTUM_TOP_N=3
@@ -444,7 +444,7 @@ Four-phase rollout separating the **legacy signal engine** (breakout + ATR trail
 | **1** | Operate improved legacy only | `DEPLOYMENT_PHASE=1`, `STRATEGY_MODE=legacy`, `MOMENTUM_RANK_ENABLED=false` | Legacy engine | `python run_backtest.py --yfinance` |
 | **2** | Compare Top3 offline | `TOP3_BACKTEST_ONLY=true` (optional flag) | Unchanged | `python run_backtest.py --strategy compare --yfinance` |
 | **3** | Parallel shadow | `DEPLOYMENT_PHASE=3`, `STRATEGY_MODE=dual`, `TOP3_DRY_RUN_ENABLED=true` | Legacy + Top3 shadow logs/Telegram | Re-run compare before enabling |
-| **4** | Live capital split | `DEPLOYMENT_PHASE=4`, `STRATEGY_MODE=dual`, `LEGACY_CAPITAL_PCT=60`, `TOP3_CAPITAL_PCT=40` | 60/40 sizing; Top3 orders via KIS (respects `KIS_DRY_RUN`) | Monitor live vs shadow |
+| **4** | Live capital split | `DEPLOYMENT_PHASE=4`, `STRATEGY_MODE=dual`, `LEGACY_CAPITAL_PCT=70`, `TOP3_CAPITAL_PCT=30` | 70/30 sizing; Top3 orders via KIS (respects `KIS_DRY_RUN`) | Monitor live vs shadow |
 
 **Phase 2 backtest examples:**
 
@@ -459,7 +459,7 @@ python run_backtest.py --strategy compare --yfinance --start 2024-01-01 --end 20
 **Advance checklist (2 → 4):**
 
 1. Phase 2: Top3 total return beats legacy on same window (1Y and 2024–2026).
-2. Phase 4 (production): Set env below; verify startup shows `capital=60/40`, `top3=live-split`, Legacy **$60,000** + Top3 **$40,000** on **$100,000** total.
+2. Phase 4 (production): Set env below; verify startup shows `capital=70/30`, `top3=live-split`, Legacy **$70,000** + Top3 **$30,000** on **$100,000** total.
 
 **Production EC2 defaults (Phase 4 — $100k total):**
 
@@ -467,8 +467,8 @@ python run_backtest.py --strategy compare --yfinance --start 2024-01-01 --end 20
 CAPITAL_AT_RISK=100000
 DEPLOYMENT_PHASE=4
 STRATEGY_MODE=dual
-LEGACY_CAPITAL_PCT=60
-TOP3_CAPITAL_PCT=40
+LEGACY_CAPITAL_PCT=70
+TOP3_CAPITAL_PCT=30
 TOP3_DRY_RUN_ENABLED=false
 MOMENTUM_RANK_ENABLED=false
 MOMENTUM_TOP_N=3
