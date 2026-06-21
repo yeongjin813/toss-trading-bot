@@ -129,6 +129,11 @@ def target_set_unchanged(previous: list[str], new: list[str]) -> bool:
     return set(previous) == set(new)
 
 
+def use_inverse_vol_weights(settings: Any) -> bool:
+    """True when Top-N slot sizing should use inverse-vol (ranking mode independent)."""
+    return bool(getattr(settings, "inverse_vol_weighting", False))
+
+
 def compute_ticker_factors(
     closes: pd.Series,
     ticker: str,

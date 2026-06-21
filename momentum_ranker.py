@@ -243,6 +243,11 @@ def compute_ticker_momentum(
     if ret_3m is None or ret_6m is None or ret_12m is None:
         return None
 
+    from momentum_selection import daily_returns, historical_volatility
+
+    returns = daily_returns(closes)
+    vol_126d = historical_volatility(returns, TRADING_DAYS_6M) or 0.0
+
     return MomentumScore(
         ticker=ticker,
         score=0.0,
@@ -253,6 +258,7 @@ def compute_ticker_momentum(
         above_sma200=above_sma200,
         volume_score=_volume_stability_score(volumes),
         close=close,
+        vol_126d=vol_126d,
     )
 
 
@@ -409,6 +415,7 @@ def rank_universe_frames(
                 above_sma200=item.above_sma200,
                 volume_score=item.volume_score,
                 close=item.close,
+                vol_126d=item.vol_126d,
             )
         )
 

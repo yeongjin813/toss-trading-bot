@@ -26,6 +26,7 @@ from momentum_ranker import (
 from momentum_selection import (
     target_allocation_weights,
     target_set_unchanged,
+    use_inverse_vol_weights,
     vol_map_from_ranked,
 )
 
@@ -123,7 +124,10 @@ def compute_top3_rebalance_orders(
     When broker_holdings is supplied (Phase 4 live), deltas use the shared
     broker account as source-of-truth instead of shadow-only quantities.
     """
-    cfg = (settings or MomentumRankSettings.from_env()).for_top3()
+    cfg = (settings or MomentumRankSettings.from_env())
+    if deploy.top3_live_orders:
+        cfg = cfg.for_production()
+    cfg = cfg.for_top3()
 
     as_of = (now or datetime.now()).strftime("%Y-%m-%d")
     first_run = shadow.last_rebalance_date is None
@@ -232,7 +236,7 @@ def compute_top3_rebalance_orders(
         if t in prices
     )
     equity = shadow.cash_usd + holdings_value
-    use_inverse_vol = cfg.ranking_mode == "enhanced" and cfg.inverse_vol_weighting
+    use_inverse_vol = use_inverse_vol_weights(cfg)
     weights = target_allocation_weights(
         target,
         vol_map_from_ranked(ranked, target),

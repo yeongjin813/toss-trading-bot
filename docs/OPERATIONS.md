@@ -413,6 +413,7 @@ Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-ha
 | QQQ half-size regime | `USE_QQQ_REGIME_FILTER=true` | Half position when SPY &lt; 200MA and QQQ &gt; 200MA |
 | Fill sync fallback | `execution_engine.py` | On ccnl/nccs HTTP 500, infer fill from `present-balance` |
 | Walk-forward benchmarks | `python run_backtest.py --walk-forward --yfinance` | Strat vs equal-weight B&H vs SPY alpha table |
+| Rolling OOS Top3 | `python scripts/walk_forward_momentum.py --yfinance` | Train 3y → test 1y; legacy equal vs inv-vol vs enhanced |
 | Dry-run | `KIS_DRY_RUN=true` | Simulate instant fills; logs `DRY_RUN` in `trade_log.csv` |
 | EOD report | `USE_DAILY_TELEGRAM_REPORT=true` | Telegram summary after 16:00 ET once per session |
 

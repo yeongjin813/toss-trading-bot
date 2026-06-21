@@ -26,6 +26,7 @@ from momentum_selection import (
     summarize_top3_analytics,
     target_allocation_weights,
     target_set_unchanged,
+    use_inverse_vol_weights,
     vol_map_from_ranked,
 )
 from portfolio_backtest import (
@@ -293,7 +294,7 @@ def run_top3_backtest(
                 prices = mark_prices(bar_date)
                 hv = holdings_value(prices)
                 equity = compute_portfolio_equity(cash, hv)
-                use_inverse_vol = cfg.ranking_mode == "enhanced" and cfg.inverse_vol_weighting
+                use_inverse_vol = use_inverse_vol_weights(cfg)
                 weights = target_allocation_weights(
                     target,
                     vol_map_from_ranked(ranked, target),

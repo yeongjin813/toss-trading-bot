@@ -32,6 +32,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 > **Phase 15 (2026-06)** — live-loop hardening: atomic `trading_state.json` writes, fewer disk flushes, and RTH orchestration moved to `watchlist_cycle.py`. See [Phase 15](#phase-15-live-loop-hardening--pipeline-extract-2026-06).
 >
+> **Phase 18 (2026-06)** — Quant feedback triage: walk-forward OOS tooling added; enhanced / inverse-vol / VIX **not** promoted to prod. See [Phase 18](#phase-18-external-quant-feedback--accept--reject-2026-06).
+>
 > **Phase 17 (2026-06)** — Realistic backtest costs + filter validation: **SPY 200MA only** in production; VIX and 3-day entry-confirm kept OFF. See [Phase 17](#phase-17-realistic-costs--validated-regime-policy-2026-06).
 >
 > **Phase 16 (2026-06)** — Enhanced momentum model (FIP / skewness / inverse-vol) researched and backtested; **Legacy kept as production default**. See [Phase 16](#phase-16-enhanced-momentum-research-legacy-retained-2026-06).  
@@ -465,6 +467,32 @@ python scripts/cost_sensitivity.py
 ```
 
 **Reference numbers (legacy $100k, 0.1% + 5 bps, 2020–2026):** SPY-only CAGR ~+10.9%, MaxDD ~14.6%. Dual Phase 4 combined ~+186% total return (see `run_backtest.py --strategy dual`).
+
+### Phase 18: External Quant Feedback — Accept / Reject *(2026-06)*
+
+Review of common quant upgrade suggestions against **existing code + fresh backtests**. Order engine, KIS, Telegram, reconciliation **unchanged**.
+
+| Suggestion | Verdict | Notes |
+|---|---|---|
+| Multi-period momentum | **Already in prod** | Legacy Top3: 63/126/252 + volume composite |
+| FIP / skewness / composite ranking | **Research only** | `enhanced` mode; Phase 16: worse CAGR/Sharpe vs legacy |
+| Inverse-vol Top3 weights | **Research only** | Re-tested 2020–26: equal +18.5% CAGR / 0.79 Sharpe vs inv-vol +15.8% / 0.75 |
+| VIX regime gate | **Rejected (prod)** | Phase 17: hurt MaxDD and CAGR |
+| Walk-forward (train → test) | **Added** | `walk_forward_research.py`, `scripts/walk_forward_momentum.py` |
+| RSI/SMA signal overhaul | **Deferred** | No validated alpha lift; high regression risk |
+| Risk parity | **Deferred** | Inverse-vol slice underperformed equal weight on Top3 |
+
+**Rolling OOS (6 folds, Top3 $40k):** train-picked winner mean Sharpe **0.87** vs always-legacy **0.84** — insufficient to change live policy.
+
+**New research commands:**
+
+```powershell
+python scripts/walk_forward_momentum.py --yfinance --cash 40000 --slippage-bps 5
+python scripts/compare_momentum_ranking.py --yfinance --walk-forward
+python -m pytest test_walk_forward_research.py -q
+```
+
+**Production unchanged:** Legacy ranking + **equal-weight Top3** + SPY/QQQ/golden-cross regime (no VIX).
 
 | Upgrade | Module | Summary |
 |---|---|---|

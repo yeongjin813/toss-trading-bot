@@ -35,6 +35,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated tickers (default: WATCHLIST env or built-in sample)",
     )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Rolling train/test OOS folds (legacy equal vs inv-vol vs enhanced)",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +93,30 @@ def main() -> int:
     if len(loaded) < 3:
         print("Need at least 3 tickers with OHLCV data.")
         return 1
+
+    if args.walk_forward:
+        if not args.yfinance:
+            print("--walk-forward requires --yfinance.")
+            return 1
+        from walk_forward_research import ROLLING_OOS_FOLDS, print_oos_summary_table, run_rolling_oos_fold
+
+        print(f"Tickers ({len(loaded)}): {', '.join(loaded)}")
+        print(f"Capital: ${args.cash:,.2f} | Rolling OOS folds: {len(ROLLING_OOS_FOLDS)}")
+        print()
+        rows = []
+        for fold in ROLLING_OOS_FOLDS:
+            row = run_rolling_oos_fold(
+                loaded,
+                ohlcv,
+                fold,
+                initial_cash=args.cash,
+                commission_rate=args.commission,
+                slippage_bps=float(os.getenv("SLIPPAGE_BPS", "5")),
+            )
+            rows.append(row)
+        print()
+        print_oos_summary_table(rows)
+        return 0
 
     base = _base_settings()
     legacy_cfg = replace(base, ranking_mode="legacy", dynamic_rebalance_only=False, inverse_vol_weighting=False)
