@@ -56,6 +56,9 @@ class MomentumRankSettings:
     weight_skew_penalty: float = 1.0
     dynamic_rebalance_only: bool = True
     inverse_vol_weighting: bool = True
+    require_tsm: bool = False
+    tsm_lookback: int = TRADING_DAYS_12M
+    tsm_min_return: float = 0.0
 
     @classmethod
     def from_env(cls) -> MomentumRankSettings:
@@ -87,6 +90,9 @@ class MomentumRankSettings:
             weight_skew_penalty=float(os.getenv("MOMENTUM_WEIGHT_SKEW_PENALTY", "1.0")),
             dynamic_rebalance_only=_flag("MOMENTUM_DYNAMIC_REBALANCE", "true"),
             inverse_vol_weighting=_flag("MOMENTUM_INVERSE_VOL_WEIGHT", "true"),
+            require_tsm=_flag("USE_TSM_TOP3_FILTER", "false"),
+            tsm_lookback=int(os.getenv("TSM_LOOKBACK_DAYS", str(TRADING_DAYS_12M))),
+            tsm_min_return=float(os.getenv("TSM_MIN_RETURN", "0")),
         )
 
     def for_top3(self) -> MomentumRankSettings:
@@ -243,6 +249,15 @@ def compute_ticker_momentum(
     if ret_3m is None or ret_6m is None or ret_12m is None:
         return None
 
+    if cfg.require_tsm:
+        tsm_ret = (
+            ret_12m
+            if cfg.tsm_lookback == TRADING_DAYS_12M
+            else _period_return(closes, cfg.tsm_lookback)
+        )
+        if tsm_ret is None or tsm_ret <= cfg.tsm_min_return:
+            return None
+
     from momentum_selection import daily_returns, historical_volatility
 
     returns = daily_returns(closes)
@@ -304,6 +319,14 @@ def _enhanced_raw_factors(
         above_sma50=above_sma50,
         above_sma200=above_sma200,
     )
+    if row is None:
+        return None
+    if settings.require_tsm:
+        tsm_ret = row.get("ret_252") if settings.tsm_lookback == TRADING_DAYS_12M else _period_return(
+            closes, settings.tsm_lookback
+        )
+        if tsm_ret is None or tsm_ret <= settings.tsm_min_return:
+            return None
     return row
 
 

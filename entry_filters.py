@@ -98,4 +98,16 @@ def passes_entry_filters(
         proximity_pct=float(cfg.get("near_52w_high_pct", 0.05)),
     ):
         return False, "not near 52-week high"
+    if cfg.get("tsm_gate"):
+        from config import StrategyConfigMapper
+        from tsm_filter import passes_tsm_gate
+
+        ok, reason = passes_tsm_gate(
+            df,
+            as_of_date,
+            lookback=int(cfg.get("tsm_lookback", StrategyConfigMapper.tsm_lookback_days())),
+            min_return=float(cfg.get("tsm_min_return", StrategyConfigMapper.tsm_min_return())),
+        )
+        if not ok:
+            return False, reason or "TSM gate blocked"
     return True, None

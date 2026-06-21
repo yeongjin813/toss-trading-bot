@@ -237,6 +237,34 @@ class StrategyConfigMapper:
         }
 
     @classmethod
+    def use_tsm_entry_gate(cls) -> bool:
+        """Legacy new-BUY: require positive lookback return (absolute momentum). Default OFF."""
+        return os.getenv("USE_TSM_ENTRY_GATE", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @classmethod
+    def use_tsm_top3_filter(cls) -> bool:
+        """Top3 rank pool: exclude names failing absolute momentum. Default OFF."""
+        return os.getenv("USE_TSM_TOP3_FILTER", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @classmethod
+    def tsm_lookback_days(cls) -> int:
+        return max(20, int(os.getenv("TSM_LOOKBACK_DAYS", "252")))
+
+    @classmethod
+    def tsm_min_return(cls) -> float:
+        return float(os.getenv("TSM_MIN_RETURN", "0"))
+
+    @classmethod
     def resolve_regime(cls, ticker: str) -> TickerConfig:
         normalized = ticker.strip().upper()
         return cls._EXPLICIT.get(normalized, cls._DEFAULT)

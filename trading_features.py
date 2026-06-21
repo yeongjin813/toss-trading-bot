@@ -55,11 +55,16 @@ class TradingFeatureFlags:
         )
 
     def entry_filter_settings(self) -> dict[str, bool | float | int]:
+        from config import StrategyConfigMapper
+
         return {
             "weekly_trend": self.use_weekly_trend_filter,
             "weekly_sma_period": self.weekly_trend_sma_period,
             "near_52w_high": self.use_52w_high_filter,
             "near_52w_high_pct": self.near_52w_high_pct,
+            "tsm_gate": StrategyConfigMapper.use_tsm_entry_gate(),
+            "tsm_lookback": StrategyConfigMapper.tsm_lookback_days(),
+            "tsm_min_return": StrategyConfigMapper.tsm_min_return(),
         }
 
 

@@ -34,6 +34,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 >
 > **Phase 19 (2026-06)** — Dual capital split **70/30** (Legacy/Top3) after 2020–2026 sweep; beats 60/40 on return, Sharpe, MaxDD. See [Phase 19](#phase-19-dual-capital-split-7030-2026-06).
 >
+> **Phase 20 (2026-06)** — TSM (absolute momentum) gates tested; **OFF in prod** — baseline wins full-period and OOS. See [Phase 20](#phase-20-tsm-absolute-momentum-gates-2026-06).
+>
 > **Phase 18 (2026-06)** — Quant feedback triage: walk-forward OOS tooling added; enhanced / inverse-vol / VIX **not** promoted to prod. See [Phase 18](#phase-18-external-quant-feedback--accept--reject-2026-06).
 >
 > **Phase 17 (2026-06)** — Realistic backtest costs + filter validation: **SPY 200MA only** in production; VIX and 3-day entry-confirm kept OFF. See [Phase 17](#phase-17-realistic-costs--validated-regime-policy-2026-06).
