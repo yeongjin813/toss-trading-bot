@@ -126,6 +126,7 @@ def run_overdeployment_trim_if_needed(
         print("[TRIM] Trim already submitted today — skipping")
         return states, ledger
 
+    submitted: list[TrimOrder] = []
     for order in trims:
         try:
             payload = deps.execute_broker_order(
@@ -135,6 +136,8 @@ def run_overdeployment_trim_if_needed(
                 order.shares,
                 order.reference_price,
             )
+            if payload.get("skipped"):
+                continue
             odno = extract_order_odno(payload) or ""
             deps.trade_log.append(
                 {
@@ -152,6 +155,7 @@ def run_overdeployment_trim_if_needed(
                     ),
                 }
             )
+            submitted.append(order)
         except Exception as exc:
             logger.error(
                 "[TRIM/ERROR] %s SELL %s failed: %s",
@@ -160,6 +164,10 @@ def run_overdeployment_trim_if_needed(
                 exc,
                 exc_info=True,
             )
+
+    if not submitted:
+        print("[TRIM] No orders accepted by broker — will retry on next RTH cycle")
+        return states, ledger
 
     portfolio["last_overdeployment_trim_date"] = today
     states, ledger = deps.run_session_reconciliation(
@@ -175,7 +183,7 @@ def run_overdeployment_trim_if_needed(
     )
     save_persisted_states(states)
 
-    summary = ", ".join(f"SELL {o.shares} {o.ticker}" for o in trims)
+    summary = ", ".join(f"SELL {o.shares} {o.ticker}" for o in submitted)
     print(f"[TRIM] Submitted: {summary}")
     if deps.telegram_enabled():
         deps.run_telegram(
