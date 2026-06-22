@@ -547,12 +547,15 @@ class PortfolioReconciliationEngine:
                 last_reconciled_at=timestamp,
                 last_report=report,
             )
-            states["_portfolio"] = {
-                "broker_cash_usd": broker_cash,
-                "available_cash_usd": available_cash,
-                "last_reconciled_at": timestamp,
-                "broker_holdings": broker_holdings,
-            }
+            portfolio = states.setdefault("_portfolio", {})
+            portfolio.update(
+                {
+                    "broker_cash_usd": broker_cash,
+                    "available_cash_usd": available_cash,
+                    "last_reconciled_at": timestamp,
+                    "broker_holdings": broker_holdings,
+                }
+            )
             return states, ledger, report
 
         except Exception as exc:
