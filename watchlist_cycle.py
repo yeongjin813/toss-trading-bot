@@ -140,20 +140,17 @@ def run_overdeployment_trim_if_needed(
                 continue
             odno = extract_order_odno(payload) or ""
             deps.trade_log.append(
-                {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "ticker": order.ticker,
-                    "signal": "SELL",
-                    "qty": order.shares,
-                    "order_price": order.reference_price,
-                    "fill_price": "",
-                    "status": "ACCEPTED",
-                    "reason": f"overdeploy_trim odno={odno}",
-                    "cash_after": ledger.available_cash_usd,
-                    "held_qty": int(
-                        states.get(order.ticker, {}).get("held_quantity", 0) or 0
-                    ),
-                }
+                ticker=order.ticker,
+                signal="SELL",
+                qty=order.shares,
+                order_price=order.reference_price,
+                fill_price=None,
+                status="ACCEPTED",
+                reason=f"overdeploy_trim odno={odno}",
+                cash_after=ledger.available_cash_usd,
+                held_qty=int(
+                    states.get(order.ticker, {}).get("held_quantity", 0) or 0
+                ),
             )
             submitted.append(order)
         except Exception as exc:
@@ -266,18 +263,17 @@ def run_top3_shadow_cycle(
                     if held <= order.shares:
                         release_ownership(states, order.ticker)
                 deps.trade_log.append(
-                    {
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "ticker": order.ticker,
-                        "signal": side,
-                        "qty": order.shares,
-                        "order_price": order.reference_price,
-                        "fill_price": "",
-                        "status": "ACCEPTED",
-                        "reason": f"top3 odno={odno}",
-                        "cash_after": ledger.available_cash_usd,
-                        "held_qty": 0,
-                    }
+                    ticker=order.ticker,
+                    signal=side,
+                    qty=order.shares,
+                    order_price=order.reference_price,
+                    fill_price=None,
+                    status="ACCEPTED",
+                    reason=f"top3 odno={odno}",
+                    cash_after=ledger.available_cash_usd,
+                    held_qty=int(
+                        states.get(order.ticker, {}).get("held_quantity", 0) or 0
+                    ),
                 )
             except Exception as exc:
                 logger.error(
