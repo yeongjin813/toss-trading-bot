@@ -16,6 +16,15 @@ def test_default_is_vts(monkeypatch: pytest.MonkeyPatch) -> None:
     assert env.is_vts is True
     assert env.base_url == KIS_VTS_BASE_URL
     assert env.tr_id_us_buy.startswith("VTT")
+    assert env.tr_id_us_sell == "VTTT1001U"
+
+
+def test_live_sell_tr_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KIS_ENVIRONMENT", "live")
+    monkeypatch.setenv("KIS_LIVE_CONFIRMED", "true")
+    monkeypatch.delenv("KIS_BASE_URL", raising=False)
+    env = load_kis_environment()
+    assert env.tr_id_us_sell == "TTTT1006U"
 
 
 def test_vts_label_with_live_url_raises(monkeypatch: pytest.MonkeyPatch) -> None:

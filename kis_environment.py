@@ -73,6 +73,8 @@ def load_kis_environment() -> KISEnvironment:
 
     prefix = "VTT" if is_vts else "TTT"
     order_default = "limit" if is_vts else "market"
+    # VTS overseas SELL uses VTTT1001U (not T1006U); live uses TTTT1006U.
+    tr_id_us_sell = "VTTT1001U" if is_vts else "TTTT1006U"
 
     explicit_order = os.getenv("KIS_ORDER_TYPE", "").strip().lower()
     if explicit_order in {"limit", "market"}:
@@ -83,7 +85,7 @@ def load_kis_environment() -> KISEnvironment:
         is_vts=is_vts,
         environment="vts" if is_vts else "live",
         tr_id_us_buy=f"{prefix}T1002U",
-        tr_id_us_sell=f"{prefix}T1006U",
+        tr_id_us_sell=tr_id_us_sell,
         tr_id_us_ccnl=f"{prefix}S3035R",
         tr_id_us_nccs=f"{prefix}S3018R",
         tr_id_us_cancel=f"{prefix}T1004U",
