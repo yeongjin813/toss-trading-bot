@@ -34,6 +34,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 >
 > **Phase 19 (2026-06)** — Dual capital split **70/30** (Legacy/Top3) after 2020–2026 sweep; beats 60/40 on return, Sharpe, MaxDD. See [Phase 19](#phase-19-dual-capital-split-7030-2026-06).
 >
+> **Phase 21 (2026-06)** — Entry filter ablation: weekly trend / 52w-high / scale-in/out independently tested. **52w-high OFF** lifts CAGR +2.5pp; weekly & scale-out are effectively dead code; scale-in is essential. See [Phase 21](#phase-21-entry-filter-ablation-2026-06).
+>
 > **Phase 20 (2026-06)** — TSM (absolute momentum) gates tested; **OFF in prod** — baseline wins full-period and OOS. See [Phase 20](#phase-20-tsm-absolute-momentum-gates-2026-06).
 >
 > **Phase 18 (2026-06)** — Quant feedback triage: walk-forward OOS tooling added; enhanced / inverse-vol / VIX **not** promoted to prod. See [Phase 18](#phase-18-external-quant-feedback--accept--reject-2026-06).
@@ -513,6 +515,72 @@ python -m pytest test_walk_forward_research.py -q
 
 ```powershell
 python scripts/dual_split_sweep_2020.py --start 2020-01-01 --end 2025-12-31
+```
+
+### Phase 20: TSM Absolute Momentum Gates *(2026-06)*
+
+OSS dual-momentum (**[GEM](https://github.com/alexjansenhome/GEM)**, **[Alesarabandi](https://github.com/Alesarabandi/Quantitative-Momentum-Strategy-Backtesting)**) suggests filtering by **12M return > 0** before cross-sectional picks. Implemented as optional gates (`tsm_filter.py`):
+
+| Gate | Env | Effect |
+|---|---|---|
+| Legacy new BUY | `USE_TSM_ENTRY_GATE` | Block breakout BUY when lookback return ≤ `TSM_MIN_RETURN` |
+| Top3 rank pool | `USE_TSM_TOP3_FILTER` | Exclude names failing TSM before momentum rank |
+
+**Dual 70/30 validation (2020–2026, 0.1%+5bps):**
+
+| Variant | Return | CAGR | Sharpe | MaxDD | Mean OOS Sharpe |
+|---|---|---|---|---|---|
+| **baseline (prod)** | **+217%** | **+21.2%** | **1.32** | **19.0%** | **1.24** |
+| legacy_tsm | +170% | +18.0% | 1.14 | 20.1% | 0.76 |
+| top3_tsm | +215% | +21.1% | 1.31 | 19.0% | 1.23 |
+| both_tsm | +169% | +17.9% | 1.13 | 20.0% | 0.74 |
+
+**Decision:** keep **`USE_TSM_ENTRY_GATE=false`**, **`USE_TSM_TOP3_FILTER=false`**. Legacy TSM cut winners; Top3 TSM ≈ no change.
+
+```powershell
+python scripts/tsm_validation.py
+python -m pytest test_tsm_filter.py -q
+```
+
+### Phase 21: Entry Filter Ablation *(2026-06)*
+
+Each filter toggled independently vs prod baseline (all ON), Dual 70/30, 2020–2025, 0.1%+5bps.
+
+**Full-period results:**
+
+| Scenario | Return | CAGR | Sharpe | MaxDD | CAGR/MaxDD |
+|---|---|---|---|---|---|
+| **baseline (prod)** | +216.9% | +21.2% | 1.32 | 19.0% | **1.12** |
+| **52w=OFF** | **+258.6%** | **+23.7%** | **1.41** | 21.4% | 1.11 |
+| weekly+52w=OFF | +258.3% | +23.7% | 1.40 | 21.5% | 1.10 |
+| 52w pct=3% | +223.8% | +21.6% | 1.29 | 19.5% | 1.11 |
+| 52w pct=8% | +200.7% | +20.1% | 1.27 | 18.4% | 1.10 |
+| scale_in=OFF | +224.6% | +21.7% | 1.18 | 27.6% | **0.78** |
+| weekly=OFF | +216.9% | +21.2% | 1.32 | 19.0% | 1.12 |
+| scale_out=OFF | +216.9% | +21.2% | 1.32 | 19.0% | 1.12 |
+
+**Sub-period Sharpe (2020-21 bull / 2022 bear / 2023-24 bull / 2025-26 transition):**
+
+| Scenario | bull | bear | bull | trans |
+|---|---|---|---|---|
+| baseline | 1.44 | -0.25 | 2.10 | 1.43 |
+| 52w=OFF | 1.47 | -0.17 | 2.27 | 1.36 |
+| scale_in=OFF | 1.45 | **-0.83** | 2.07 | 1.39 |
+
+**Findings:**
+1. **`weekly_trend` filter = dead code** — toggling has zero effect on backtest output. `len(work) < sma_period * 5` fallback returns True for most bars.
+2. **`52w-high` filter costs CAGR** — OFF lifts CAGR +2.5pp and Sharpe +0.09 while MaxDD rises +2.4pp (CAGR/MaxDD flat). Filter blocks early-trend entries without improving bear-market defense.
+3. **`scale_in` is essential** — OFF causes MaxDD +8.65pp, Sharpe -0.14, 2022 Sharpe -0.83. Scale-in smooths entry cost in drawdowns.
+4. **`scale_out` = dead code** — identical results to baseline; likely not triggering in backtest paths.
+
+**Decisions:**
+- `USE_52W_HIGH_FILTER`: **candidate to flip OFF** — CAGR +2.5pp at cost of MaxDD +2.4pp; acceptable if target is total return.
+- `USE_WEEKLY_TREND_FILTER` / `USE_SCALE_OUT`: keep ON but investigate dead-code paths.
+- `USE_SCALE_IN`: **keep ON, never remove**.
+- Prod unchanged until further OOS validation of 52w=OFF.
+
+```powershell
+python scripts/entry_filter_ablation.py
 ```
 
 | Upgrade | Module | Summary |
