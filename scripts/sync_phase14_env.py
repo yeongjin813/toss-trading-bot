@@ -1,4 +1,4 @@
-"""Merge Phase 14 non-secret keys from .env.example into .env (EC2 deploy helper)."""
+"""Merge non-secret prod keys from .env.example into .env (EC2 deploy helper)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -39,6 +39,8 @@ KEYS_TO_SYNC = [
     "USE_TSM_TOP3_FILTER",
     "TSM_LOOKBACK_DAYS",
     "TSM_MIN_RETURN",
+    "MOMENTUM_TOP_N",
+    "MOMENTUM_TOP_N_HOLD_BAND",
 ]
 
 

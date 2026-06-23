@@ -804,6 +804,26 @@ class PortfolioBacktestEngine:
                         continue
                     entry_events.append((series, bar, size_multiplier, None))
 
+            # Persist trailing state for held positions that did NOT trigger an exit.
+            # When fill_at_next_open=True, evaluate_bar runs with mutate_state=False
+            # (a read-only copy), so highest_price_achieved and profit_trail_armed are
+            # never committed back to series.state.  We fix that here so the trail
+            # correctly tracks the running peak across bars.
+            if defer_fills:
+                exiting_series = {id(ev[0]) for ev in exit_events}
+                for ticker in self.watchlist:
+                    ts = self.series_map[ticker]
+                    if ts.shares <= 0 or id(ts) in exiting_series:
+                        continue
+                    tidx = ts.date_to_index.get(bar_date)
+                    if tidx is None or tidx < 1:
+                        continue
+                    tbar = BarSnapshot.from_row(ts.enriched.iloc[tidx])
+                    ts.engine._update_trailing_state(
+                        ts.state, tbar.close, tbar.atr,
+                        atr_regime_multiplier=atr_stop_multiplier,
+                    )
+
             next_date = self._next_trading_date(bar_date) if defer_fills else None
 
             for series, bar, signal, exit_reason, partial_qty in exit_events:
