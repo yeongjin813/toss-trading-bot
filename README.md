@@ -36,6 +36,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 >
 > **Phase 21 (2026-06)** — Entry filter ablation: weekly trend / 52w-high / scale-in/out independently tested. **52w-high OFF** lifts CAGR +2.5pp; weekly & scale-out are effectively dead code; scale-in is essential. See [Phase 21](#phase-21-entry-filter-ablation-2026-06).
 >
+> **Phase 22 (2026-06)** — Top-N sweep (Top2–5) + turnover band sweep (band 0–3). **Top4** beats Top3 (CAGR +0.6pp, Sharpe +0.10, MaxDD -1.1pp). **band=1** reduces trades -88 and MaxDD -0.8pp at no CAGR cost. Both applied to prod defaults. See [Phase 22](#phase-22-top-n--turnover-band-sweep-2026-06).
+>
 > **Phase 20 (2026-06)** — TSM (absolute momentum) gates tested; **OFF in prod** — baseline wins full-period and OOS. See [Phase 20](#phase-20-tsm-absolute-momentum-gates-2026-06).
 >
 > **Phase 18 (2026-06)** — Quant feedback triage: walk-forward OOS tooling added; enhanced / inverse-vol / VIX **not** promoted to prod. See [Phase 18](#phase-18-external-quant-feedback--accept--reject-2026-06).
@@ -574,13 +576,67 @@ Each filter toggled independently vs prod baseline (all ON), Dual 70/30, 2020–
 4. **`scale_out` = dead code** — identical results to baseline; likely not triggering in backtest paths.
 
 **Decisions:**
-- `USE_52W_HIGH_FILTER`: **candidate to flip OFF** — CAGR +2.5pp at cost of MaxDD +2.4pp; acceptable if target is total return.
+- `USE_52W_HIGH_FILTER`: **flipped OFF** — CAGR +2.5pp at cost of MaxDD +2.4pp; Phase 22 retested with this setting confirmed.
 - `USE_WEEKLY_TREND_FILTER` / `USE_SCALE_OUT`: keep ON but investigate dead-code paths.
 - `USE_SCALE_IN`: **keep ON, never remove**.
-- Prod unchanged until further OOS validation of 52w=OFF.
 
 ```powershell
 python scripts/entry_filter_ablation.py
+```
+
+---
+
+### Phase 22: Top-N + Turnover Band Sweep *(2026-06)*
+
+Two independent experiments on the Top3 leg, both run with 52w=OFF (Phase 21 applied).
+
+#### Phase 22a: Top-N Sweep (Top2–Top5 + cash threshold)
+
+Universe sweep with optional `min_momentum_score` cash threshold (exclude negatively-scored tickers).
+
+**Full-period results (Dual 70/30, 2020–2025, 0.1%+5bps):**
+
+| Scenario | CAGR | Sharpe | MaxDD | Trades | vs Top3 |
+|---|---|---|---|---|---|
+| Top2 | +26.4% | 1.29 | 22.1% | 903 | DCAGR +2.35pp, DSharpe -0.02 |
+| **Top3 (prod)** | **+24.1%** | **1.31** | **23.1%** | **1211** | — |
+| **Top4** | **+24.7%** | **1.41** | **22.0%** | **1477** | DCAGR +0.60pp, DSharpe +0.10, DMaxDD -1.11pp |
+| Top5 | +23.7% | 1.41 | 21.4% | 1651 | DCAGR -0.35pp, DSharpe +0.10, DMaxDD -1.69pp |
+| Top3+cash(s>0) | +23.1% | 1.31 | 23.0% | 1171 | DCAGR -0.99pp — cash drag in 2020-21 |
+| Top4+cash(s>0) | +23.8% | 1.40 | 22.0% | 1422 | DCAGR -0.24pp |
+| Top5+cash(s>0.2) | +23.9% | 1.36 | 22.4% | 1456 | DCAGR -0.20pp |
+
+**Findings:**
+- **Top4 is the sweet spot** — CAGR +0.6pp, Sharpe +0.10, MaxDD -1.1pp vs Top3; diversification gain without cash drag.
+- **Top2 wins on CAGR** (+2.35pp) but lowest Sharpe (1.29); too concentrated for bear-market robustness.
+- **Cash threshold (s>0)** hurts 2020-21 bull Sharpe (-0.14~-0.22) without enough bear-year benefit; not adopted.
+
+#### Phase 22b: Turnover Band Sweep (band 0–3)
+
+Hold a ticker if it slips from Top-N but remains in Top-(N+band). Reduces roundtrip costs (~0.3%/trade).
+
+| Scenario | CAGR | Sharpe | MaxDD | Trades | vs band=0 |
+|---|---|---|---|---|---|
+| **band=0 (prod)** | **+24.1%** | **1.31** | **23.1%** | **1211** | — |
+| band=1 (keep if Top4) | +24.3% | 1.32 | 22.3% | 1123 | DCAGR +0.27pp, -88 trades |
+| band=2 (keep if Top5) | +24.4% | 1.32 | 22.3% | 1087 | DCAGR +0.34pp, -124 trades |
+| band=3 (keep if Top6) | +24.5% | 1.35 | 22.3% | 1035 | DCAGR +0.41pp, -176 trades |
+
+**Findings:**
+- Every band > 0 is strictly better: CAGR up, MaxDD down, fewer trades. Improvement monotonically increases with band.
+- **band=1 (keep if Top4)** adopted as conservative default — verified improvement with minimal code complexity.
+
+**Combined production settings applied:**
+
+```
+USE_52W_HIGH_FILTER=false        # Phase 21: +2.5pp CAGR
+MOMENTUM_TOP_N=4                 # Phase 22a: +0.6pp CAGR, +0.10 Sharpe
+MOMENTUM_TOP_N_HOLD_BAND=1       # Phase 22b: -88 trades, MaxDD -0.8pp
+```
+
+```powershell
+python scripts/topn_cash_sweep.py
+python scripts/turnover_band.py
 ```
 
 | Upgrade | Module | Summary |

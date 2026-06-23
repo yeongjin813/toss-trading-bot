@@ -262,16 +262,31 @@ def run_top3_backtest(
                 as_of_date=bar_date,
                 settings=cfg,
             )
+            # Apply min_momentum_score: filter ranked list before selecting target
+            min_score = getattr(cfg, "min_momentum_score", float("-inf"))
+            eligible = (
+                [r for r in ranked if r.score >= min_score]
+                if min_score > float("-inf") else ranked
+            )
+
             if cfg.sector_diversify:
                 target = select_top_tickers_diversified(
-                    ranked,
+                    eligible,
                     top_n=cfg.top_n,
                     max_per_sector=cfg.max_per_sector,
                 )
             else:
-                target = select_top_tickers(ranked, top_n=cfg.top_n)
-            if not target:
+                target = select_top_tickers(eligible, top_n=cfg.top_n)
+            if not target and min_score <= float("-inf"):
                 target = tickers[: cfg.top_n]
+
+            # Hold band: don't exit a ticker still in top (top_n + band)
+            hold_band = getattr(cfg, "top_n_hold_band", 0)
+            if hold_band > 0:
+                extended = select_top_tickers(ranked, top_n=cfg.top_n + hold_band)
+                hold_band_set = set(extended)
+            else:
+                hold_band_set = set(target)
 
             skip_trades = (
                 not first_run
@@ -287,8 +302,9 @@ def run_top3_backtest(
                 equity = compute_portfolio_equity(cash, hv)
 
                 sell_plan: list[tuple[str, int, str]] = []
+                target_set = set(target)
                 for ticker, shares in list(holdings.items()):
-                    if shares > 0 and ticker not in target and ticker in prices:
+                    if shares > 0 and ticker not in target_set and ticker not in hold_band_set and ticker in prices:
                         sell_plan.append((ticker, shares, "TOP3_EXIT"))
 
                 prices = mark_prices(bar_date)

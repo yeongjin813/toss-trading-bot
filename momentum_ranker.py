@@ -26,7 +26,7 @@ SMA_200 = 200
 # Production and dataclass default — do not change without a new backtest + review.
 DEFAULT_RANKING_MODE = "legacy"
 PRODUCTION_RANKING_MODE = "legacy"
-VALID_RANKING_MODES = frozenset({"legacy", "enhanced"})
+VALID_RANKING_MODES = frozenset({"legacy", "enhanced", "fracdiff"})
 
 
 class FrameProvider(Protocol):
@@ -59,6 +59,10 @@ class MomentumRankSettings:
     require_tsm: bool = False
     tsm_lookback: int = TRADING_DAYS_12M
     tsm_min_return: float = 0.0
+    # Turnover band: keep a held ticker if still in top (top_n + top_n_hold_band); 0 = disabled
+    top_n_hold_band: int = 0
+    # Cash threshold: exclude tickers with raw score below this from target (0 = no filter)
+    min_momentum_score: float = float("-inf")
 
     @classmethod
     def from_env(cls) -> MomentumRankSettings:
@@ -93,6 +97,8 @@ class MomentumRankSettings:
             require_tsm=_flag("USE_TSM_TOP3_FILTER", "false"),
             tsm_lookback=int(os.getenv("TSM_LOOKBACK_DAYS", str(TRADING_DAYS_12M))),
             tsm_min_return=float(os.getenv("TSM_MIN_RETURN", "0")),
+            top_n_hold_band=max(0, int(os.getenv("MOMENTUM_TOP_N_HOLD_BAND", "0"))),
+            min_momentum_score=float(os.getenv("MOMENTUM_MIN_SCORE", str(float("-inf")))),
         )
 
     def for_top3(self) -> MomentumRankSettings:
@@ -243,9 +249,17 @@ def compute_ticker_momentum(
         if close < floor:
             return None
 
-    ret_3m = _period_return(closes, TRADING_DAYS_3M)
-    ret_6m = _period_return(closes, TRADING_DAYS_6M)
-    ret_12m = _period_return(closes, TRADING_DAYS_12M)
+    if cfg.ranking_mode == "fracdiff":
+        from fracdiff_momentum import fracdiff_horizon_returns
+
+        ret_3m, ret_6m, ret_12m = fracdiff_horizon_returns(
+            closes,
+            lookbacks=(TRADING_DAYS_3M, TRADING_DAYS_6M, TRADING_DAYS_12M),
+        )
+    else:
+        ret_3m = _period_return(closes, TRADING_DAYS_3M)
+        ret_6m = _period_return(closes, TRADING_DAYS_6M)
+        ret_12m = _period_return(closes, TRADING_DAYS_12M)
     if ret_3m is None or ret_6m is None or ret_12m is None:
         return None
 
