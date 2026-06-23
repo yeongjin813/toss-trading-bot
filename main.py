@@ -140,6 +140,7 @@ TR_ID_US_BUY = KIS_ENV.tr_id_us_buy
 TR_ID_US_SELL = KIS_ENV.tr_id_us_sell
 TR_ID_DAILY_PRICE = "HHDFS76240000"
 TR_ID_US_PRESENT_BALANCE = "VTRP6504R"
+TR_ID_US_INQUIRE_BALANCE = KIS_ENV.tr_id_us_balance
 TR_ID_US_CCNL = KIS_ENV.tr_id_us_ccnl
 TR_ID_US_NCCS = KIS_ENV.tr_id_us_nccs
 TR_ID_US_CANCEL = KIS_ENV.tr_id_us_cancel
@@ -149,6 +150,7 @@ HASHKEY_PATH = "/uapi/hashkey"
 DAILY_PRICE_PATH = "/uapi/overseas-price/v1/quotations/dailyprice"
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 PRESENT_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
+INQUIRE_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 INQUIRE_CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 INQUIRE_NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 ORDER_RVSECNCL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
@@ -789,6 +791,28 @@ class KISApiClient:
             params=params,
             label="present-balance",
             error_prefix="Present balance API error",
+        )
+
+    def fetch_overseas_inquire_balance(
+        self,
+        ovrs_excg_cd: str,
+        tr_crcy_cd: str = "USD",
+    ) -> dict[str, Any]:
+        """Fetch overseas equity holdings via inquire-balance (ovrs_cblc_qty)."""
+        params = {
+            "CANO": CANO,
+            "ACNT_PRDT_CD": ACNT_PRDT_CD,
+            "OVRS_EXCG_CD": ovrs_excg_cd,
+            "TR_CRCY_CD": tr_crcy_cd,
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        return self._kis_get_with_retry(
+            path=INQUIRE_BALANCE_PATH,
+            tr_id=TR_ID_US_INQUIRE_BALANCE,
+            params=params,
+            label=f"inquire-balance:{ovrs_excg_cd}",
+            error_prefix="Inquire balance API error",
         )
 
     def fetch_overseas_order_ccnl(

@@ -29,6 +29,7 @@ class KISEnvironment:
     tr_id_us_ccnl: str
     tr_id_us_nccs: str
     tr_id_us_cancel: str
+    tr_id_us_balance: str
     default_order_type: str
 
     def banner_label(self) -> str:
@@ -89,6 +90,7 @@ def load_kis_environment() -> KISEnvironment:
         tr_id_us_ccnl=f"{prefix}S3035R",
         tr_id_us_nccs=f"{prefix}S3018R",
         tr_id_us_cancel=f"{prefix}T1004U",
+        tr_id_us_balance=f"{prefix}S3012R",
         default_order_type=order_default,
     )
 

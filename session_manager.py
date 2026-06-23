@@ -191,10 +191,10 @@ def _parse_broker_holdings(
         "hldg_qty",
         "cblc_qty",
         "ovrs_cblc_qty",
+        "ccld_qty_smtl1",
+        "ord_psbl_qty1",
         "tot_qty",
         "ord_psbl_qty",
-        "ord_psbl_qty1",
-        "ccld_qty_smtl1",
     )
     symbol_fields = ("ovrs_pdno", "pdno", "symb", "prdt_name")
 
@@ -266,6 +266,86 @@ def _present_balance_qty_unreliable(
     return any(isinstance(row, dict) and row.get("pdno") for row in rows)
 
 
+def _parse_inquire_balance_holdings(
+    payload: dict[str, Any],
+    watchlist: list[str],
+) -> dict[str, int]:
+    """Parse inquire-balance output1 rows (ovrs_cblc_qty is authoritative on VTS)."""
+    holdings: dict[str, int] = {ticker: 0 for ticker in watchlist}
+    watchset = set(watchlist)
+    rows = payload.get("output1") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return holdings
+
+    symbol_fields = ("ovrs_pdno", "pdno", "symb")
+    qty_fields = ("ovrs_cblc_qty", "hldg_qty", "ord_psbl_qty", "cblc_qty13")
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = None
+        for field_name in symbol_fields:
+            raw = row.get(field_name)
+            if raw:
+                symbol = str(raw).strip().upper()
+                break
+        if not symbol or symbol not in watchset:
+            continue
+
+        quantity = 0
+        for field_name in qty_fields:
+            raw = row.get(field_name)
+            if raw in (None, ""):
+                continue
+            try:
+                quantity = int(float(str(raw).replace(",", "")))
+                break
+            except (TypeError, ValueError):
+                continue
+
+        holdings[symbol] = max(holdings.get(symbol, 0), max(quantity, 0))
+
+    return holdings
+
+
+def _inquire_balance_exchanges() -> tuple[str, ...]:
+    """VTS mock requires per-exchange queries; live NASD covers all US listings."""
+    from kis_environment import load_kis_environment
+
+    if load_kis_environment().is_vts:
+        return ("NASD", "NYSE", "AMEX")
+    return ("NASD",)
+
+
+def _holdings_from_inquire_balance(
+    client: Any,
+    watchlist: list[str],
+) -> dict[str, int]:
+    """Aggregate overseas holdings from inquire-balance across exchange buckets."""
+    holdings: dict[str, int] = {ticker: 0 for ticker in watchlist}
+    if not hasattr(client, "fetch_overseas_inquire_balance"):
+        return holdings
+
+    for exchange in _inquire_balance_exchanges():
+        try:
+            payload = client.fetch_overseas_inquire_balance(ovrs_excg_cd=exchange)
+        except Exception as exc:
+            logger.warning(
+                "[RECONCILE/BALANCE-FB] inquire-balance %s failed: %s",
+                exchange,
+                exc,
+                exc_info=True,
+            )
+            continue
+        parsed = _parse_inquire_balance_holdings(payload, watchlist)
+        for ticker, qty in parsed.items():
+            holdings[ticker] = max(holdings[ticker], qty)
+
+    return holdings
+
+
 def _holdings_from_ccnl(
     client: Any,
     watchlist: list[str],
@@ -331,13 +411,21 @@ def resolve_broker_holdings(
 
     broker_holdings = _parse_broker_holdings(payload, watchlist)
     if _present_balance_qty_unreliable(payload, broker_holdings):
-        ccnl_holdings = _holdings_from_ccnl(client, watchlist)
-        if sum(ccnl_holdings.values()) > 0:
+        balance_holdings = _holdings_from_inquire_balance(client, watchlist)
+        if sum(balance_holdings.values()) > 0:
             print(
-                "[RECONCILE/CCNL-FB] present-balance qty empty — "
-                "using ccnl fill aggregation"
+                "[RECONCILE/BALANCE-FB] present-balance qty empty — "
+                "using inquire-balance (ovrs_cblc_qty)"
             )
-            broker_holdings = ccnl_holdings
+            broker_holdings = balance_holdings
+        else:
+            ccnl_holdings = _holdings_from_ccnl(client, watchlist)
+            if sum(ccnl_holdings.values()) > 0:
+                print(
+                    "[RECONCILE/CCNL-FB] present-balance qty empty — "
+                    "using ccnl fill aggregation"
+                )
+                broker_holdings = ccnl_holdings
 
     return broker_holdings
 
