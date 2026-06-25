@@ -8,7 +8,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM / DEFAULT (all `breakout`) |
 | **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top3 momentum rebalance (separate sizing pools) |
 | **Universe Filter** | Legacy: full watchlist signals · Top3: equal-weight Top-3, Friday rebalance (`top3_strategy.py`) |
-| **Regime Filter** | **Validated:** SPY 200MA + QQQ half-size + golden cross — **VIX / entry-confirm OFF** (2020–26 backtest) |
+| **Regime Filter** | **Validated:** SPY 200MA + QQQ half-size — **golden cross OFF (Phase 25)**, VIX / entry-confirm OFF (2020–25 backtest) |
 | **Watchlist Matrix** | **25 US names** — 15 tech core + 10 non-tech diversification (LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT); configurable via `.env` `WATCHLIST`; sector tags + KIS routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
 | **Account** | Set in `.env` — `KIS_CANO`, `KIS_ACNT_PRDT_CD` (never commit) |
@@ -37,6 +37,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 > **Phase 21 (2026-06)** — Entry filter ablation: weekly trend / 52w-high / scale-in/out independently tested. **52w-high OFF** lifts CAGR +2.5pp; weekly & scale-out are effectively dead code; scale-in is essential. See [Phase 21](#phase-21-entry-filter-ablation-2026-06).
 >
 > **Phase 22 (2026-06)** — Top-N sweep (Top2–5) + turnover band sweep (band 0–3). **Top4** beats Top3 (CAGR +0.6pp, Sharpe +0.10, MaxDD -1.1pp). **band=1** reduces trades -88 and MaxDD -0.8pp at no CAGR cost. Both applied to prod defaults. See [Phase 22](#phase-22-top-n--turnover-band-sweep-2026-06).
+>
+> **Phase 25 (2026-06)** — Regime golden-cross ablation. **`USE_REGIME_GOLDEN_CROSS=false` adopted**: +0.66pp full CAGR, +0.42pp OOS CAGR, MaxDD -0.61pp, bear2022 unchanged. `REGIME_CAUTIOUS_MAX_POSITIONS=3` has zero effect -- prod stays at 2. See [Phase 25](#phase-25-regime-golden-cross-ablation-2026-06).
 >
 > **Phase 24 (2026-06)** — Aggressive vs Prod comparison (3 configs). **Config C (Semi-aggressive)** is best OOS MAR: +1.93pp full CAGR, +2.51pp OOS CAGR, bear2022 unchanged. Config B (Aggressive) collapses in bear2022 (-12.0%, Sharpe -1.32). See [Phase 24](#phase-24-aggressive-vs-prod-comparison-2026-06).
 >
@@ -641,6 +643,58 @@ MOMENTUM_TOP_N_HOLD_BAND=1       # Phase 22b: -88 trades, MaxDD -0.8pp
 ```powershell
 python scripts/topn_cash_sweep.py
 python scripts/turnover_band.py
+```
+
+---
+
+### Phase 25: Regime Golden-Cross Ablation *(2026-06)*
+
+Focused ablation to isolate the effect of `USE_REGIME_GOLDEN_CROSS` on strategy performance.
+Phase 24 showed Config C beats prod by +1.9pp CAGR (multiple changes). Phase 25 isolates the single variable.
+All other settings identical to current prod: `USE_52W_HIGH_FILTER=false`, `MOMENTUM_TOP_N=4`, `MOMENTUM_TOP_N_HOLD_BAND=1`, dual 70/30, `use_vol_adjusted_risk=True`.
+
+#### Scenarios Tested
+
+| Config | golden_cross | cautious_max | Full CAGR | Sharpe | MaxDD | C/D | Trades | IS CAGR | OOS CAGR | OOS Sh |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **prod-baseline** | ON | 2 | +17.8% | 1.14 | 19.8% | 0.90 | 2494 | +13.3% | +22.8% | 1.35 |
+| **golden_cross=OFF** | OFF | 2 | **+18.5%** | **1.16** | **19.2%** | **0.96** | 2461 | +14.1% | **+23.2%** | **1.36** |
+| cautious_max=3 | ON | 3 | +17.8% | 1.14 | 19.8% | 0.90 | 2494 | +13.3% | +22.8% | 1.35 |
+| both (OFF+max3) | OFF | 3 | +18.5% | 1.16 | 19.2% | 0.96 | 2461 | +14.1% | +23.2% | 1.36 |
+
+#### Delta vs Prod Baseline
+
+| Config | Full DCAGR | DSharpe | DMaxDD | DIS | DOOS | DOOS Sh | DTrades | bear2022 DSharpe |
+|---|---|---|---|---|---|---|---|---|
+| golden_cross=OFF | **+0.66pp** | +0.02 | **-0.61pp** | +0.87pp | **+0.42pp** | +0.00 | -33 | **0.00** |
+| cautious_max=3 | 0.00pp | 0.00 | 0.00pp | 0.00pp | 0.00pp | 0.00 | 0 | 0.00 |
+| both (OFF+max3) | **+0.66pp** | +0.02 | **-0.61pp** | +0.87pp | **+0.42pp** | +0.00 | -33 | **0.00** |
+
+#### Sub-Period Detail (Critical: bear2022)
+
+| Period | prod-baseline | golden_cross=OFF | cautious_max=3 | both |
+|---|---|---|---|---|
+| bull20-21 CAGR | +26.5% | +27.9% | +26.5% | +27.9% |
+| **bear2022 CAGR** | **-9.4%** | **-9.2%** | **-9.4%** | **-9.2%** |
+| bear2022 Sharpe | -0.99 | **-0.99** | -0.99 | **-0.99** |
+| bear2022 MaxDD | 13.3% | 13.0% | 13.3% | 13.0% |
+| bull23-24 CAGR | +32.0% | +31.2% | +32.0% | +31.2% |
+| trans2025 CAGR | +6.2% | **+8.7%** | +6.2% | **+8.7%** |
+| trans2025 Sharpe | 0.45 | **0.58** | 0.45 | **0.58** |
+
+#### Key Findings
+
+1. **`USE_REGIME_GOLDEN_CROSS=false` ADOPTED**: +0.66pp full CAGR, +0.42pp OOS CAGR, MaxDD shrinks -0.61pp. bear2022 Sharpe completely unchanged (-0.99 both). The golden cross requirement was over-filtering entries in sideways/uncertain markets (especially trans2025: Sharpe +0.13).
+2. **`REGIME_CAUTIOUS_MAX_POSITIONS=3` has ZERO effect**: Changing from 2 to 3 produces identical results to the fraction of a basis point. The cautious regime is either rarely triggered or the system never attempts to hold more than 2 positions while in cautious mode. `REGIME_CAUTIOUS_MAX_POSITIONS` stays at 2.
+3. **Isolating the Phase 24 Config C gain**: The entire +0.66pp CAGR of Phase 24 Config C attributable to this single flag (golden_cross=OFF). Other Config C changes (RSI/vol relaxation, cautious_max=3) contribute negligibly or via separate channels.
+4. **Best MAR (full period):** `golden_cross=OFF` = 0.964; **Best OOS MAR:** `golden_cross=OFF` = 1.209.
+
+#### Applied Change
+
+`USE_REGIME_GOLDEN_CROSS=false` set in `.env.example` (Phase 25).
+
+```powershell
+python scripts/golden_cross_ablation.py
 ```
 
 ---
