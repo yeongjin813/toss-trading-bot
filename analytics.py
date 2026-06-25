@@ -1334,13 +1334,17 @@ class LiveSignalEngine:
         dynamic_atr_stop: dict[str, float] | None = None
 
         if self._has_active_position(working_state):
+            # Always advance hold calendar on the caller's state (idempotent per bar_date).
+            self._advance_bars_held(state, bar)
+            working_state.bars_held = state.bars_held
+            working_state.entry_bar_date = state.entry_bar_date
+            working_state.hold_count_bar_date = state.hold_count_bar_date
             if mutate_state:
-                self._advance_bars_held(state, bar)
-                working_state.bars_held = state.bars_held
-                working_state.entry_bar_date = state.entry_bar_date
-                working_state.hold_count_bar_date = state.hold_count_bar_date
-            self._update_trend_exit_counter(state, bar, mutate=True)
-            working_state.days_below_sma_long = state.days_below_sma_long
+                self._update_trend_exit_counter(state, bar, mutate=True)
+                working_state.days_below_sma_long = state.days_below_sma_long
+            else:
+                self._update_trend_exit_counter(working_state, bar, mutate=True)
+                state.days_below_sma_long = working_state.days_below_sma_long
 
             soft_blocked = self._soft_exit_blocked(working_state)
 

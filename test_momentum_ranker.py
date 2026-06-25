@@ -12,6 +12,7 @@ import os
 from momentum_ranker import (
     MomentumRankSettings,
     build_cycle_tickers,
+    hold_band_ticker_set,
     is_new_buy_allowed,
     rank_universe_frames,
     rebalance_active_tickers,
@@ -191,6 +192,24 @@ def test_warn_if_env_enhanced_ignored() -> None:
             os.environ["MOMENTUM_RANKING_MODE"] = prior
 
 
+def test_hold_band_extends_retention_set() -> None:
+    ranked = [
+        type("R", (), {"ticker": t, "score": float(i)})()
+        for i, t in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])
+    ]
+    target = ["AAA", "BBB", "CCC", "DDD"]
+    band = hold_band_ticker_set(
+        ranked,  # type: ignore[arg-type]
+        top_n=4,
+        hold_band=1,
+        target=target,
+    )
+    assert band == {"AAA", "BBB", "CCC", "DDD", "EEE"}
+    assert hold_band_ticker_set(ranked, top_n=4, hold_band=0, target=target) == set(  # type: ignore[arg-type]
+        target
+    )
+
+
 def main() -> int:
     test_rank_universe_prefers_strong_momentum()
     test_build_cycle_tickers_keeps_held_names()
@@ -201,6 +220,7 @@ def main() -> int:
     test_for_production_forces_legacy()
     test_for_live_bot_forces_legacy_ranking()
     test_warn_if_env_enhanced_ignored()
+    test_hold_band_extends_retention_set()
     print("ALL MOMENTUM RANKER TESTS PASSED")
     return 0
 

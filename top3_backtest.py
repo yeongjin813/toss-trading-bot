@@ -17,6 +17,7 @@ from config import StrategyConfigMapper
 from execution_friction import fill_price
 from momentum_ranker import (
     MomentumRankSettings,
+    hold_band_ticker_set,
     rank_universe_frames,
     select_top_tickers,
     select_top_tickers_diversified,
@@ -281,12 +282,12 @@ def run_top3_backtest(
                 target = tickers[: cfg.top_n]
 
             # Hold band: don't exit a ticker still in top (top_n + band)
-            hold_band = getattr(cfg, "top_n_hold_band", 0)
-            if hold_band > 0:
-                extended = select_top_tickers(ranked, top_n=cfg.top_n + hold_band)
-                hold_band_set = set(extended)
-            else:
-                hold_band_set = set(target)
+            hold_band_set = hold_band_ticker_set(
+                ranked,
+                top_n=cfg.top_n,
+                hold_band=getattr(cfg, "top_n_hold_band", 0),
+                target=target,
+            )
 
             skip_trades = (
                 not first_run

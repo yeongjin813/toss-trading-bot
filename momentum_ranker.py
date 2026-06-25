@@ -484,6 +484,19 @@ def select_top_tickers(
     return [row.ticker for row in ranked[:top_n]]
 
 
+def hold_band_ticker_set(
+    ranked: list[MomentumScore],
+    *,
+    top_n: int,
+    hold_band: int,
+    target: list[str] | None = None,
+) -> set[str]:
+    """Tickers that may be held without a Top-N exit (rank top_n + hold_band)."""
+    if hold_band <= 0:
+        return set(target or [])
+    return set(select_top_tickers(ranked, top_n=top_n + hold_band))
+
+
 def select_top_tickers_diversified(
     ranked: list[MomentumScore],
     *,

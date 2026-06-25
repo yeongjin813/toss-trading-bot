@@ -18,6 +18,7 @@ import pandas as pd
 from deployment_config import DeploymentConfig, scaled_capital
 from momentum_ranker import (
     MomentumRankSettings,
+    hold_band_ticker_set,
     rank_universe_cache,
     select_top_tickers,
     select_top_tickers_diversified,
@@ -213,9 +214,22 @@ def compute_top3_rebalance_orders(
     else:
         held_tickers = {t for t, q in shadow.holdings.items() if q > 0}
 
+    target_set = set(target)
+    hold_band_set = hold_band_ticker_set(
+        ranked,
+        top_n=cfg.top_n,
+        hold_band=cfg.top_n_hold_band,
+        target=target,
+    )
+
     for ticker in held_tickers:
         shares = current_shares(ticker)
-        if shares > 0 and ticker not in target and ticker in prices:
+        if (
+            shares > 0
+            and ticker not in target_set
+            and ticker not in hold_band_set
+            and ticker in prices
+        ):
             orders.append(
                 Top3SimulatedOrder(
                     ticker=ticker,
