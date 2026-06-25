@@ -26,6 +26,7 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 15. [Dual-Strategy Deployment Phases](#dual-strategy-deployment-phases)
 16. [Phase 14 — Profit, Risk & Diversified Watchlist](#phase-14--profit-risk--diversified-watchlist)
 17. [Phase 15 — Live-Loop Hardening](#phase-15--live-loop-hardening--pipeline-extract)
+18. [Phases 21–25 — Research-Validated Prod Defaults](#phases-2125--research-validated-prod-defaults)
 
 ---
 
@@ -35,55 +36,34 @@ For strategy math, architecture, and backtest theory, see the [main README](../R
 
 Copy from `.env.example` and fill in KIS credentials. Never commit `.env`.
 
-```ini
-KIS_APP_KEY=your_app_key_here
-KIS_APP_SECRET=your_app_secret_here
-KIS_CANO=your_account_number
-KIS_ACNT_PRDT_CD=01
+**Production defaults (Phases 21–25)** — copy the full file from `.env.example`; key validated flags:
 
-WATCHLIST=AAPL,MSFT,NVDA,META,AMZN,GOOGL,TSLA,AMD,AVGO,NFLX,PLTR,CRWD,TSM,SHOP,UBER,LLY,UNH,JNJ,JPM,V,XOM,COST,WMT,KO,CAT
+```ini
 USE_SPY_MARKET_FILTER=true
 USE_QQQ_REGIME_FILTER=true
-USE_REGIME_GOLDEN_CROSS=true
-USE_VOL_ADJUSTED_RISK=true
-USE_WEEKLY_TREND_FILTER=true
-USE_52W_HIGH_FILTER=true
+USE_REGIME_GOLDEN_CROSS=false      # Phase 25: was true
+USE_52W_HIGH_FILTER=false          # Phase 21: was true
 USE_SCALE_IN=true
+USE_WEEKLY_TREND_FILTER=true
 USE_SCALE_OUT=true
-MAX_POSITIONS_PER_SECTOR=2
-MOMENTUM_SECTOR_DIVERSIFY=true
-MOMENTUM_MAX_PER_SECTOR=1
-PENDING_ORDER_CANCEL_MINUTES=45
-MAX_CONSECUTIVE_LOSS_DAYS=3
-CAPITAL_AT_RISK=100000
-RISK_PER_TRADE=0.01
-LOOP_COOLDOWN_SECONDS=60
-KIS_REQUEST_TIMEOUT_SECONDS=30
-KIS_SLOW_API_MS=3000
-KIS_ORDER_MAX_RETRIES=3
-KIS_ORDER_RETRY_BACKOFF_SECONDS=2.0
-USE_EOD_ATR_STOPS=false
-KIS_ORDER_TYPE=limit
+REGIME_CAUTIOUS_MAX_POSITIONS=2
+ENTRY_CONFIRMATION_DAYS=0
+USE_VIX_REGIME_FILTER=false
+SLIPPAGE_BPS=5
 
-# Dual-strategy Phase 4: Legacy $70k + Top3 $30k on $100k total
+# Dual-strategy Phase 4: Legacy $70k + Top4 $30k on $100k total
 DEPLOYMENT_PHASE=4
 STRATEGY_MODE=dual
 LEGACY_CAPITAL_PCT=70
 TOP3_CAPITAL_PCT=30
 TOP3_DRY_RUN_ENABLED=false
 MOMENTUM_RANK_ENABLED=false
-MOMENTUM_TOP_N=3
+MOMENTUM_TOP_N=4                   # Phase 22: was 3
+MOMENTUM_TOP_N_HOLD_BAND=1         # Phase 22: turnover band
 MAX_DAILY_LOSS_USD=5000
 MAX_OPEN_POSITIONS=5
 MAX_TICKER_EXPOSURE_USD=25000
-
-# Safety & reporting
-KIS_DRY_RUN=false
-USE_DAILY_TELEGRAM_REPORT=true
-
-USE_TELEGRAM_ALERTS=false
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_chat_id_here
+CAPITAL_AT_RISK=100000
 ```
 
 Full variable reference: [README Appendix C](../README.md#appendix-c-configuration-externalization-matrix).
@@ -234,18 +214,19 @@ sudo systemctl status toss-bot
 ```bash
 cd ~/toss-trading-bot
 git fetch origin && git reset --hard origin/main
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt -q
+.venv/bin/python scripts/sync_phase14_env.py
 ```
 
-**Merge Phase 14+17 keys into server `.env`** (if not already present — compare with `.env.example`):
+**Verify prod keys synced** (compare with `.env.example`):
 
 ```bash
-grep -E '^(WATCHLIST|USE_REGIME_GOLDEN_CROSS|USE_VOL_ADJUSTED_RISK|USE_WEEKLY_TREND_FILTER|USE_52W_HIGH_FILTER|USE_SCALE_IN|USE_SCALE_OUT|MAX_POSITIONS_PER_SECTOR|MOMENTUM_SECTOR_DIVERSIFY|SLIPPAGE_BPS|ENTRY_CONFIRMATION_DAYS|USE_VIX_REGIME_FILTER)=' .env
+grep -E '^(USE_REGIME_GOLDEN_CROSS|USE_52W_HIGH_FILTER|MOMENTUM_TOP_N|MOMENTUM_TOP_N_HOLD_BAND|LEGACY_CAPITAL_PCT|TOP3_CAPITAL_PCT|DEPLOYMENT_PHASE|STRATEGY_MODE|ENTRY_CONFIRMATION_DAYS|USE_VIX_REGIME_FILTER|SLIPPAGE_BPS)=' .env
 ```
 
-Ensure `ENTRY_CONFIRMATION_DAYS=0`, `USE_VIX_REGIME_FILTER=false`, `SLIPPAGE_BPS=5` (backtest parity; live limit buffer unchanged).
+Expected: `USE_REGIME_GOLDEN_CROSS=false`, `USE_52W_HIGH_FILTER=false`, `MOMENTUM_TOP_N=4`, `MOMENTUM_TOP_N_HOLD_BAND=1`.
 
-Add or update missing lines from `.env.example`, then:
+Then restart:
 
 ```bash
 sudo systemctl restart toss-bot
@@ -461,7 +442,7 @@ python run_backtest.py --strategy compare --yfinance --start 2024-01-01 --end 20
 1. Phase 2: Top3 total return beats legacy on same window (1Y and 2024–2026).
 2. Phase 4 (production): Set env below; verify startup shows `capital=70/30`, `top3=live-split`, Legacy **$70,000** + Top3 **$30,000** on **$100,000** total.
 
-**Production EC2 defaults (Phase 4 — $100k total):**
+**Production EC2 defaults (Phase 4 + Phases 21–25 — $100k total):**
 
 ```ini
 CAPITAL_AT_RISK=100000
@@ -471,7 +452,11 @@ LEGACY_CAPITAL_PCT=70
 TOP3_CAPITAL_PCT=30
 TOP3_DRY_RUN_ENABLED=false
 MOMENTUM_RANK_ENABLED=false
-MOMENTUM_TOP_N=3
+MOMENTUM_TOP_N=4
+MOMENTUM_TOP_N_HOLD_BAND=1
+USE_REGIME_GOLDEN_CROSS=false
+USE_52W_HIGH_FILTER=false
+USE_SCALE_IN=true
 MAX_DAILY_LOSS_USD=5000
 MAX_TICKER_EXPOSURE_USD=25000
 MAX_OPEN_POSITIONS=5
@@ -601,6 +586,42 @@ CACHE_GC_EVERY_N_CYCLES=60
 ```
 
 Post-RTH the bot calls `finalize_intraday_bars()` before sleeping — commits forming bars to CSV once per session.
+
+---
+
+## Phases 21–25 — Research-Validated Prod Defaults
+
+Summary of backtest-driven changes applied to `.env.example` and EC2 (June 2026). Full detail: [README Phases 21–25](../README.md#phase-21-entry-filter-ablation-2026-06).
+
+| Phase | Change | Effect | Adopted |
+|---|---|---|---|
+| 21 | `USE_52W_HIGH_FILTER=false` | +2.5pp CAGR | Yes |
+| 22 | `MOMENTUM_TOP_N=4`, `MOMENTUM_TOP_N_HOLD_BAND=1` | +0.6pp CAGR, -88 trades | Yes |
+| 23 | OOS validation (2023–25) | No overfitting | Confirmed |
+| 24 | Aggressive vs prod | Config B fails bear2022; Config C gain = golden_cross | Partial |
+| 25 | `USE_REGIME_GOLDEN_CROSS=false` | +0.66pp CAGR, bear2022 unchanged | Yes |
+
+**EC2 deploy one-liner** (after `git push`):
+
+```bash
+cd ~/toss-trading-bot && git fetch origin && git reset --hard origin/main && .venv/bin/pip install -r requirements.txt -q && .venv/bin/python scripts/sync_phase14_env.py && sudo systemctl restart toss-bot && systemctl is-active toss-bot
+```
+
+**Verify after deploy:**
+
+```bash
+grep -E '^(USE_REGIME_GOLDEN_CROSS|USE_52W_HIGH_FILTER|MOMENTUM_TOP_N|MOMENTUM_TOP_N_HOLD_BAND)=' .env
+git log -1 --oneline
+```
+
+**Research scripts** (local only):
+
+```powershell
+python scripts/entry_filter_ablation.py
+python scripts/oos_validation.py
+python scripts/golden_cross_ablation.py
+python scripts/aggressive_sweep.py
+```
 
 ---
 

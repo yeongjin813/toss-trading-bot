@@ -4,10 +4,10 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 | Field | Value |
 |---|---|
-| **System Status** | **Phase 4 live** — Legacy 70% + Top3 30% on **$100,000** total (`CAPITAL_AT_RISK`) |
+| **System Status** | **Phase 4 live** — Legacy 70% + **Top4** 30% on **$100,000** total (`CAPITAL_AT_RISK`) |
 | **Config Architecture** | `config.py` → `StrategyConfigMapper.for_ticker()` — MEGA / HIGH_BETA / MOMENTUM / DEFAULT (all `breakout`) |
-| **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top3 momentum rebalance (separate sizing pools) |
-| **Universe Filter** | Legacy: full watchlist signals · Top3: equal-weight Top-3, Friday rebalance (`top3_strategy.py`) |
+| **Dual Strategy** | `deployment_config.py` — Legacy signal engine + Top4 momentum rebalance (separate sizing pools) |
+| **Universe Filter** | Legacy: full watchlist signals · Top4: equal-weight Top-4, Friday rebalance, band=1 (`top3_strategy.py`) |
 | **Regime Filter** | **Validated:** SPY 200MA + QQQ half-size — **golden cross OFF (Phase 25)**, VIX / entry-confirm OFF (2020–25 backtest) |
 | **Watchlist Matrix** | **25 US names** — 15 tech core + 10 non-tech diversification (LLY, UNH, JNJ, JPM, V, XOM, COST, WMT, KO, CAT); configurable via `.env` `WATCHLIST`; sector tags + KIS routing in `market_registry.py` |
 | **Broker Gateway** | Korea Investment & Securities (KIS) OpenAPI (VTS sandbox) |
@@ -26,7 +26,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Base URL (VTS Mock):** `https://openapivts.koreainvestment.com:29443`
 
-**Latest production commits:** Watchlist pipeline extract · `a973468` · Atomic state persistence · `a102044` · Phase 14 + 25-ticker watchlist · `497b9a2`
+**Latest production commits:** Phase 25 golden_cross=OFF · `e6f1b8d` · hold-band live parity · `2ce4bde` · Phase 22 Top4+band=1 · `9cda982`
 
 ---
 
@@ -52,6 +52,26 @@ An automated, production-grade quantitative trading infrastructure and empirical
 >
 > **Phase 16 (2026-06)** — Enhanced momentum model (FIP / skewness / inverse-vol) researched and backtested; **Legacy kept as production default**. See [Phase 16](#phase-16-enhanced-momentum-research-legacy-retained-2026-06).  
 > **Phase 14 (2026-06)** — profit/risk parity + **25-ticker** universe. See rows **14.x** and [Phase 14](#phase-14-profit-risk-parity--diversified-universe-2026-06) before [Live System Flow](#live-system-flow).
+
+### Current Production Config *(Phases 21–25, applied to `.env.example` + EC2)*
+
+| Setting | Value | Why |
+|---|---|---|
+| `USE_52W_HIGH_FILTER` | **false** | Phase 21: +2.5pp CAGR; blocks early-trend entries |
+| `MOMENTUM_TOP_N` | **4** | Phase 22: +0.6pp CAGR vs Top3 |
+| `MOMENTUM_TOP_N_HOLD_BAND` | **1** | Phase 22: keep if still in Top5; -88 trades |
+| `USE_REGIME_GOLDEN_CROSS` | **false** | Phase 25: +0.66pp CAGR; bear2022 unchanged |
+| `USE_SCALE_IN` | **true** | Phase 21: essential for MaxDD control |
+| `USE_WEEKLY_TREND_FILTER` | true | kept (dead code in backtest; no harm) |
+| `USE_SCALE_OUT` | true | kept (dead code in backtest; no harm) |
+| `REGIME_CAUTIOUS_MAX_POSITIONS` | 2 | Phase 25: 3 has zero effect |
+| `LEGACY_CAPITAL_PCT` / `TOP3_CAPITAL_PCT` | 70 / 30 | Phase 19 validated split |
+| `ENTRY_CONFIRMATION_DAYS` | 0 | Phase 17: do not enable |
+| `USE_VIX_REGIME_FILTER` | false | Phase 17: do not enable |
+
+**Not adopted (tested, rejected or deferred):** TSM gates (Ph20), cash threshold (Ph22), Config B aggressive (Ph24), RSI/vol relaxation (Ph24 Config C remainder).
+
+**Research scripts:** `scripts/entry_filter_ablation.py`, `scripts/oos_validation.py`, `scripts/golden_cross_ablation.py`, `scripts/aggressive_sweep.py`
 
 ## Documentation Map
 
@@ -408,7 +428,7 @@ python run_backtest.py --strategy dual --yfinance
 python scripts/compare_watchlist.py
 ```
 
-**Recommended `.env` (Phase 4 + Phase 14 + 17):** copy from `.env.example` — includes `SLIPPAGE_BPS=5` (backtest), `ENTRY_CONFIRMATION_DAYS=0`, `USE_VIX_REGIME_FILTER=false`, `USE_REGIME_GOLDEN_CROSS`, `USE_VOL_ADJUSTED_RISK`, `USE_WEEKLY_TREND_FILTER`, `USE_52W_HIGH_FILTER`, `USE_SCALE_IN`, `USE_SCALE_OUT`, `MAX_POSITIONS_PER_SECTOR=2`, `MOMENTUM_SECTOR_DIVERSIFY=true`, and the 25-ticker `WATCHLIST`.
+**Recommended `.env` (Phase 4 + Phase 14 + 17 + 21–25):** copy from `.env.example` — includes `USE_52W_HIGH_FILTER=false`, `USE_REGIME_GOLDEN_CROSS=false`, `MOMENTUM_TOP_N=4`, `MOMENTUM_TOP_N_HOLD_BAND=1`, `SLIPPAGE_BPS=5`, `ENTRY_CONFIRMATION_DAYS=0`, `USE_VIX_REGIME_FILTER=false`, and the 25-ticker `WATCHLIST`.
 
 ### Phase 15: Live-Loop Hardening & Pipeline Extract *(2026-06)*
 
@@ -635,9 +655,10 @@ Hold a ticker if it slips from Top-N but remains in Top-(N+band). Reduces roundt
 **Combined production settings applied:**
 
 ```
-USE_52W_HIGH_FILTER=false        # Phase 21: +2.5pp CAGR
-MOMENTUM_TOP_N=4                 # Phase 22a: +0.6pp CAGR, +0.10 Sharpe
-MOMENTUM_TOP_N_HOLD_BAND=1       # Phase 22b: -88 trades, MaxDD -0.8pp
+USE_52W_HIGH_FILTER=false           # Phase 21: +2.5pp CAGR
+MOMENTUM_TOP_N=4                    # Phase 22a: +0.6pp CAGR, +0.10 Sharpe
+MOMENTUM_TOP_N_HOLD_BAND=1          # Phase 22b: -88 trades, MaxDD -0.8pp
+USE_REGIME_GOLDEN_CROSS=false       # Phase 25: +0.66pp CAGR, bear2022 unchanged
 ```
 
 ```powershell
