@@ -38,6 +38,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 >
 > **Phase 22 (2026-06)** — Top-N sweep (Top2–5) + turnover band sweep (band 0–3). **Top4** beats Top3 (CAGR +0.6pp, Sharpe +0.10, MaxDD -1.1pp). **band=1** reduces trades -88 and MaxDD -0.8pp at no CAGR cost. Both applied to prod defaults. See [Phase 22](#phase-22-top-n--turnover-band-sweep-2026-06).
 >
+> **Phase 24 (2026-06)** — Aggressive vs Prod comparison (3 configs). **Config C (Semi-aggressive)** is best OOS MAR: +1.93pp full CAGR, +2.51pp OOS CAGR, bear2022 unchanged. Config B (Aggressive) collapses in bear2022 (-12.0%, Sharpe -1.32). See [Phase 24](#phase-24-aggressive-vs-prod-comparison-2026-06).
+>
 > **Phase 23 (2026-06)** — OOS validation (IS=2020-22, OOS=2023-25). All Ph21-22 improvements hold OOS with **amplified gains**: prod config achieves OOS CAGR +36.7%, Sharpe 1.80. No overfitting. See [Phase 23](#phase-23-oos-validation-2026-06).
 >
 > **Phase 20 (2026-06)** — TSM (absolute momentum) gates tested; **OFF in prod** — baseline wins full-period and OOS. See [Phase 20](#phase-20-tsm-absolute-momentum-gates-2026-06).
@@ -639,6 +641,63 @@ MOMENTUM_TOP_N_HOLD_BAND=1       # Phase 22b: -88 trades, MaxDD -0.8pp
 ```powershell
 python scripts/topn_cash_sweep.py
 python scripts/turnover_band.py
+```
+
+---
+
+### Phase 24: Aggressive vs Prod Comparison *(2026-06)*
+
+Three configurations tested head-to-head: conservative PROD (A), aggressive/수익극대화 (B), and semi-aggressive middle ground (C).
+Dual 70/30 Legacy/Top4, 2020–2025 full period + OOS (2023–25) + 4 sub-periods.
+**Key question: does loosening entry bars and adding positions survive bear2022?**
+
+#### Main Results (Full 2020–2025)
+
+| Config | CAGR | Sharpe | MaxDD | C/D | Trades | OOS CAGR | OOS Sharpe | OOS MaxDD |
+|---|---|---|---|---|---|---|---|---|
+| **A: PROD** (baseline) | +17.8% | 1.14 | 19.8% | 0.90 | 2494 | +22.8% | 1.35 | 19.8% |
+| B: Aggressive | +19.0% | 1.17 | 18.7% | 1.02 | 2464 | +23.9% | 1.39 | 18.7% |
+| **C: Semi-aggressive** | **+19.7%** | **1.23** | **19.5%** | **1.01** | 2478 | **+25.3%** | **1.46** | **19.5%** |
+
+Config B changes vs PROD: vol_threshold 0.45 (all), RSI -5 to -8 pts, cautious_max_pos=4, golden_cross=OFF, vol_adj_risk=OFF, max_open=7.
+Config C changes vs PROD: vol_threshold 0.50 (all), RSI -4 to -5 pts, cautious_max_pos=3, golden_cross=OFF, vol_adj_risk=ON, max_open=6.
+
+#### Delta vs PROD
+
+| Config | Full DCAGR | DSharpe | DMaxDD | OOS DCAGR | OOS DSharpe | bear2022 Sharpe |
+|---|---|---|---|---|---|---|
+| B: Aggressive | +1.20pp | +0.02 | -1.04pp | +1.12pp | +0.03 | **-1.32** ⚠️ |
+| C: Semi-aggressive | +1.93pp | +0.08 | -0.29pp | **+2.51pp** | **+0.11** | **-1.05** ✓ |
+
+#### Sub-Period Detail (Critical: bear2022)
+
+| Period | A: PROD | B: Aggressive | C: Semi-aggressive |
+|---|---|---|---|
+| bull20-21 CAGR | +26.5% | +30.2% | +28.9% |
+| **bear2022 CAGR** | **-9.4%** | **-12.0% ⚠️** | **-9.6% ✓** |
+| bear2022 Sharpe | -0.99 | -1.32 | -1.05 |
+| bear2022 MaxDD | 13.3% | 15.6% | 13.3% |
+| bull23-24 CAGR | +32.0% | +31.4% | +33.7% |
+| trans2025 CAGR | +6.2% | +10.1% | +10.1% |
+
+**Best MAR (full period):** B: Aggressive = 1.015
+**Best OOS MAR:** C: Semi-aggressive = 1.297
+
+#### Findings
+
+1. **Config B (Aggressive) REJECTED for production**: bear2022 CAGR deteriorates -2.6pp to -12.0% and Sharpe drops from -0.99 to -1.32. The combination of `use_vol_adjusted_risk=False` (fixed sizing) + lower RSI thresholds enters trades earlier in a downtrend, amplifying losses exactly when risk control matters most.
+2. **Config C (Semi-aggressive) CONSIDER for upgrade**: Nearly identical bear2022 performance (-9.6% vs -9.4%, same 13.3% MaxDD), but achieves +1.93pp full CAGR and **+2.51pp OOS CAGR** vs PROD. Best OOS MAR of all three configs (1.297). The key: keeping `use_vol_adjusted_risk=True` preserves position-size scaling in volatile markets.
+3. **vol_adjusted_risk is the critical differentiator**: Config B disables volatility scaling — this is what causes the bear2022 blow-up, not the RSI/volume relaxation per se.
+4. **Golden cross filter (USE_REGIME_GOLDEN_CROSS=false)**: Both B and C remove this. Effect is modest but positive on trans2025 (Sharpe +0.21 both configs), suggesting the golden cross requirement was over-filtering in sideways/uncertain markets.
+
+#### Recommendation
+
+- **Stay with Config A (PROD)** if bear market protection is the priority.
+- **Upgrade to Config C (Semi-aggressive)** if +1.93pp CAGR and +2.51pp OOS CAGR justify the tiny additional bear risk (bear2022 only 0.2pp worse). The key changes to apply: `volume_threshold` all regimes to 0.50, RSI thresholds down 4–5 pts, `REGIME_CAUTIOUS_MAX_POSITIONS=3`, `USE_REGIME_GOLDEN_CROSS=false`, `MAX_OPEN_POSITIONS=6`.
+- **Do NOT switch to Config B (Aggressive)**: The removal of vol-adjusted sizing is dangerous. Even if full-period CAGR looks better (+1.20pp), the bear market penalty (-2.6pp CAGR, Sharpe -1.32) is unacceptable for a live production system.
+
+```powershell
+python scripts/aggressive_sweep.py
 ```
 
 ---
