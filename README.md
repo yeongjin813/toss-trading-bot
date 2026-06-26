@@ -40,6 +40,8 @@ An automated, production-grade quantitative trading infrastructure and empirical
 >
 > **Phase 25 (2026-06)** — Regime golden-cross ablation. **`USE_REGIME_GOLDEN_CROSS=false` adopted**: +0.66pp full CAGR, +0.42pp OOS CAGR, MaxDD -0.61pp, bear2022 unchanged. `REGIME_CAUTIOUS_MAX_POSITIONS=3` has zero effect -- prod stays at 2. See [Phase 25](#phase-25-regime-golden-cross-ablation-2026-06).
 >
+> **Phase 26 (2026-06)** — Capital-at-risk sweep ($50k–$300k). **CAGR invariant**; **$100k adopted** for VTS (full sandbox buying power + proportional risk limits). See [Phase 26](#phase-26-capital-at-risk-sweep-2026-06).
+>
 > **Phase 24 (2026-06)** — Aggressive vs Prod comparison (3 configs). **Config C (Semi-aggressive)** is best OOS MAR: +1.93pp full CAGR, +2.51pp OOS CAGR, bear2022 unchanged. Config B (Aggressive) collapses in bear2022 (-12.0%, Sharpe -1.32). See [Phase 24](#phase-24-aggressive-vs-prod-comparison-2026-06).
 >
 > **Phase 23 (2026-06)** — OOS validation (IS=2020-22, OOS=2023-25). All Ph21-22 improvements hold OOS with **amplified gains**: prod config achieves OOS CAGR +36.7%, Sharpe 1.80. No overfitting. See [Phase 23](#phase-23-oos-validation-2026-06).
@@ -71,7 +73,7 @@ An automated, production-grade quantitative trading infrastructure and empirical
 
 **Not adopted (tested, rejected or deferred):** TSM gates (Ph20), cash threshold (Ph22), Config B aggressive (Ph24), RSI/vol relaxation (Ph24 Config C remainder).
 
-**Research scripts:** `scripts/entry_filter_ablation.py`, `scripts/oos_validation.py`, `scripts/golden_cross_ablation.py`, `scripts/aggressive_sweep.py`
+**Research scripts:** `scripts/entry_filter_ablation.py`, `scripts/oos_validation.py`, `scripts/golden_cross_ablation.py`, `scripts/aggressive_sweep.py`, `scripts/capital_sweep.py`
 
 ## Documentation Map
 
@@ -122,7 +124,7 @@ flowchart TD
 3. **Pending lock** — no open unfilled order on this ticker
 4. **Entry filters** — weekly trend + optional 52-week high proximity (`entry_filters.py`)
 5. **Momentum** — ticker in Top-N active list (new BUY only; exits always run)
-6. **SPY/QQQ regime** — SPY ≤ 200MA blocks BUY; golden cross → cautious caps; half size when SPY bear + QQQ bull
+6. **SPY/QQQ regime** — SPY ≤ 200MA blocks BUY; half size when SPY bear + QQQ bull (`USE_REGIME_GOLDEN_CROSS=false` in prod, Phase 25)
 7. **Strategy ownership** — Legacy vs Top3 cannot both open the same ticker (`strategy_ownership.py`)
 8. **RiskGuard** — daily loss, consecutive loss days, max positions, per-ticker exposure, **sector concentration**
 9. **Signal engine** — regime-specific breakout entry + staged exits; optional scale-in / scale-out
@@ -486,6 +488,7 @@ python -m pytest test_momentum_selection.py test_momentum_ranker.py -q
 | `vix_data.py` | ^VIX yfinance frame (research; live inject when filter ON) |
 | `scripts/filter_combo_backtest.py` | SPY-only vs entry-confirm vs VIX grid |
 | `scripts/cost_sensitivity.py` | Commission × slippage sensitivity (dual 60/40) |
+| `scripts/capital_sweep.py` | Capital-at-risk levels $50k–$300k (VTS vs live scaling) |
 | `BACKTEST_FILL_AT_NEXT_OPEN` | Signal at close → **fill next session open** (default `true`; legacy + Top3 backtests) |
 | `USE_WEEKLY_TELEGRAM_REPORT` | Friday EOD weekly PnL vs paper anchor (Telegram) |
 
@@ -716,6 +719,30 @@ All other settings identical to current prod: `USE_52W_HIGH_FILTER=false`, `MOME
 
 ```powershell
 python scripts/golden_cross_ablation.py
+```
+
+---
+
+### Phase 26: Capital-at-Risk Sweep *(2026-06)*
+
+Validates **how much USD** to deploy under Phase 4 dual 70/30 + Top4 + band=1 (2020–2025 backtest, proportional risk limits).
+
+| Capital | CAGR | Sharpe | MaxDD | $/yr est | VTS feasible |
+|---|---|---|---|---|---|
+| $50k | +18.2% | 1.15 | 19.5% | ~$9k | Yes |
+| $75k | +18.8% | 1.18 | 19.6% | ~$14k | Yes |
+| **$100k** | **+18.5%** | **1.16** | **19.2%** | **~$18.5k** | **Yes (prod)** |
+| $250k | +17.2% | 1.08 | 20.1% | ~$43k | Live account only |
+
+#### Key Findings
+
+1. **CAGR / Sharpe are capital-invariant** — position sizing scales linearly; only absolute dollar profit changes.
+2. **VTS sandbox ceiling ~$100k** — deploying less wastes broker buying power; deploying more causes order rejects / over-deploy trim.
+3. **Prod adopted: `CAPITAL_AT_RISK=100000`** with proportional limits (`MAX_TICKER_EXPOSURE_USD=25000`, `MAX_DAILY_LOSS_USD=5000`, `MAX_PORTFOLIO_USD=100000`).
+4. **Live account migration:** when off VTS, scale all caps proportionally (e.g. $250k → ticker cap $62.5k, daily loss $12.5k). Re-run sweep before raising.
+
+```powershell
+python scripts/capital_sweep.py
 ```
 
 ---
@@ -2467,7 +2494,9 @@ Toss Trading Bot/
 ├── test_watchlist_cycle.py
 ├── scripts/
 │   ├── compare_watchlist.py  # 15 vs 25 dual backtest comparison
-│   └── dual_sweep.py         # Capital-split sweep + walk-forward
+│   ├── capital_sweep.py      # Capital-at-risk sweep (VTS $100k prod default)
+│   ├── oos_validation.py     # IS/OOS validation for Ph21-22 prod settings
+│   └── dual_sweep.py         # Legacy/Top3 capital-split sweep
 ├── test_analytics.py         # Engine verification (trend filter + conditional RSI tests)
 ├── test_momentum_ranker.py
 ├── test_momentum_selection.py

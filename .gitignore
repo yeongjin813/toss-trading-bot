@@ -8,6 +8,7 @@ trade_log.csv
 trade_log_test.csv
 trading_state.json
 trading_state.json.bak
+trading_state_ec2.json
 order_retry_queue.json
 data/*.csv
 data/*.CSV

@@ -245,17 +245,30 @@ systemctl is-active toss-bot
 
 | Source | Typical value | Meaning |
 |---|---|---|
-| KIS mock app “orderable USD” | ~$100,000 | Real sandbox buying power |
-| `.env` `CAPITAL_AT_RISK` | e.g. `100000` | Strategy cap used for sizing |
+| KIS mock app “orderable USD” | ~$100,000 | Real sandbox buying power (hard ceiling for VTS) |
+| `.env` `CAPITAL_AT_RISK` | `100000` | Strategy cap used for sizing (prod validated, Phase 26) |
 | Log `Deployable Cash` | matches `CAPITAL_AT_RISK` | What the bot deploys |
 | Log `broker_cash_usd = 0` | VTS API gap | **Not** broke — bot falls back to `CAPITAL_AT_RISK` |
 
-Align bot sizing with your mock account:
+**Prod VTS (Phase 26 adopted):** use full sandbox buying power with proportional risk limits:
 
 ```env
 CAPITAL_AT_RISK=100000
-MAX_TICKER_EXPOSURE_USD=10000
+MAX_TICKER_EXPOSURE_USD=25000
+MAX_DAILY_LOSS_USD=5000
+MAX_PORTFOLIO_USD=100000
 ```
+
+**Live account scale-up** (when off VTS): multiply all USD caps by the same factor. Example $250k:
+
+```env
+CAPITAL_AT_RISK=250000
+MAX_TICKER_EXPOSURE_USD=62500
+MAX_DAILY_LOSS_USD=12500
+MAX_PORTFOLIO_USD=250000
+```
+
+Re-run `python scripts/capital_sweep.py` before raising capital. Do not exceed broker orderable USD.
 
 ---
 
