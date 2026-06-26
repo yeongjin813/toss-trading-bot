@@ -351,9 +351,46 @@ Commit `46767be` — reduces off-hours VTS noise and Telegram spam.
 
 ## Log Management
 
-Growth: ~15–25 MB per US trading day (60s × 25 tickers during RTH).
+Growth: ~15–25 MB per US trading day (60s × 25 tickers during RTH). `trade_log.csv` grows slowly (one row per fill).
 
-Rotate on EC2:
+### Automated rotation (recommended on EC2)
+
+Repo ships `deploy/logrotate-toss-bot.conf`:
+
+| File | Policy | Retention |
+|---|---|---|
+| `project_metrics.log` | weekly **or** 50 MB | 8 rotated files (compressed) |
+| `trade_log.csv` | monthly | 12 months (compressed) |
+
+Uses `copytruncate` so `toss-bot` systemd does not need a restart.
+
+**Install on EC2** (after `git pull`):
+
+```bash
+cd ~/toss-trading-bot
+git pull origin main
+sudo bash deploy/install-logrotate.sh
+```
+
+Custom install path:
+
+```bash
+BOT_DIR=/home/ubuntu/toss-trading-bot sudo -E bash deploy/install-logrotate.sh
+```
+
+Verify dry-run:
+
+```bash
+sudo logrotate -d /etc/logrotate.d/toss-bot
+```
+
+Force one rotation (optional):
+
+```bash
+sudo logrotate -f /etc/logrotate.d/toss-bot
+```
+
+### Manual truncate (fallback)
 
 ```bash
 cd ~/toss-trading-bot
