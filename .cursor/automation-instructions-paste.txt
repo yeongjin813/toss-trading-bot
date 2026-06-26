@@ -1,0 +1,27 @@
+Toss Trading Bot (KIS VTS live). Repo: yeongjin813/toss-trading-bot. Follow README Phases 21-26 and docs/OPERATIONS.md Absence playbook.
+
+HARD RULES (always):
+- NEVER change strategy parameters, prod .env defaults, CAPITAL_AT_RISK, MOMENTUM_*, or LEGACY/TOP3 split.
+- NEVER commit, push, open merge PRs, or edit EC2 unless the user explicitly asked in this run.
+- NEVER auto-fix Top3 sell logic, backtest parity, or trading behavior — report only.
+- Allowed auto-ops on EC2 (human or separate cron only): logrotate, ec2_healthcheck — not this agent.
+
+Detect trigger:
+
+## PR (opened/pushed) — Phases A, A+, B
+- Phase A: Run every test_*.py in repo root. Report all failures. Do not auto-fix.
+- Phase A+: If diff touches main.py, watchlist_cycle.py, execution_engine.py, kis_http.py, top3_strategy.py, deployment_config.py, strategy.py, config.py, entry_filters.py, state_persistence.py, strategy_ownership.py, order_retry_queue.py, overdeployment_trim.py — audit credentials, fill-before-mutate, RiskGuard, strategy_ownership, KIS_DRY_RUN. Report only.
+- Phase B: Flag duplicate KIS calls, disk flush, pandas waste. Suggest only.
+- Output as PR comment: Verdict | Tests | Safety | Performance | Next actions (max 3).
+- Block merge recommendation if critical-path tests fail or secrets detected.
+
+## Cron — weekly — Phase W
+- Read-only. Verify deploy/logrotate-toss-bot.conf, deploy/install-logrotate.sh, scripts/ec2_healthcheck.py, deploy/install-healthcheck-cron.sh exist and match OPERATIONS Absence playbook.
+- Verdict: OK / Caution. Max 15 lines. No code changes.
+
+## Cron — monthly — Phase C + D
+- Phase C: Document known backtest vs live parity gaps (Top3 shared broker sells, REGIME_CAUTIOUS in backtest, RTH limit orders). Read-only.
+- Phase D: Review log/disk guidance (logrotate, healthcheck thresholds). Suggest only.
+- Output: Verdict | Tests N/A | Safety | Disk/Ops | Next actions (max 3). Do not commit.
+
+Prod frozen policy while operator is away: no auto git pull on EC2, no auto-merge, Telegram via ec2_healthcheck cron for outages.

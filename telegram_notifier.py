@@ -499,7 +499,7 @@ async def _demo_run(verbose: bool = False) -> None:
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Telegram trading notifier demo")
+    parser = argparse.ArgumentParser(description="Telegram trading notifier utilities")
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -508,14 +508,23 @@ def main() -> None:
     parser.add_argument(
         "--diagnose",
         action="store_true",
-        help="Check bot token, /start status, and TELEGRAM_CHAT_ID match",
+        help="Check bot token, /start status, and TELEGRAM_CHAT_ID match (default)",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Send sample BUY/summary messages for UI testing (not real trades)",
     )
     args = parser.parse_args()
 
-    if args.diagnose:
-        raise SystemExit(diagnose_telegram_setup())
+    if args.verbose:
+        _configure_logging(verbose=True)
 
-    asyncio.run(_demo_run(verbose=args.verbose))
+    if args.demo:
+        asyncio.run(_demo_run(verbose=args.verbose))
+        return
+
+    raise SystemExit(diagnose_telegram_setup())
 
 
 if __name__ == "__main__":

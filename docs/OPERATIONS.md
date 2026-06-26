@@ -285,10 +285,15 @@ Re-run `python scripts/capital_sweep.py` before raising capital. Do not exceed b
 
 ```bash
 python telegram_notifier.py --diagnose
-python telegram_notifier.py --verbose
 ```
 
 On EC2: `.venv/bin/python telegram_notifier.py --diagnose`
+
+**Do not use** `telegram_notifier.py --verbose` alone for prod checks — it used to send **fake** sample trades. Use `--demo` only when you intentionally want sample messages:
+
+```bash
+python telegram_notifier.py --demo
+```
 
 ### What to expect
 
@@ -442,7 +447,7 @@ Does **not** SSH to EC2 or modify prod — use healthcheck cron for outages.
 2. `sudo logrotate -d /etc/logrotate.d/toss-bot`
 3. `bash deploy/install-healthcheck-cron.sh`
 4. Backup EC2 `.env` locally (never commit)
-5. Confirm Telegram: `.venv/bin/python telegram_notifier.py --diagnose`
+5. Confirm Telegram: `.venv/bin/python telegram_notifier.py --diagnose` (not `--demo`)
 
 ---
 
