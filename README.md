@@ -292,7 +292,9 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 | **System INFO** | Top3 shadow summary, **over-deploy trim queued/submitted** | ℹ️ trim plan before RTH; trim batch after submit |
 | **EOD report** | Once per NY session after 16:00 ET | Equity, PnL, fills, holdings, deployable cash |
 
-Duplicate CRITICAL spam is suppressed by `TELEGRAM_ALERT_THROTTLE_SECONDS` (default **900**). Diagnose setup: `python telegram_notifier.py --diagnose`.
+Duplicate CRITICAL spam is suppressed by `TELEGRAM_ALERT_THROTTLE_SECONDS` (default **900**). Diagnose setup: `python telegram_notifier.py --diagnose` (default CLI). Use `--demo` only for **sample** trade messages — not real fills.
+
+Unattended prod ops (healthcheck cron, logrotate, absence playbook): [docs/OPERATIONS.md](docs/OPERATIONS.md#absence-playbook-long-leave--unattended-prod).
 
 ### Phase 7.1: RTH-Only Polling & Alert Hardening *(2026-06)*
 
