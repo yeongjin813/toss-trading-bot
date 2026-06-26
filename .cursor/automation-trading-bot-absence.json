@@ -1,0 +1,55 @@
+{
+  "name": "Trading Bot Absence Guard",
+  "description": "PR regression guard + weekly/monthly read-only ops audit. No auto strategy fixes; EC2 alerts via scripts/ec2_healthcheck.py cron.",
+  "workflow": {
+    "triggers": [
+      {
+        "git": {
+          "pullRequest": {
+            "opened": {
+              "repos": ["yeongjin813/toss-trading-bot"],
+              "ignoreDraftPrs": true
+            }
+          }
+        }
+      },
+      {
+        "git": {
+          "pullRequest": {
+            "pushed": {
+              "repos": ["yeongjin813/toss-trading-bot"],
+              "ignoreDraftPrs": true
+            }
+          }
+        }
+      },
+      {
+        "cron": {
+          "cron": "0 0 * * 1"
+        }
+      },
+      {
+        "cron": {
+          "cron": "0 9 1 * *"
+        }
+      }
+    ],
+    "actions": [
+      {
+        "prComment": {}
+      }
+    ],
+    "prompts": [
+      "Toss Trading Bot (KIS VTS live). Repo: yeongjin813/toss-trading-bot. Follow README Phases 21-26 and docs/OPERATIONS.md Absence playbook.\n\nHARD RULES (always):\n- NEVER change strategy parameters, prod .env defaults, CAPITAL_AT_RISK, MOMENTUM_*, or LEGACY/TOP3 split.\n- NEVER commit, push, open merge PRs, or edit EC2 unless the user explicitly asked in this run.\n- NEVER auto-fix Top3 sell logic, backtest parity, or trading behavior — report only.\n- Allowed auto-ops on EC2 (human or separate cron only): logrotate, ec2_healthcheck — not this agent.\n\nDetect trigger:\n\n## PR (opened/pushed) — Phases A, A+, B\n- Phase A: Run every test_*.py in repo root. Report all failures. Do not auto-fix.\n- Phase A+: If diff touches main.py, watchlist_cycle.py, execution_engine.py, kis_http.py, top3_strategy.py, deployment_config.py, strategy.py, config.py, entry_filters.py, state_persistence.py, strategy_ownership.py, order_retry_queue.py, overdeployment_trim.py — audit credentials, fill-before-mutate, RiskGuard, strategy_ownership, KIS_DRY_RUN. Report only.\n- Phase B: Flag duplicate KIS calls, disk flush, pandas waste. Suggest only.\n- Output as PR comment: Verdict | Tests | Safety | Performance | Next actions (max 3).\n- Block merge recommendation if critical-path tests fail or secrets detected.\n\n## Cron — weekly (Mon 00:00 UTC) — Phase W\n- Read-only. Verify deploy/logrotate-toss-bot.conf, deploy/install-logrotate.sh, scripts/ec2_healthcheck.py, deploy/install-healthcheck-cron.sh exist and match OPERATIONS Absence playbook.\n- Verdict: OK / Caution. Max 15 lines. No code changes.\n\n## Cron — monthly (1st 09:00 UTC) — Phase C + D\n- Phase C: Document known backtest vs live parity gaps (Top3 shared broker sells, REGIME_CAUTIOUS in backtest, RTH limit orders). Read-only.\n- Phase D: Review log/disk guidance (logrotate, healthcheck thresholds). Suggest only.\n- Output: Verdict | Tests N/A | Safety | Disk/Ops | Next actions (max 3). Do not commit.\n\nProd frozen policy while operator is away: no auto git pull on EC2, no auto-merge, Telegram via ec2_healthcheck cron for outages."
+    ],
+    "model": "",
+    "agentOptions": {
+      "skipInstall": false
+    },
+    "memoryEnabled": true,
+    "gitConfig": {
+      "repo": "yeongjin813/toss-trading-bot",
+      "branch": "main"
+    }
+  }
+}

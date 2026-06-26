@@ -1,0 +1,18 @@
+{
+  "name": "Trading Bot PR Guard & Monthly Health",
+  "description": "DEPRECATED — use automation-trading-bot-absence.json instead.",
+  "workflow": {
+    "triggers": [],
+    "actions": [{ "prComment": {} }],
+    "prompts": [
+      "This file is deprecated. Import .cursor/automation-trading-bot-absence.json in the Automations UI."
+    ],
+    "model": "",
+    "agentOptions": { "skipInstall": false },
+    "memoryEnabled": false,
+    "gitConfig": {
+      "repo": "yeongjin813/toss-trading-bot",
+      "branch": "main"
+    }
+  }
+}

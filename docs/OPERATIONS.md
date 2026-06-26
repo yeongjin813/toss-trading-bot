@@ -400,6 +400,52 @@ sudo truncate -s 0 project_metrics.log
 
 ---
 
+## Absence Playbook (long leave / unattended prod)
+
+**Policy:** freeze EC2 code and `.env` — **no automatic `git pull`** while away. Real-time alerts come from **EC2 cron**, not Cursor Automation.
+
+| Layer | What runs | Auto-fix? |
+|---|---|---|
+| **EC2 healthcheck** | Every 15 min — `scripts/ec2_healthcheck.py` | Alerts only (Telegram) |
+| **systemd** | `Restart=always` on `toss-bot` | Restarts process |
+| **logrotate** | `deploy/logrotate-toss-bot.conf` | Rotates logs |
+| **Cursor Automation** | PR guard + weekly/monthly **read-only** audit | **Never** changes strategy |
+
+### Install healthcheck cron (EC2)
+
+```bash
+cd ~/toss-trading-bot
+git pull origin main
+bash deploy/install-healthcheck-cron.sh
+.venv/bin/python scripts/ec2_healthcheck.py --dry-run
+```
+
+Checks: `toss-bot` active, root disk ≥ 80%, `project_metrics.log` ≥ 400 MB.  
+Repeats the same Telegram alert at most once per 4 hours per issue.
+
+Optional `.env` overrides:
+
+```env
+HEALTHCHECK_DISK_WARN_PCT=80
+HEALTHCHECK_LOG_WARN_MB=400
+HEALTHCHECK_ALERT_COOLDOWN_SEC=14400
+```
+
+### Cursor Automation
+
+Import draft: `.cursor/automation-trading-bot-absence.json` (PR guard + weekly/monthly read-only).  
+Does **not** SSH to EC2 or modify prod — use healthcheck cron for outages.
+
+### Before you leave
+
+1. `systemctl is-active toss-bot` → `active`
+2. `sudo logrotate -d /etc/logrotate.d/toss-bot`
+3. `bash deploy/install-healthcheck-cron.sh`
+4. Backup EC2 `.env` locally (never commit)
+5. Confirm Telegram: `.venv/bin/python telegram_notifier.py --diagnose`
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
