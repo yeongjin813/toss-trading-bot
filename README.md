@@ -44,7 +44,7 @@ An experimental automated trading **infrastructure** and telemetry stack on the 
 >
 > **Phase 24 (2026-06)** — Aggressive vs Prod comparison (3 configs). **Config C (Semi-aggressive)** is best OOS MAR: +1.93pp full CAGR, +2.51pp OOS CAGR, bear2022 unchanged. Config B (Aggressive) collapses in bear2022 (-12.0%, Sharpe -1.32). See [Phase 24](#phase-24-aggressive-vs-prod-comparison-2026-06).
 >
-> **Phase 23 (2026-06)** — OOS validation (IS=2020-22, OOS=2023-25). All Ph21-22 improvements hold OOS with **amplified gains**: prod config achieves OOS CAGR +36.7%, Sharpe 1.80. No overfitting. See [Phase 23](#phase-23-oos-validation-2026-06).
+> **Phase 23 (2026-06)** — OOS validation (IS=2020-22, OOS=2023-25). All Ph21-22 improvements hold OOS with **amplified gains**: prod config achieves OOS CAGR +36.7%, Sharpe 1.80. OOS validation **reduces, but does not eliminate, overfitting risk**. See [Phase 23](#phase-23-oos-validation-2026-06).
 >
 > **Phase 20 (2026-06)** — TSM (absolute momentum) gates tested; **OFF in prod** — baseline wins full-period and OOS. See [Phase 20](#phase-20-tsm-absolute-momentum-gates-2026-06).
 >
@@ -829,7 +829,7 @@ Split: IS = 2020–2022, OOS = 2023–2025. All Phase 21-22 improvements validat
 | prod (all) | +3.16pp | **+7.46pp** | +0.22 | All improvements confirmed |
 
 **Findings:**
-1. **No overfitting detected** — every config beats baseline OOS. Improvements are stronger OOS than IS.
+1. **OOS held for tested configs** — improvements were stronger OOS than IS in Phase 23 sweeps; this reduces overfitting risk but is not a guarantee.
 2. **52w=OFF is more beneficial OOS** (+5.55pp) than full-period (+2.49pp): the filter was blocking early-trend entries in the 2023-25 bull run.
 3. **Top4 amplifies OOS gains** (+8.49pp OOS) — in 2023-25 broad tech rally, a 4th position captured alpha the 3-slot portfolio missed.
 4. **Prod config confirmed**: OOS CAGR +36.7%, Sharpe 1.80, MaxDD 21.4%. Production settings are robust.

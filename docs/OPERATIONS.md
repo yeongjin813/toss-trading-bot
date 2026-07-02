@@ -700,7 +700,7 @@ Summary of backtest-driven changes applied to `.env.example` and EC2 (June 2026)
 |---|---|---|---|
 | 21 | `USE_52W_HIGH_FILTER=false` | +2.5pp CAGR | Yes |
 | 22 | `MOMENTUM_TOP_N=4`, `MOMENTUM_TOP_N_HOLD_BAND=1` | +0.6pp CAGR, -88 trades | Yes |
-| 23 | OOS validation (2023–25) | No overfitting | Confirmed |
+| 23 | OOS validation (2023–25) | Overfitting risk | OOS gains held for tested configs; not a guarantee of future alpha |
 | 24 | Aggressive vs prod | Config B fails bear2022; Config C gain = golden_cross | Partial |
 | 25 | `USE_REGIME_GOLDEN_CROSS=false` | +0.66pp CAGR, bear2022 unchanged | Yes |
 

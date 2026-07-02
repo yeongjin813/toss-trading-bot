@@ -69,11 +69,14 @@ Restart `toss-bot`. Existing stop-loss / sell signals can still execute.
 
 **Use only if you intentionally want to flatten all positions.**
 
+Both lines are required (typo guard):
+
 ```ini
 EMERGENCY_LIQUIDATE=true
+EMERGENCY_LIQUIDATE_CONFIRM=I_UNDERSTAND_THIS_WILL_SELL
 ```
 
-Restart during **US regular hours (09:30–16:00 ET)**. The bot will attempt to **SELL all holdings** once per cycle, then skip normal trading until you set `EMERGENCY_LIQUIDATE=false`.
+Restart during **US regular hours (09:30–16:00 ET)**. Without the confirm phrase, **no liquidation runs** even if `EMERGENCY_LIQUIDATE=true`.
 
 You will get **CRITICAL Telegram** alerts when this mode runs.
 
@@ -132,13 +135,25 @@ Symptoms: `[RECONCILE/MISMATCH]` in logs, `holdings_mismatch` in `heartbeat.json
 
 ## 9. Backups
 
-Daily (optional cron):
+Daily on EC2 (optional cron):
 
 ```bash
 .venv/bin/python scripts/daily_backup.py
 ```
 
 Backups go to `~/toss-trading-bot/backups/YYYY-MM-DD/` (no `.env`).
+
+**Offsite (required for real disaster recovery):** EC2-only backups die with the server. Pull weekly to your PC:
+
+```powershell
+.\scripts\pull_backups_from_ec2.ps1 -PemPath "C:\path\to\tb.pem" -Host YOUR_EC2_IP
+```
+
+Or manually:
+
+```powershell
+scp -r -i "C:\path\to\tb.pem" ubuntu@YOUR_EC2_IP:~/toss-trading-bot/backups ./toss-bot-backups
+```
 
 **Restore `trading_state.json`:**
 
@@ -148,6 +163,13 @@ cp backups/YYYY-MM-DD/trading_state.json ./trading_state.json
 sudo systemctl restart toss-bot
 ```
 
+**Safety latch** (`safety_latch.json`): after repeated anomalies the bot auto-blocks **new BUYs** (not auto-sell). To clear:
+
+1. `TRADING_PAUSED=true` + restart  
+2. Fix root cause (reconcile mismatch, Telegram, etc.)  
+3. Delete `safety_latch.json`  
+4. `TRADING_PAUSED=false` + restart  
+
 **Do not commit to GitHub:** `.env`, `kis_token_cache.json`, `trading_state.json`, `backups/`, logs.
 
 ---
@@ -155,7 +177,8 @@ sudo systemctl restart toss-bot
 ## 10. What NOT to do
 
 - Do **not** switch to **live** real-money API while away.
-- Do **not** `git pull` + restart on a schedule without reviewing changes.
+- Do **not** `git pull` + restart on a schedule without reviewing changes (no auto-update while away).
+- systemd `Restart=always` is OK — process crash recovery only, not code updates.
 - Do **not** change strategy params, `CAPITAL_AT_RISK`, or watchlist casually.
 - Do **not** run `telegram_notifier.py --demo` on EC2.
 - Do **not** ignore **KIS mock 90-day re-enrollment** or **annual API key renewal** (manual calendar reminders).
@@ -168,7 +191,7 @@ sudo systemctl restart toss-bot
 |------|--------|
 | 1 | `systemctl is-active toss-bot` |
 | 2 | If runaway behavior suspected → `TRADING_PAUSED=true` + restart |
-| 3 | If must flatten → `EMERGENCY_LIQUIDATE=true` + restart (RTH only) |
+| 3 | If must flatten → set **both** `EMERGENCY_LIQUIDATE=true` and `EMERGENCY_LIQUIDATE_CONFIRM=I_UNDERSTAND_THIS_WILL_SELL`, then restart (RTH only) |
 | 4 | Check `heartbeat.json` + last 50 log lines |
 | 5 | Run `scripts/ec2_healthcheck.py --dry-run` |
 | 6 | If KIS auth expired → renew keys / mock session, then restart |

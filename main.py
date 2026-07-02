@@ -124,6 +124,7 @@ from kis_environment import load_kis_environment, validate_kis_live_guard
 from operational_safety import (
     check_order_placement_allowed,
     describe_active_switches,
+    emergency_liquidate_misconfigured,
     validate_live_account_requirements,
 )
 from heartbeat import (
@@ -131,6 +132,7 @@ from heartbeat import (
     update_holdings_mismatch,
     update_pending_order_snapshot,
 )
+from safety_latch import issue_flags_from_heartbeat, update_from_issue_flags
 from loop_timing import effective_loop_cooldown_seconds
 from trading_features import TradingFeatureFlags, apply_vix_regime_gate
 from vix_data import fetch_vix_daily_yfinance
@@ -266,8 +268,14 @@ def _run_telegram(coro) -> None:
 
     try:
         asyncio.run(coro)
+        _persist_heartbeat(touch_telegram=True)
+        update_from_issue_flags(telegram_failure=False)
     except Exception as exc:
         logger.error("Telegram dispatch failed: %s", exc)
+        _, newly = update_from_issue_flags(telegram_failure=True)
+        if newly:
+            for reason in newly:
+                logger.critical("[SAFETY/LATCH] %s", reason)
 
 
 def _dispatch_trade_report(
@@ -376,6 +384,21 @@ def _persist_heartbeat(
     if states is not None:
         update_pending_order_snapshot(states, WATCHLIST, hb)
         update_holdings_mismatch(states, WATCHLIST, hb)
+        from analytics import is_us_regular_market_hours
+
+        flags = issue_flags_from_heartbeat(
+            hb,
+            require_rth_activity=is_us_regular_market_hours(),
+        )
+        _, newly = update_from_issue_flags(**flags)
+        if newly:
+            for reason in newly:
+                logger.critical("[SAFETY/LATCH] %s", reason)
+                _dispatch_system_alert(
+                    "CRITICAL",
+                    f"Safety latch engaged — {reason}. New BUY orders blocked.",
+                    telegram=True,
+                )
     hb.save()
 
 
@@ -2200,6 +2223,10 @@ def main() -> None:
             "WARNING",
             "Kill switches active at startup: " + ", ".join(switch_banner),
         )
+    misconfigured = emergency_liquidate_misconfigured()
+    if misconfigured:
+        print(f"[WARN] {misconfigured}")
+        _dispatch_system_alert("WARNING", misconfigured)
 
     print("KIS Mock Trading - Production Execution Engine")
     print(f"Execution Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

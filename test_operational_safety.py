@@ -31,7 +31,21 @@ def test_emergency_liquidate_blocks_buy_allows_sell(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("TRADING_PAUSED", "false")
     monkeypatch.setenv("ALLOW_NEW_BUYS", "true")
     monkeypatch.setenv("EMERGENCY_LIQUIDATE", "true")
+    monkeypatch.setenv("EMERGENCY_LIQUIDATE_CONFIRM", "I_UNDERSTAND_THIS_WILL_SELL")
     assert check_order_placement_allowed("BUY") is not None
+    assert check_order_placement_allowed("SELL") is None
+
+
+def test_emergency_liquidate_without_confirm_is_inert(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRADING_PAUSED", "false")
+    monkeypatch.setenv("ALLOW_NEW_BUYS", "true")
+    monkeypatch.setenv("EMERGENCY_LIQUIDATE", "true")
+    monkeypatch.delenv("EMERGENCY_LIQUIDATE_CONFIRM", raising=False)
+    from operational_safety import KillSwitchSettings, emergency_liquidate_armed
+
+    assert emergency_liquidate_armed() is False
+    assert KillSwitchSettings.from_env().emergency_liquidate is False
+    assert check_order_placement_allowed("BUY") is None
     assert check_order_placement_allowed("SELL") is None
 
 

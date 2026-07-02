@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from kis_environment import KISEnvironment
 
 _CONFIRM_FLAGS = frozenset({"1", "true", "yes", "on"})
+EMERGENCY_LIQUIDATE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_WILL_SELL"
 
 
 def _env_flag(name: str, default: str = "false") -> bool:
@@ -26,20 +27,42 @@ class KillSwitchSettings:
     trading_paused: bool
     allow_new_buys: bool
     emergency_liquidate: bool
+    emergency_liquidate_requested: bool
 
     @classmethod
     def from_env(cls) -> KillSwitchSettings:
         raw_buys = os.getenv("ALLOW_NEW_BUYS", "true").strip().lower()
         allow_buys = raw_buys not in {"false", "0", "no", "off"}
+        requested = _env_flag("EMERGENCY_LIQUIDATE")
         return cls(
             trading_paused=_env_flag("TRADING_PAUSED"),
             allow_new_buys=allow_buys,
-            emergency_liquidate=_env_flag("EMERGENCY_LIQUIDATE"),
+            emergency_liquidate=emergency_liquidate_armed(),
+            emergency_liquidate_requested=requested,
         )
 
 
 def kill_switch_settings_from_env() -> KillSwitchSettings:
     return KillSwitchSettings.from_env()
+
+
+def emergency_liquidate_armed() -> bool:
+    """Both EMERGENCY_LIQUIDATE and the confirm phrase must be set."""
+    if not _env_flag("EMERGENCY_LIQUIDATE"):
+        return False
+    confirm = os.getenv("EMERGENCY_LIQUIDATE_CONFIRM", "").strip()
+    return confirm == EMERGENCY_LIQUIDATE_CONFIRM_PHRASE
+
+
+def emergency_liquidate_misconfigured() -> str | None:
+    if not _env_flag("EMERGENCY_LIQUIDATE"):
+        return None
+    if emergency_liquidate_armed():
+        return None
+    return (
+        "EMERGENCY_LIQUIDATE=true but EMERGENCY_LIQUIDATE_CONFIRM "
+        f"!= {EMERGENCY_LIQUIDATE_CONFIRM_PHRASE!r} — liquidation disabled"
+    )
 
 
 def describe_active_switches(settings: KillSwitchSettings | None = None) -> list[str]:
@@ -49,8 +72,15 @@ def describe_active_switches(settings: KillSwitchSettings | None = None) -> list
         active.append("TRADING_PAUSED")
     if not settings.allow_new_buys:
         active.append("ALLOW_NEW_BUYS=false")
-    if settings.emergency_liquidate:
+    if settings.emergency_liquidate_requested and not settings.emergency_liquidate:
+        active.append("EMERGENCY_LIQUIDATE(unconfirmed)")
+    elif settings.emergency_liquidate:
         active.append("EMERGENCY_LIQUIDATE")
+    from safety_latch import auto_buy_block_reason
+
+    latch_reason = auto_buy_block_reason()
+    if latch_reason:
+        active.append("SAFETY_LATCH(auto_block_buys)")
     return active
 
 
@@ -79,6 +109,12 @@ def check_order_placement_allowed(
 
     if settings.trading_paused:
         return "TRADING_PAUSED=true — all broker orders blocked (health/reconcile/logging still run)"
+
+    from safety_latch import auto_buy_block_reason
+
+    latch_block = auto_buy_block_reason()
+    if normalized == "BUY" and latch_block:
+        return latch_block
 
     if normalized == "BUY" and not settings.allow_new_buys:
         return "ALLOW_NEW_BUYS=false — new BUY orders blocked (risk exits still allowed)"

@@ -344,6 +344,11 @@ def run_emergency_liquidation_if_needed(
     """
     settings = kill_switch_settings_from_env()
     if not settings.emergency_liquidate:
+        if settings.emergency_liquidate_requested:
+            print(
+                "[EMERGENCY] EMERGENCY_LIQUIDATE=true but confirm phrase missing — "
+                "set EMERGENCY_LIQUIDATE_CONFIRM=I_UNDERSTAND_THIS_WILL_SELL"
+            )
         return states, ledger, False
 
     holdings = collect_open_holdings(states, deps.watchlist)

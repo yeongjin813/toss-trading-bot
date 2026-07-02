@@ -134,6 +134,13 @@ def run_checks(
     for level, message in check_heartbeat_issues(hb, require_rth_activity=require_rth):
         issues.append((level, message))
 
+    from safety_latch import issue_flags_from_heartbeat, update_from_issue_flags
+
+    flags = issue_flags_from_heartbeat(hb, require_rth_activity=require_rth)
+    _, newly = update_from_issue_flags(**flags)
+    for reason in newly:
+        issues.append(("CRITICAL", f"Safety latch engaged — {reason}"))
+
     return issues
 
 
