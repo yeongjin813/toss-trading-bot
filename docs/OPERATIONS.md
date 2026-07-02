@@ -1,7 +1,7 @@
 # Production Operations Guide
 
 Day-to-day guide for running the KIS VTS live bot locally or on AWS EC2.  
-For strategy math, architecture, and backtest theory, see the [main README](../README.md).
+For strategy math, architecture, and backtest theory, see [STRATEGY.md](STRATEGY.md) and the full [REFERENCE.md](REFERENCE.md).
 
 **VTS base URL:** `https://openapivts.koreainvestment.com:29443`
 
@@ -66,7 +66,7 @@ MAX_TICKER_EXPOSURE_USD=25000
 CAPITAL_AT_RISK=100000
 ```
 
-Full variable reference: [README Appendix C](../README.md#appendix-c-configuration-externalization-matrix).
+Full variable reference: [REFERENCE.md Appendix C](REFERENCE.md#appendix-c-configuration-externalization-matrix).
 
 ### 2. Install dependencies
 
@@ -93,7 +93,7 @@ Stop with `Ctrl+C`. State persists to `trading_state.json`.
 | Weekday | 09:30–16:00 (RTH) | Watchlist cycle every 60s | **Active** |
 | Weekday | After 16:00 | EOD Telegram report (once), then sleep until next RTH | **None** (report only) |
 
-See [Live System Flow](../README.md#live-system-flow) for the full gate and fill pipeline.
+See [STRATEGY.md — Live RTH pipeline](STRATEGY.md#live-rth-pipeline) for the gate and fill pipeline.
 
 ### Live order timing (not close-only)
 
@@ -337,7 +337,7 @@ python telegram_notifier.py --demo
 
 Diagnose: `python telegram_notifier.py --diagnose` (EC2: `.venv/bin/python telegram_notifier.py --diagnose`).
 
-**Related capital env (not Telegram-specific but drives INFO trim alerts):** `MAX_PORTFOLIO_USD`, `OVERDEPLOYMENT_TRIM_ENABLED`, `OVERDEPLOYMENT_TRIM_TARGET_PCT` — see [Phase 13 in README](../README.md#phase-13-broker-holdings-sync--report-parity-2026-06).
+**Related capital env (not Telegram-specific but drives INFO trim alerts):** `MAX_PORTFOLIO_USD`, `OVERDEPLOYMENT_TRIM_ENABLED`, `OVERDEPLOYMENT_TRIM_TARGET_PCT` — see [Phase 13 in README](REFERENCE.md#phase-13-broker-holdings-sync--report-parity-2026-06).
 
 ---
 
@@ -468,7 +468,7 @@ Does **not** SSH to EC2 or modify prod — use healthcheck cron for outages.
 | TSLA filled but state stuck | Run reconcile at startup; verify `held_quantity` in `trading_state.json` |
 | Test signals without broker risk | Set `KIS_DRY_RUN=true` — instant local fills, no KIS order API |
 
-VTS incident history: [README Appendix A](../README.md#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses).
+VTS incident history: [README Appendix A](REFERENCE.md#appendix-a-infrastructure-patch-ledger-vts-mock-api-bypasses).
 
 ---
 
@@ -482,7 +482,7 @@ VTS incident history: [README Appendix A](../README.md#appendix-a-infrastructure
 | Backtest ATR parity | `USE_EOD_ATR_STOPS=true` | Daily bar low stops (matches backtest); default keeps intraday stops |
 | CI | `.github/workflows/ci.yml` | Runs all `test_*.py` on push/PR |
 
-Full step-by-step changelog: [README Phase 8](../README.md#phase-8-production-hardening--readme-improvement-log).
+Full step-by-step changelog: [README Phase 8](REFERENCE.md#phase-8-production-hardening--readme-improvement-log).
 
 ---
 
@@ -515,7 +515,7 @@ USE_DAILY_TELEGRAM_REPORT=true
 
 **Safe signal testing on EC2:** set `KIS_DRY_RUN=true`, restart `toss-bot`, confirm startup banner shows `*** KIS DRY-RUN MODE ***`, then set back to `false` before real orders.
 
-Full architecture: [README Live System Flow](../README.md#live-system-flow) · [Phase 9](../README.md#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06).
+Full architecture: [README Live System Flow](REFERENCE.md#live-system-flow) · [Phase 9](REFERENCE.md#phase-9-momentum-universe-strategy-overhaul--ops-polish-2026-06).
 
 ---
 
@@ -610,13 +610,13 @@ USE_DAILY_TELEGRAM_REPORT=true
 python run_backtest.py --walk-forward --yfinance --momentum-top-n 3
 ```
 
-Full strategy matrix: [README Section 8](../README.md#8-strategy-configurations--parameters) · [Phase 10](../README.md#phase-10-trend-hold--exit-discipline-2026-06).
+Full strategy matrix: [README Section 8](REFERENCE.md#8-strategy-configurations--parameters) · [Phase 10](REFERENCE.md#phase-10-trend-hold--exit-discipline-2026-06).
 
 ---
 
 ## Phase 14 — Profit, Risk & Diversified Watchlist
 
-Phase 14 closes the gap between live, backtest, and production risk posture. Full architecture: [README Phase 14](../README.md#phase-14-profit-risk-parity--diversified-universe-2026-06) · [Live System Flow](../README.md#live-system-flow).
+Phase 14 closes the gap between live, backtest, and production risk posture. Full architecture: [README Phase 14](REFERENCE.md#phase-14-profit-risk-parity--diversified-universe-2026-06) · [Live System Flow](REFERENCE.md#live-system-flow).
 
 | Feature | Env / file | What it does |
 |---|---|---|
@@ -650,7 +650,7 @@ python scripts/compare_watchlist.py
 
 ## Phase 15 — Live-Loop Hardening & Pipeline Extract
 
-Architecture cleanup for production stability. Full detail: [README Phase 15](../README.md#phase-15-live-loop-hardening--pipeline-extract-2026-06).
+Architecture cleanup for production stability. Full detail: [README Phase 15](REFERENCE.md#phase-15-live-loop-hardening--pipeline-extract-2026-06).
 
 | Component | File | Role |
 |---|---|---|
@@ -694,7 +694,7 @@ Post-RTH the bot calls `finalize_intraday_bars()` before sleeping — commits fo
 
 ## Phases 21–25 — Research-Validated Prod Defaults
 
-Summary of backtest-driven changes applied to `.env.example` and EC2 (June 2026). Full detail: [README Phases 21–25](../README.md#phase-21-entry-filter-ablation-2026-06).
+Summary of backtest-driven changes applied to `.env.example` and EC2 (June 2026). Full detail: [README Phases 21–25](REFERENCE.md#phase-21-entry-filter-ablation-2026-06).
 
 | Phase | Change | Effect | Adopted |
 |---|---|---|---|

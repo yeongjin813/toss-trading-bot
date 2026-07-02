@@ -198,4 +198,4 @@ sudo systemctl restart toss-bot
 
 ---
 
-See also: [OPERATIONS.md](OPERATIONS.md) (EC2 deploy, healthcheck cron, absence playbook).
+See also: [OPERATIONS.md](OPERATIONS.md) · [README.md](../README.md) · [STRATEGY.md](STRATEGY.md) · [RISK.md](RISK.md)
