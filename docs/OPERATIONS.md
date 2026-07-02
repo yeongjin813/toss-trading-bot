@@ -407,6 +407,8 @@ sudo truncate -s 0 project_metrics.log
 
 ## Absence Playbook (long leave / unattended prod)
 
+See **[MILITARY_RUNBOOK.md](MILITARY_RUNBOOK.md)** for pause trading, emergency liquidation, backups, and emergency checklist.
+
 **Policy:** freeze EC2 code and `.env` — **no automatic `git pull`** while away. Real-time alerts come from **EC2 cron**, not Cursor Automation.
 
 | Layer | What runs | Auto-fix? |

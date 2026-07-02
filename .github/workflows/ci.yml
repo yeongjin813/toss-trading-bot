@@ -17,12 +17,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run verification suite
         run: |
-          python test_analytics.py
-          python test_execution_engine.py
-          python test_kis_http.py
-          python test_order_retry_queue.py
-          python test_telegram_notifier.py
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run test suite
+        run: pytest test_*.py -q --ignore=scripts/

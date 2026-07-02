@@ -12,6 +12,8 @@ trading_state_ec2.json
 trading_state_ec2_snap.json
 *_ec2_snap.json
 order_retry_queue.json
+heartbeat.json
+backups/
 data/*.csv
 data/*.CSV
 *.log

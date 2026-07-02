@@ -126,6 +126,14 @@ def run_checks(
             )
         )
 
+    from analytics import is_us_regular_market_hours
+    from heartbeat import HeartbeatState, check_heartbeat_issues
+
+    hb = HeartbeatState.load(bot_dir / "heartbeat.json")
+    require_rth = is_us_regular_market_hours()
+    for level, message in check_heartbeat_issues(hb, require_rth_activity=require_rth):
+        issues.append((level, message))
+
     return issues
 
 
@@ -154,7 +162,14 @@ def main() -> int:
     )
 
     if not issues:
-        print(f"OK: {service} active, disk and logs within thresholds")
+        print(f"OK: {service} active, disk, logs, and heartbeat within thresholds")
+        return 0
+
+    alertable = [(lvl, msg) for lvl, msg in issues if lvl != "INFO"]
+    if not alertable:
+        for level, message in issues:
+            print(f"[{level}] {message}")
+        print(f"OK: {service} active (informational heartbeat notes only)")
         return 0
 
     for level, message in issues:
@@ -171,6 +186,8 @@ def main() -> int:
     state = _load_state(state_path)
     sent = 0
     for level, message in issues:
+        if level == "INFO":
+            continue
         key = f"{level}:{message}"
         if not _should_alert(state, key, cooldown):
             print(f"Throttled: {message}")

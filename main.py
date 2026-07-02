@@ -121,6 +121,16 @@ from strategy_ownership import (
     release_ownership,
 )
 from kis_environment import load_kis_environment, validate_kis_live_guard
+from operational_safety import (
+    check_order_placement_allowed,
+    describe_active_switches,
+    validate_live_account_requirements,
+)
+from heartbeat import (
+    HeartbeatState,
+    update_holdings_mismatch,
+    update_pending_order_snapshot,
+)
 from loop_timing import effective_loop_cooldown_seconds
 from trading_features import TradingFeatureFlags, apply_vix_regime_gate
 from vix_data import fetch_vix_daily_yfinance
@@ -339,6 +349,34 @@ def _dispatch_system_alert(
         _alert_last_sent[throttle_key] = now
 
     _run_telegram(send_system_alert(level_upper, message))
+    _persist_heartbeat(touch_telegram=True)
+
+
+def _persist_heartbeat(
+    states: dict[str, Any] | None = None,
+    *,
+    touch_loop: bool = False,
+    touch_broker: bool = False,
+    touch_reconcile: bool = False,
+    touch_telegram: bool = False,
+    touch_eod: bool = False,
+) -> None:
+    hb = HeartbeatState.load()
+    if touch_loop:
+        hb.touch_loop()
+    if touch_broker:
+        hb.touch_broker_api()
+    if touch_reconcile:
+        hb.touch_reconcile()
+    if touch_telegram:
+        hb.touch_telegram()
+    if touch_eod:
+        hb.touch_eod_report()
+    hb.active_kill_switches = describe_active_switches()
+    if states is not None:
+        update_pending_order_snapshot(states, WATCHLIST, hb)
+        update_holdings_mismatch(states, WATCHLIST, hb)
+    hb.save()
 
 
 def _handle_trade_fill(
@@ -431,6 +469,12 @@ def validate_environment() -> None:
         KIS_ENV,
         dry_run=is_dry_run_mode(),
         capital_at_risk=CAPITAL_AT_RISK,
+    )
+    validate_live_account_requirements(
+        KIS_ENV,
+        dry_run=is_dry_run_mode(),
+        capital_at_risk=CAPITAL_AT_RISK,
+        execution_settings=EXECUTION_SETTINGS,
     )
 
 
@@ -1070,8 +1114,17 @@ def execute_broker_order(
     signal: str,
     quantity: int,
     reference_price: float,
+    *,
+    emergency_liquidation_sell: bool = False,
 ) -> dict[str, Any]:
     side = _broker_side_for_signal(signal)
+    block = check_order_placement_allowed(
+        side,
+        emergency_liquidation_sell=emergency_liquidation_sell,
+    )
+    if block:
+        print(f"[GATE/KILL] {ticker} {side} blocked — {block}")
+        return {"rt_cd": "0", "skipped": True, "reason": block}
     if is_dry_run_mode():
         odno = f"DRY-{uuid.uuid4().hex[:8].upper()}"
         print(
@@ -1624,6 +1677,8 @@ def run_session_reconciliation(
     shadow = load_top3_state(states)
     reconcile_ownership(states, WATCHLIST, top3_active=shadow.active_tickers)
     save_persisted_states(states)
+    if report.reconciled:
+        _persist_heartbeat(states, touch_reconcile=True, touch_broker=True)
     return states, ledger
 
 
@@ -2098,6 +2153,7 @@ def _maybe_send_eod_report(
     mark_eod_report_sent(states)
     record_daily_equity_snapshot(states, float(metrics["equity"]), now=now)
     save_persisted_states(states)
+    _persist_heartbeat(states, touch_eod=True, touch_telegram=_telegram_enabled())
     _maybe_send_weekly_report(states, ledger, now=now)
 
 
@@ -2138,9 +2194,21 @@ def main() -> None:
         _dispatch_system_alert("CRITICAL", f"Startup validation failed: {exc}")
         raise
 
+    switch_banner = describe_active_switches()
+    if switch_banner:
+        _dispatch_system_alert(
+            "WARNING",
+            "Kill switches active at startup: " + ", ".join(switch_banner),
+        )
+
     print("KIS Mock Trading - Production Execution Engine")
     print(f"Execution Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Deployment          : {DEPLOYMENT.describe()}")
+    active_switches = describe_active_switches()
+    if active_switches:
+        print(f"Kill Switches       : ACTIVE — {', '.join(active_switches)}")
+    else:
+        print("Kill Switches       : none (normal trading)")
     print(f"Base URL            : {BASE_URL} ({KIS_ENV.banner_label()})")
     print(f"Account             : {CANO}-{ACNT_PRDT_CD}")
     print(f"Watchlist           : {', '.join(WATCHLIST)}")
@@ -2357,6 +2425,7 @@ def main() -> None:
                 states, ledger = run_watchlist_cycle(
                     client, cache, states, ledger, CYCLE_DEPS
                 )
+                _persist_heartbeat(states, touch_loop=True, touch_broker=True)
             except Exception as exc:
                 if _is_transient_kis_failure(exc):
                     logger.warning("Cycle skipped after transient KIS error: %s", exc)

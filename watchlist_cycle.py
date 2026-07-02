@@ -27,6 +27,11 @@ from momentum_ranker import MomentumRankSettings, build_cycle_tickers, rebalance
 from overdeployment_trim import format_trim_plan_text, plan_overdeployment_trims
 from session_manager import PortfolioLedger
 from state_persistence import save_persisted_states
+from operational_safety import (
+    check_order_placement_allowed,
+    collect_open_holdings,
+    kill_switch_settings_from_env,
+)
 from strategy_ownership import check_buy_collision, claim_ownership, release_ownership
 from top3_strategy import compute_top3_rebalance_orders, load_top3_state, save_top3_state
 
@@ -239,6 +244,10 @@ def run_top3_shadow_cycle(
                         f"deployable ${top3_cash:,.2f} < est ${est_cost:,.2f}"
                     )
                     continue
+                buy_block = check_order_placement_allowed("BUY")
+                if buy_block:
+                    print(f"[TOP3/GATE] {order.ticker} BUY blocked — {buy_block}")
+                    continue
                 collision = check_buy_collision(states, order.ticker, "top3")
                 if collision:
                     print(
@@ -246,6 +255,11 @@ def run_top3_shadow_cycle(
                     )
                     continue
             try:
+                if side == "SELL":
+                    sell_block = check_order_placement_allowed("SELL")
+                    if sell_block:
+                        print(f"[TOP3/GATE] {order.ticker} SELL blocked — {sell_block}")
+                        continue
                 payload = deps.execute_broker_order(
                     client,
                     order.ticker,
@@ -315,6 +329,97 @@ def run_top3_shadow_cycle(
     return states, ledger
 
 
+def run_emergency_liquidation_if_needed(
+    client: KISClient,
+    cache: MarketDataCache,
+    states: dict[str, Any],
+    ledger: PortfolioLedger,
+    deps: WatchlistCycleDeps,
+) -> tuple[dict[str, Any], PortfolioLedger, bool]:
+    """
+    When EMERGENCY_LIQUIDATE=true, attempt to close all holdings during RTH.
+
+    Returns (states, ledger, handled) where handled=True means normal trading
+    should be skipped for this cycle.
+    """
+    settings = kill_switch_settings_from_env()
+    if not settings.emergency_liquidate:
+        return states, ledger, False
+
+    holdings = collect_open_holdings(states, deps.watchlist)
+    if not holdings:
+        print("[EMERGENCY] EMERGENCY_LIQUIDATE active — no open holdings")
+        return states, ledger, True
+
+    prices = deps.watchlist_mark_prices(cache, deps.watchlist)
+    print()
+    print("!" * 88)
+    print("EMERGENCY LIQUIDATION — closing all open positions".center(88))
+    print("!" * 88)
+    deps.dispatch_system_alert(
+        "CRITICAL",
+        f"EMERGENCY_LIQUIDATE active — submitting SELL for {len(holdings)} holding(s)",
+    )
+
+    for ticker, qty in holdings:
+        price = prices.get(ticker)
+        if price is None or price <= 0:
+            print(f"[EMERGENCY] {ticker} SELL skipped — no mark price")
+            continue
+        block = check_order_placement_allowed(
+            "SELL",
+            settings=settings,
+            emergency_liquidation_sell=True,
+        )
+        if block:
+            print(f"[EMERGENCY] {ticker} SELL blocked — {block}")
+            continue
+        try:
+            payload = deps.execute_broker_order(
+                client,
+                ticker,
+                "SELL",
+                qty,
+                price,
+                emergency_liquidation_sell=True,
+            )
+            if payload.get("skipped"):
+                print(f"[EMERGENCY] {ticker} SELL skipped by broker gate")
+                continue
+            odno = extract_order_odno(payload) or ""
+            release_ownership(states, ticker)
+            deps.trade_log.append(
+                ticker=ticker,
+                signal="SELL",
+                qty=qty,
+                order_price=price,
+                fill_price=None,
+                status="ACCEPTED",
+                reason=f"emergency_liquidate odno={odno}",
+                cash_after=ledger.available_cash_usd,
+                held_qty=0,
+            )
+            print(f"[EMERGENCY] SELL {qty} {ticker} @ {price:.2f} odno={odno}")
+        except Exception as exc:
+            logger.error("[EMERGENCY] %s SELL failed: %s", ticker, exc, exc_info=True)
+
+    states, ledger = deps.run_session_reconciliation(
+        client, states, force=True, cache=cache
+    )
+    ledger = deps.refresh_ledger_deployable_cash(ledger, states, cache)
+    deps.fill_monitor.resolve_all_pending(
+        client,
+        states,
+        deps.watchlist,
+        LiveSignalEngine,
+        cash_after=ledger.available_cash_usd,
+    )
+    save_persisted_states(states)
+    print("[EMERGENCY] Liquidation pass complete — normal trading suppressed this cycle")
+    print("!" * 88)
+    return states, ledger, True
+
+
 def run_watchlist_cycle(
     client: KISClient,
     cache: MarketDataCache,
@@ -345,6 +450,13 @@ def run_watchlist_cycle(
 
     states, ledger = deps.run_session_reconciliation(client, states, cache=cache)
     ledger = deps.refresh_ledger_deployable_cash(ledger, states, cache)
+
+    states, ledger, emergency_handled = run_emergency_liquidation_if_needed(
+        client, cache, states, ledger, deps
+    )
+    if emergency_handled:
+        return states, ledger
+
     states, ledger = run_overdeployment_trim_if_needed(
         client, cache, states, ledger, deps, execute=True
     )

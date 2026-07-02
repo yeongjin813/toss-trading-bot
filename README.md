@@ -1,6 +1,6 @@
 # Multi-Asset Live Quantitative Pipeline & Risk-Resilient Infrastructure
 
-An automated, production-grade quantitative trading infrastructure and empirical telemetry engine built on top of the Korea Investment & Securities (KIS) OpenAPI. The system ingests live market sequences across multi-regime assets, enforces strict liquidity/volatility risk gates, implements a state-gated synchronous execution lock, and programmatically neutralizes Virtual Trading Server (VTS) sandbox anomalies.
+An experimental automated trading **infrastructure** and telemetry stack on the Korea Investment & Securities (KIS) OpenAPI. Paper/VTS-first by design; live trading requires explicit guards and operator review. The system ingests market data, enforces risk gates, reconciles broker state, and runs dual-strategy execution (Legacy + Top4) with operational safeguards for unattended operation.
 
 | Field | Value |
 |---|---|
@@ -194,6 +194,7 @@ Read this top-to-bottom for a **single narrative** of every major fix. Each row 
 - **[Live System Flow](#live-system-flow)** — end-to-end gate + fill pipeline
 - **[Improvement Journey — what changed & why](#improvement-journey--what-changed-and-why)**
 - **[Production Operations Guide](docs/OPERATIONS.md)** — deploy, monitor, Telegram, EC2, troubleshooting
+- **[Military Service Runbook](docs/MILITARY_RUNBOOK.md)** — pause trading, emergency flatten, backups, what not to do
 
 **Architecture & chronology**
 
@@ -313,7 +314,7 @@ Closed gaps from [Section 12](#12-pre-deployment-critical-architectural-flaws--h
 | **8.3** | One timeout = lost order intent | Inline retry + `order_retry_queue.json` per RTH cycle | `order_retry_queue.py` |
 | **8.4** | Live intraday stops ≠ backtest daily `Low` | `USE_EOD_ATR_STOPS=true` for parity (default keeps legacy) | `analytics.py`, `session_manager.py` |
 | **8.5** | Stop distance only logged on sell signal | `Trigger Floor Dist` every cycle when positioned | `main.py` |
-| **8.6** | Regressions caught only manually | GitHub Actions CI on all `test_*.py` | `.github/workflows/ci.yml` |
+| **8.6** | Regressions caught only manually | GitHub Actions CI runs `pytest test_*.py` | `.github/workflows/ci.yml` |
 | **8.7** | Ops mixed into 2k-line README | Split [docs/OPERATIONS.md](docs/OPERATIONS.md) | `docs/` |
 
 **Recommended for backtest-aligned live runs:** set `USE_EOD_ATR_STOPS=true` in `.env`.  
