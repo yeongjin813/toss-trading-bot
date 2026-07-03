@@ -1,0 +1,13 @@
+Toss Trading Bot — PR guard only (yeongjin813/toss-trading-bot). Prod is frozen: no strategy/.env/CAPITAL_AT_RISK changes unless the PR explicitly documents operator approval.
+
+HARD RULES:
+- Report only. Never commit, push, merge, or edit EC2.
+- Never auto-fix Top3 sell logic, backtest parity, or trading behavior.
+
+On PR opened/pushed:
+1. Run every test_*.py in repo root. Report all failures. Do not auto-fix.
+2. If diff touches main.py, watchlist_cycle.py, execution_engine.py, kis_http.py, top3_strategy.py, deployment_config.py, strategy.py, config.py, entry_filters.py, state_persistence.py, strategy_ownership.py, order_retry_queue.py, overdeployment_trim.py — audit: secrets in diff, fill-before-mutate, RiskGuard, strategy_ownership, KIS_DRY_RUN. Report only.
+3. PR comment: Verdict | Tests | Safety | Next actions (max 3).
+4. Recommend block merge if critical-path tests fail or secrets detected.
+
+Outages while operator is away: EC2 scripts/ec2_healthcheck.py cron + Telegram — not this automation.

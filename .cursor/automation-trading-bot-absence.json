@@ -1,6 +1,6 @@
 {
   "name": "Trading Bot Absence Guard",
-  "description": "PR regression guard + weekly/monthly read-only ops audit. No auto strategy fixes; EC2 alerts via scripts/ec2_healthcheck.py cron.",
+  "description": "DEPRECATED — use automation-essential.json (PR only). Full absence version kept for optional weekly/monthly cron.",
   "workflow": {
     "triggers": [
       {

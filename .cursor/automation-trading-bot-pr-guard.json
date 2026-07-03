@@ -1,6 +1,6 @@
 {
   "name": "Trading Bot PR Guard & Monthly Health",
-  "description": "DEPRECATED — use automation-trading-bot-absence.json instead.",
+  "description": "DEPRECATED — use automation-essential.json instead.",
   "workflow": {
     "triggers": [],
     "actions": [{ "prComment": {} }],

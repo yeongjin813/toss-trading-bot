@@ -1,0 +1,45 @@
+{
+  "name": "Trading Bot PR Guard (Essential)",
+  "description": "PR-only regression and safety audit. No cron, no EC2 edits, no auto strategy fixes.",
+  "workflow": {
+    "triggers": [
+      {
+        "git": {
+          "pullRequest": {
+            "opened": {
+              "repos": ["yeongjin813/toss-trading-bot"],
+              "ignoreDraftPrs": true
+            }
+          }
+        }
+      },
+      {
+        "git": {
+          "pullRequest": {
+            "pushed": {
+              "repos": ["yeongjin813/toss-trading-bot"],
+              "ignoreDraftPrs": true
+            }
+          }
+        }
+      }
+    ],
+    "actions": [
+      {
+        "prComment": {}
+      }
+    ],
+    "prompts": [
+      "Toss Trading Bot — PR guard only (yeongjin813/toss-trading-bot). Prod is frozen: no strategy/.env/CAPITAL_AT_RISK changes unless the PR explicitly documents operator approval.\n\nHARD RULES:\n- Report only. Never commit, push, merge, or edit EC2.\n- Never auto-fix Top3 sell logic, backtest parity, or trading behavior.\n\nOn PR opened/pushed:\n1. Run every test_*.py in repo root. Report all failures. Do not auto-fix.\n2. If diff touches main.py, watchlist_cycle.py, execution_engine.py, kis_http.py, top3_strategy.py, deployment_config.py, strategy.py, config.py, entry_filters.py, state_persistence.py, strategy_ownership.py, order_retry_queue.py, overdeployment_trim.py — audit: secrets in diff, fill-before-mutate, RiskGuard, strategy_ownership, KIS_DRY_RUN. Report only.\n3. PR comment: Verdict | Tests | Safety | Next actions (max 3).\n4. Recommend block merge if critical-path tests fail or secrets detected.\n\nOutages while operator is away: EC2 scripts/ec2_healthcheck.py cron + Telegram — not this automation."
+    ],
+    "model": "",
+    "agentOptions": {
+      "skipInstall": false
+    },
+    "memoryEnabled": false,
+    "gitConfig": {
+      "repo": "yeongjin813/toss-trading-bot",
+      "branch": "main"
+    }
+  }
+}
