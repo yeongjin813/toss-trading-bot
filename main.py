@@ -261,21 +261,30 @@ def _telegram_enabled() -> bool:
     return TelegramConfig.from_env().enabled
 
 
-def _run_telegram(coro) -> None:
+def _run_telegram(coro) -> bool:
     """Run an async Telegram coroutine from sync code; no-op when alerts disabled."""
     if not _telegram_enabled():
-        return
+        return True
 
     try:
-        asyncio.run(coro)
+        result = asyncio.run(coro)
+        if result is None:
+            logger.error("Telegram dispatch failed: send returned no message")
+            _, newly = update_from_issue_flags(telegram_failure=True)
+            if newly:
+                for reason in newly:
+                    logger.critical("[SAFETY/LATCH] %s", reason)
+            return False
         _persist_heartbeat(touch_telegram=True)
         update_from_issue_flags(telegram_failure=False)
+        return True
     except Exception as exc:
         logger.error("Telegram dispatch failed: %s", exc)
         _, newly = update_from_issue_flags(telegram_failure=True)
         if newly:
             for reason in newly:
                 logger.critical("[SAFETY/LATCH] %s", reason)
+        return False
 
 
 def _dispatch_trade_report(
@@ -2141,9 +2150,9 @@ def _maybe_send_eod_report(
     client: KISApiClient | None = None,
     cache: MarketDataCache | None = None,
     now: datetime | None = None,
-) -> None:
+) -> bool:
     if not should_send_eod_report(now, states):
-        return
+        return True
 
     if client is not None:
         states, ledger = run_session_reconciliation(
@@ -2170,7 +2179,9 @@ def _maybe_send_eod_report(
     text = format_eod_report_text(metrics)
     print(f"[EOD] Sending daily report for {metrics['date']}...")
     if _telegram_enabled():
-        _run_telegram(send_eod_report(text))
+        if not _run_telegram(send_eod_report(text)):
+            print("[EOD] Telegram failed — will retry on next cycle")
+            return False
     else:
         print(text.replace("\\", ""))
     mark_eod_report_sent(states)
@@ -2178,6 +2189,7 @@ def _maybe_send_eod_report(
     save_persisted_states(states)
     _persist_heartbeat(states, touch_eod=True, touch_telegram=_telegram_enabled())
     _maybe_send_weekly_report(states, ledger, now=now)
+    return True
 
 
 def _maybe_send_weekly_report(
@@ -2198,7 +2210,9 @@ def _maybe_send_weekly_report(
     text = format_weekly_report_text(metrics)
     print(f"[WEEKLY] Sending paper report for {metrics['week_key']}...")
     if _telegram_enabled():
-        _run_telegram(send_eod_report(text))
+        if not _run_telegram(send_eod_report(text)):
+            print("[WEEKLY] Telegram failed — will retry on next cycle")
+            return
     else:
         print(text.replace("\\", ""))
     mark_weekly_report_sent(states, now=now)
@@ -2426,10 +2440,20 @@ def main() -> None:
                         f"[CACHE] Finalized {finalized} forming bar(s) into "
                         "completed EOD history (disk-safe)"
                     )
-                _maybe_send_eod_report(
+                eod_sent = _maybe_send_eod_report(
                     states, ledger, client=client, cache=cache, now=cycle_started
                 )
                 sleep_seconds = seconds_until_us_rth_open(cycle_started)
+                if (
+                    not eod_sent
+                    and should_send_eod_report(cycle_started, states)
+                ):
+                    retry_sleep = int(os.getenv("EOD_RETRY_SLEEP_SECONDS", "900"))
+                    sleep_seconds = min(sleep_seconds, max(retry_sleep, 60))
+                    print(
+                        f"[EOD] Retrying after {sleep_seconds}s "
+                        "(Telegram not delivered yet)"
+                    )
                 print()
                 print(
                     f"--- Cycle {cycle_count} skipped at "
