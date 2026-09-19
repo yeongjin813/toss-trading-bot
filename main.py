@@ -83,6 +83,7 @@ from session_manager import (
     align_deployable_cash,
     holdings_notional_usd,
     summarize_overseas_present_balance,
+    unrealized_pnl_usd,
 )
 from state_persistence import load_persisted_states, save_persisted_states
 from telegram_notifier import (
@@ -1631,12 +1632,18 @@ def _estimate_portfolio_equity(
     states: dict[str, Any],
     cache: MarketDataCache,
 ) -> float:
-    """Mark-to-market equity: broker cash (when known) + open position notionals."""
+    """Mark-to-market equity: broker cash (when known) + open position notionals.
+
+    When VTS reports broker USD cash as 0, deployable cash is inferred as
+    CAPITAL − holdings, which would cancel mark moves and pin equity at CAPITAL.
+    In that case use CAPITAL_AT_RISK + unrealized PnL vs entry_price instead.
+    """
     prices = _watchlist_mark_prices(cache, WATCHLIST)
     holdings_val = holdings_notional_usd(states, WATCHLIST, prices)
     if ledger.broker_cash_usd > 0:
         return ledger.broker_cash_usd + holdings_val
-    return holdings_val + max(0.0, ledger.available_cash_usd)
+    unrealized = unrealized_pnl_usd(states, WATCHLIST, prices)
+    return float(CAPITAL_AT_RISK) + unrealized
 
 
 def _should_run_session_reconciliation(states: dict[str, Any], now: datetime) -> bool:

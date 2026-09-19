@@ -43,6 +43,42 @@ class DeployableCashTests(unittest.TestCase):
         total = holdings_notional_usd(states, ["TSLA", "AAPL"], {"TSLA": 400.0})
         self.assertEqual(total, 4_000.0)
 
+    def test_unrealized_pnl_vs_entry(self) -> None:
+        from session_manager import unrealized_pnl_usd
+
+        states = {
+            "TSLA": {"held_quantity": 10, "entry_price": 400.0},
+            "AAPL": {"held_quantity": 5, "entry_price": 200.0},
+            "MSFT": {"held_quantity": 3},  # missing entry → 0
+        }
+        pnl = unrealized_pnl_usd(
+            states,
+            ["TSLA", "AAPL", "MSFT"],
+            {"TSLA": 410.0, "AAPL": 190.0, "MSFT": 400.0},
+        )
+        # TSLA +100, AAPL -50 → +50
+        self.assertEqual(pnl, 50.0)
+
+    def test_vts_equity_not_flat_at_capital(self) -> None:
+        """broker_cash=0 must not pin equity at CAPITAL when positions have entry."""
+        from session_manager import unrealized_pnl_usd
+
+        capital = 100_000.0
+        states = {"UNH": {"held_quantity": 18, "entry_price": 422.03}}
+        prices = {"UNH": 430.0}
+        holdings = holdings_notional_usd(states, ["UNH"], prices)
+        inferred_cash = align_deployable_cash(
+            broker_cash_usd=0.0,
+            capital_at_risk=capital,
+            holdings_notional_usd=holdings,
+            fallback_cash_usd=capital,
+        )
+        # Old bug: holdings + inferred_cash == capital
+        self.assertAlmostEqual(holdings + inferred_cash, capital, places=2)
+        equity = capital + unrealized_pnl_usd(states, ["UNH"], prices)
+        self.assertGreater(equity, capital)
+        self.assertAlmostEqual(equity, capital + 18 * (430.0 - 422.03), places=2)
+
 
 class RiskGuardCapTests(unittest.TestCase):
     def test_blocks_buy_when_over_portfolio_cap(self) -> None:

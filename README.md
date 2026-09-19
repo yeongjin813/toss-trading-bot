@@ -30,10 +30,27 @@ This is **experimental infrastructure**. Backtest and VTS results do **not** gua
 - **Fill verification** before mutating `trading_state.json` (`OrderFillMonitor`)
 - Telegram trade, system, and EOD reports
 - Kill switches: `TRADING_PAUSED`, `ALLOW_NEW_BUYS`, `EMERGENCY_LIQUIDATE` (+ confirm phrase)
-- **Safety latch**: auto-block new BUYs after repeated anomalies (`safety_latch.json`)
+- **Safety latch**: hard-block new BUYs on trading anomalies (mismatch / broker stale / pending stuck); EOD/Telegram issues are alert-only (`safety_latch.json`)
 - **Heartbeat** + stale-loop detection (`heartbeat.json`, `scripts/ec2_healthcheck.py`)
-- Daily local backup script (`scripts/daily_backup.py`)
+- Daily local backup script (`scripts/daily_backup.py`) + optional EC2 cron (`deploy/install-daily-backup-cron.sh`)
+- Live vs Top3 shadow summary (`scripts/compare_live_shadow.py`)
 - GitHub Actions: `pytest` on push/PR
+
+---
+
+## Return from leave (2026-09)
+
+After unattended VTS operation (military absence), production strategy stayed **frozen** (Legacy 70% + Top4 30%). Ops/measurement updates only:
+
+| Topic | What changed |
+|--------|----------------|
+| Soft latch | `eod_missing` / Telegram failures no longer auto-block buys |
+| VTS equity MTM | When broker USD cash is 0, equity = `CAPITAL_AT_RISK + unrealized PnL` (was stuck flat at capital) |
+| Mock account | Re-enroll after ~90 days; set `KIS_CANO` / app keys; clean-slate `trading_state` |
+| Backups | Daily backup cron installer |
+| Docs | [MILITARY_RUNBOOK.md](docs/MILITARY_RUNBOOK.md), [RESEARCH_LOG.md](docs/RESEARCH_LOG.md), [CHANGELOG.md](docs/CHANGELOG.md) |
+
+**Absence live sample was not a clean PnL test** (latch + equity pin + mock reset). Next value is a fresh VTS equity curve with strategy unchanged. Config C remainder (RSI/vol/`MAX_OPEN_POSITIONS=6`) remains a **roadmap** item, not applied.
 
 ---
 

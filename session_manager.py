@@ -489,6 +489,33 @@ def holdings_notional_usd(
     return total
 
 
+def unrealized_pnl_usd(
+    states: Mapping[str, Any],
+    watchlist: list[str],
+    prices: Mapping[str, float],
+) -> float:
+    """
+    Unrealized PnL vs entry_price for open positions.
+
+    Tickers missing a positive entry_price contribute 0 (avoid inventing basis).
+    Used when VTS broker USD cash is unreliable so equity is not stuck at CAPITAL.
+    """
+    total = 0.0
+    for ticker in watchlist:
+        payload = states.get(ticker, {})
+        if not isinstance(payload, dict):
+            continue
+        qty = int(payload.get("held_quantity", 0) or 0)
+        if qty <= 0:
+            continue
+        entry = float(payload.get("entry_price", 0.0) or 0.0)
+        mark = float(prices.get(ticker, 0.0) or 0.0)
+        if entry <= 0 or mark <= 0:
+            continue
+        total += qty * (mark - entry)
+    return total
+
+
 def align_deployable_cash(
     *,
     broker_cash_usd: float,

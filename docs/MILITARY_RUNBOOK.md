@@ -163,7 +163,7 @@ cp backups/YYYY-MM-DD/trading_state.json ./trading_state.json
 sudo systemctl restart toss-bot
 ```
 
-**Safety latch** (`safety_latch.json`): after repeated anomalies the bot auto-blocks **new BUYs** (not auto-sell). To clear:
+**Safety latch** (`safety_latch.json`): after repeated **trading** anomalies (holdings mismatch, broker stale, stuck pending) the bot auto-blocks **new BUYs** (not auto-sell). `eod_missing` / Telegram failures are tracked but **do not** latch (alert-only). To clear:
 
 1. `TRADING_PAUSED=true` + restart  
 2. Fix root cause (reconcile mismatch, Telegram, etc.)  
@@ -171,6 +171,20 @@ sudo systemctl restart toss-bot
 4. `TRADING_PAUSED=false` + restart  
 
 **Do not commit to GitHub:** `.env`, `kis_token_cache.json`, `trading_state.json`, `backups/`, logs.
+
+### Mock 90-day re-enrollment (account reset)
+
+After KIS VTS re-application, **fix OpenAPI app keys + `KIS_CANO`/`KIS_ACNT_PRDT_CD`**, clear token cache, then clean-slate runtime:
+
+1. `TRADING_PAUSED=true`, stop `toss-bot`
+2. `python scripts/daily_backup.py`
+3. Archive `trading_state.json`, `trade_log.csv`, `order_retry_queue.json` (do not delete without archive)
+4. Restart; confirm `present-balance` `rt_cd=0` and holdings match the app
+5. `TRADING_PAUSED=false`
+
+**Equity note (2026-09):** when VTS reports broker USD cash as 0, live equity is `CAPITAL_AT_RISK + unrealized PnL vs entry_price` so `equity_history` is not pinned at `$CAPITAL`. Compare live vs Top3 shadow with `python scripts/compare_live_shadow.py`.
+
+Daily backup cron: `bash deploy/install-daily-backup-cron.sh` (01:15 UTC).
 
 ---
 

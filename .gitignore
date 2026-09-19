@@ -18,3 +18,4 @@ backups/
 data/*.csv
 data/*.CSV
 *.log
+tmp/

@@ -3,6 +3,10 @@ Automatic safety latch — blocks new BUYs after repeated operational anomalies.
 
 Does not auto-liquidate. Persists to safety_latch.json (runtime file, not .env).
 Clear with TRADING_PAUSED=true, fix root cause, delete safety_latch.json, restart.
+
+Soft counters (eod_missing, telegram_failure) are tracked for ops visibility but
+never engage the buy-block latch — they are notification issues, not trading faults.
+Hard latch remains for holdings_mismatch / broker_stale / pending_order_stuck.
 """
 
 from __future__ import annotations
@@ -21,6 +25,9 @@ LATCH_COUNTERS = (
     "eod_missing",
     "telegram_failure",
 )
+
+# Tracked in safety_latch.json but do not block new BUYs (paper/project-friendly).
+SOFT_LATCH_COUNTERS = frozenset({"eod_missing", "telegram_failure"})
 
 
 def _utc_now_iso() -> str:
@@ -135,6 +142,8 @@ def update_from_issue_flags(
             state.counters[counter] = int(state.counters.get(counter, 0)) + 1
         else:
             state.counters[counter] = 0
+        if counter in SOFT_LATCH_COUNTERS:
+            continue
         threshold = thresholds[counter]
         if state.counters[counter] >= threshold:
             if _engage_latch(

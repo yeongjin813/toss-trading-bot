@@ -12,6 +12,17 @@ High-level release notes. Strategy research detail: [RESEARCH_LOG.md](RESEARCH_L
 
 ---
 
+## 2026-09 (return from leave)
+
+| Area | Change |
+|------|--------|
+| **Soft latch** | `eod_missing` / Telegram failures tracked but do not engage buy-block; hard latch kept for mismatch / broker stale / pending stuck |
+| **VTS equity MTM** | When `broker_cash_usd=0`, equity = `CAPITAL_AT_RISK + unrealized(entry→mark)` so EOD curves can move |
+| **Ops** | `scripts/compare_live_shadow.py`; `deploy/install-daily-backup-cron.sh`; mock 90-day re-enroll clean-slate notes in runbook |
+| **Strategy** | Unchanged (prod freeze): Top4, 52w OFF, golden_cross OFF, 70/30 |
+
+---
+
 ## 2026-06 (recent)
 
 | Commit / area | Change |
@@ -34,6 +45,7 @@ High-level release notes. Strategy research detail: [RESEARCH_LOG.md](RESEARCH_L
 
 | Date | Change |
 |------|--------|
+| 2026-09 | Return-from-leave ops notes; soft latch + VTS equity MTM documented |
 | 2026-06 | README refactored to landing page; legacy content → `docs/REFERENCE.md` |
 
 ---
