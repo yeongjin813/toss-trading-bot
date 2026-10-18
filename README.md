@@ -30,7 +30,7 @@ This is **experimental infrastructure**. Backtest and VTS results do **not** gua
 - **Fill verification** before mutating `trading_state.json` (`OrderFillMonitor`)
 - Telegram trade, system, and EOD reports
 - Kill switches: `TRADING_PAUSED`, `ALLOW_NEW_BUYS`, `EMERGENCY_LIQUIDATE` (+ confirm phrase)
-- **Safety latch**: hard-block new BUYs on trading anomalies (mismatch / broker stale / pending stuck); EOD/Telegram issues are alert-only (`safety_latch.json`)
+- **Safety latch**: anomalies are counted and Telegram-alerted. Paper default does **not** block buys (`SAFETY_LATCH_BLOCK_BUYS=false`). Set `true` before live capital.
 - **Heartbeat** + stale-loop detection (`heartbeat.json`, `scripts/ec2_healthcheck.py`)
 - Daily local backup script (`scripts/daily_backup.py`) + optional EC2 cron (`deploy/install-daily-backup-cron.sh`)
 - Live vs Top3 shadow summary (`scripts/compare_live_shadow.py`)
@@ -38,19 +38,30 @@ This is **experimental infrastructure**. Backtest and VTS results do **not** gua
 
 ---
 
-## Return from leave (2026-09)
+## Return from leave (2026-09) and paper sample (through 2026-10-16)
 
-After unattended VTS operation (military absence), production strategy stayed **frozen** (Legacy 70% + Top4 30%). Ops/measurement updates only:
+Production strategy stayed **frozen** (Legacy 70% + Top4 30%). Ops changes only:
 
 | Topic | What changed |
 |--------|----------------|
-| Soft latch | `eod_missing` / Telegram failures no longer auto-block buys |
-| VTS equity MTM | When broker USD cash is 0, equity = `CAPITAL_AT_RISK + unrealized PnL` (was stuck flat at capital) |
-| Mock account | Re-enroll after ~90 days; set `KIS_CANO` / app keys; clean-slate `trading_state` |
+| Latch | All anomaly counters alert only. Buys are not auto-blocked unless `SAFETY_LATCH_BLOCK_BUYS=true` |
+| VTS equity MTM | When broker USD cash is 0, equity = `CAPITAL_AT_RISK + unrealized PnL` |
+| Mock account | Re-enrolled `50206476-01` after the ~90-day reset; runtime state clean-slated on 2026-09-19 |
 | Backups | Daily backup cron installer |
-| Docs | [MILITARY_RUNBOOK.md](docs/MILITARY_RUNBOOK.md), [RESEARCH_LOG.md](docs/RESEARCH_LOG.md), [CHANGELOG.md](docs/CHANGELOG.md) |
 
-**Absence live sample was not a clean PnL test** (latch + equity pin + mock reset). Next value is a fresh VTS equity curve with strategy unchanged. Config C remainder (RSI/vol/`MAX_OPEN_POSITIONS=6`) remains a **roadmap** item, not applied.
+**Paper fills after the reset (realized vs entry):**
+
+| Ticker | Qty | Entry | Exit | PnL |
+|--------|-----|-------|------|-----|
+| AMD | 12 | 585.38 | 601.62 (09-30) | +194.88 |
+| META | 5 | 700.17 | 714.52 (09-28) | +71.75 |
+| JNJ | 28 | 268.82 / 270.78 | 269.91 (09-29) | +28.56 |
+| V | 20 | 369.14 | 367.27 (09-25) | -37.40 |
+| KO | 86 | 88.06 / 88.03 | 86.61 (09-29) | -124.67 |
+| AAPL | 19 | 338.89 | 330.49 (09-29) | -159.60 |
+| **Total** | | | | **about -26** |
+
+Reported equity peaked at **$100,331.78** on 2026-09-24 and was **$100,000** cash again by 2026-09-30. A holdings mismatch on 2026-09-28 engaged the old buy latch; exits still ran through 09-30. That latch was cleared on 2026-10-18 and buy-blocking is now opt-in. One week of fills is not evidence for a strategy change. Config C remainder stays on the roadmap.
 
 ---
 

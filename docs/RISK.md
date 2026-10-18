@@ -20,7 +20,7 @@ Mitigation: `USE_EOD_ATR_STOPS=true` for closer stop parity; `SLIPPAGE_BPS=5` an
 
 - **Mitigated:** `PortfolioReconciliationEngine` (KIS `VTRP6504R`, ccnl fallback)
 - **Residual:** Race during pending orders; manual trades outside bot
-- **Response:** `[RECONCILE/MISMATCH]` logs; safety latch after repeated mismatch; see [MILITARY_RUNBOOK.md](MILITARY_RUNBOOK.md)
+- **Response:** `[RECONCILE/MISMATCH]` logs and a one-time alert. Paper default does not block buys; set `SAFETY_LATCH_BLOCK_BUYS=true` to block. See [MILITARY_RUNBOOK.md](MILITARY_RUNBOOK.md).
 
 ### Capital and sizing
 

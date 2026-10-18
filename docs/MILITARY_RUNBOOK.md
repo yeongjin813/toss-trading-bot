@@ -163,7 +163,7 @@ cp backups/YYYY-MM-DD/trading_state.json ./trading_state.json
 sudo systemctl restart toss-bot
 ```
 
-**Safety latch** (`safety_latch.json`): after repeated **trading** anomalies (holdings mismatch, broker stale, stuck pending) the bot auto-blocks **new BUYs** (not auto-sell). `eod_missing` / Telegram failures are tracked but **do not** latch (alert-only). To clear:
+**Safety latch** (`safety_latch.json`): anomalies are counted and alerted. **Paper default does not block new BUYs** (`SAFETY_LATCH_BLOCK_BUYS=false`) so VTS results stay observable. Set `SAFETY_LATCH_BLOCK_BUYS=true` to block buys after repeated trading anomalies. To clear a stored block:
 
 1. `TRADING_PAUSED=true` + restart  
 2. Fix root cause (reconcile mismatch, Telegram, etc.)  

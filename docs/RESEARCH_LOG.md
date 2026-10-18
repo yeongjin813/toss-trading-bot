@@ -72,11 +72,12 @@ python scripts/filter_combo_backtest.py
 - Off-watchlist broker holdings edge cases
 - VTS mock session **90-day renewal** (manual)
 
-### Ops notes (2026-09 return)
+### Ops notes (2026-09 return, updated 2026-10-18)
 
-- Soft latch: `eod_missing` / Telegram failures no longer block new buys (hard latch remains for mismatch / broker stale / pending stuck).
-- VTS equity MTM: when `broker_cash_usd=0`, equity = `CAPITAL_AT_RISK + unrealized(entry→mark)` so EOD curves can move.
+- Latch is **alert-only** by default (`SAFETY_LATCH_BLOCK_BUYS=false`), including holdings mismatch. Set `true` to block new buys.
+- VTS equity MTM: when `broker_cash_usd=0`, equity = `CAPITAL_AT_RISK + unrealized(entry→mark)`.
+- Clean paper sample 2026-09-21 to 2026-09-30: six round trips, realized about **-$26**, then cash. Too short to change prod settings.
 - Live vs shadow helper: `python scripts/compare_live_shadow.py`
-- **Next experiment (not applied):** Config C remainder — volume_threshold 0.50, RSI −4–5, `MAX_OPEN_POSITIONS=6` (Phase 24/25: small OOS gain; golden_cross OFF already landed the bulk).
+- **Next experiment (not applied):** Config C remainder — volume_threshold 0.50, RSI −4–5, `MAX_OPEN_POSITIONS=6`.
 
 See [RISK.md](RISK.md) for operational residual risks.

@@ -1,12 +1,10 @@
 """
-Automatic safety latch — blocks new BUYs after repeated operational anomalies.
+Automatic safety latch — records repeated operational anomalies.
+
+Paper/project default: alerts only. New BUYs stay allowed so VTS results
+remain observable. Set SAFETY_LATCH_BLOCK_BUYS=true to restore buy blocking.
 
 Does not auto-liquidate. Persists to safety_latch.json (runtime file, not .env).
-Clear with TRADING_PAUSED=true, fix root cause, delete safety_latch.json, restart.
-
-Soft counters (eod_missing, telegram_failure) are tracked for ops visibility but
-never engage the buy-block latch — they are notification issues, not trading faults.
-Hard latch remains for holdings_mismatch / broker_stale / pending_order_stuck.
 """
 
 from __future__ import annotations
@@ -26,8 +24,10 @@ LATCH_COUNTERS = (
     "telegram_failure",
 )
 
-# Tracked in safety_latch.json but do not block new BUYs (paper/project-friendly).
-SOFT_LATCH_COUNTERS = frozenset({"eod_missing", "telegram_failure"})
+def buy_block_enabled() -> bool:
+    """Buy blocking is opt-in. Default is alert-only for paper trading."""
+    raw = os.getenv("SAFETY_LATCH_BLOCK_BUYS", "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _utc_now_iso() -> str:
@@ -94,6 +94,8 @@ def latch_thresholds() -> dict[str, int]:
 
 
 def auto_buy_block_reason(state: SafetyLatchState | None = None) -> str | None:
+    if not buy_block_enabled():
+        return None
     state = state or SafetyLatchState.load()
     if not state.auto_block_new_buys:
         return None
@@ -142,16 +144,18 @@ def update_from_issue_flags(
             state.counters[counter] = int(state.counters.get(counter, 0)) + 1
         else:
             state.counters[counter] = 0
-        if counter in SOFT_LATCH_COUNTERS:
-            continue
         threshold = thresholds[counter]
-        if state.counters[counter] >= threshold:
-            if _engage_latch(
-                state,
-                f"{counter} reached {state.counters[counter]} consecutive hits "
-                f"(threshold {threshold})",
-            ):
+        if state.counters[counter] != threshold:
+            continue
+        detail = (
+            f"{counter} reached {state.counters[counter]} consecutive hits "
+            f"(threshold {threshold})"
+        )
+        if buy_block_enabled():
+            if _engage_latch(state, detail):
                 newly_latched_reasons.append(state.block_reason or counter)
+        else:
+            newly_latched_reasons.append(f"{detail} (alert only; buys not blocked)")
     state.save()
     return state, newly_latched_reasons
 

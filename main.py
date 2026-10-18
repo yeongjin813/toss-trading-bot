@@ -404,9 +404,10 @@ def _persist_heartbeat(
         if newly:
             for reason in newly:
                 logger.critical("[SAFETY/LATCH] %s", reason)
+                blocked = "New BUY orders blocked." if "alert only" not in reason else "Buys continue."
                 _dispatch_system_alert(
                     "CRITICAL",
-                    f"Safety latch engaged — {reason}. New BUY orders blocked.",
+                    f"Safety latch — {reason}. {blocked}",
                     telegram=True,
                 )
     hb.save()

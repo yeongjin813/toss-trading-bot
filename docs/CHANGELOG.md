@@ -12,6 +12,16 @@ High-level release notes. Strategy research detail: [RESEARCH_LOG.md](RESEARCH_L
 
 ---
 
+## 2026-10 (paper sample + alert-only latch)
+
+| Area | Change |
+|------|--------|
+| **Latch** | `SAFETY_LATCH_BLOCK_BUYS` defaults to false. Repeated anomalies alert once and do not block buys. Opt in with `true` for live capital |
+| **VTS fills 09-21 to 09-30** | AMD, META, JNJ, V, KO, AAPL round trips. Realized PnL about **-$26**. Peak reported equity **$100,331.78** (09-24), flat **$100,000** cash after 09-30 |
+| **09-28 mismatch** | Three reconcile mismatches engaged the old buy latch. Cleared 2026-10-18. Strategy parameters unchanged |
+
+---
+
 ## 2026-09 (return from leave)
 
 | Area | Change |
@@ -45,7 +55,8 @@ High-level release notes. Strategy research detail: [RESEARCH_LOG.md](RESEARCH_L
 
 | Date | Change |
 |------|--------|
-| 2026-09 | Return-from-leave ops notes; soft latch + VTS equity MTM documented |
+| 2026-10 | Paper round-trip table; latch is alert-only unless `SAFETY_LATCH_BLOCK_BUYS=true` |
+| 2026-09 | Return-from-leave ops notes; VTS equity MTM documented |
 | 2026-06 | README refactored to landing page; legacy content → `docs/REFERENCE.md` |
 
 ---
